@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/cache/
+.streamlit/secrets.toml
+
+# 本プロジェクトと無関係な個人ファイル（コードベースに含めない）
+私は箱川達也.txt
+Claude Codeコマンド一覧.md
