@@ -8,3 +8,6 @@ data/cache/
 # 本プロジェクトと無関係な個人ファイル（コードベースに含めない）
 私は箱川達也.txt
 Claude Codeコマンド一覧.md
+
+# Claude Codeのローカル作業用ファイル
+.claude/
