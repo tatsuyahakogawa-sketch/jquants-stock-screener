@@ -74,9 +74,11 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `app.py`: Streamlit UI（絞り込み条件選択 → スクリーニング実行 → 銘柄集計テーブル/CSV）
 - `src/jquants_client.py`: J-Quants認証・レート制限（429時は65秒待って自動リトライ）・ページネーション
 - `src/endpoints.py`: 日付単位バルク取得 + ローカルキャッシュ（`data/cache/`, parquet）
-- `src/tdnet_client.py`: TDnet開示情報の非公式ミラーAPIクライアント（新工場・新店舗、東証移籍検出用）
+- `src/tdnet_client.py`: TDnet開示情報の非公式ミラーAPIクライアント（新工場・新店舗、東証移籍検出、実行表の「最近のトピック」欄用）
+- `src/edinet_client.py`: EDINET(金融庁)から有価証券報告書の事業概要・大株主・潜在株式・事業等のリスク・経営方針をテキストブロック単位で取得（`EDINET_API_KEY`必須、README参照）。要約はせず開示テキストをそのまま使う
 - `src/rules.py`: 各条件の判定ロジック（J-Quants数値データ、市場区分履歴、TDnetタイトル検出）
-- `src/pipeline.py`: 取得〜判定〜銘柄単位集計(build_summary)〜市場データ付与(enrich_with_market_data)のオーケストレーション
+- `src/pipeline.py`: 取得〜判定〜銘柄単位集計(build_summary)〜市場データ付与(enrich_with_market_data)のオーケストレーション。時価総額/PER/PBR/配当利回り計算(compute_market_metrics)と上場日近似(estimate_listing_date)はexcel_export.pyと共用
+- `src/excel_export.py`: 銘柄コード→Excel自動生成。企業詳細・実行表とも、元のExcel（個人情報・実データを除いた汎用テンプレート化: `templates/company_detail_template.xlsx`, `templates/execution_table_template.xlsx`）のレイアウト・書式・数式をそのまま使い値だけを埋める方式。定性コメント欄はtdnet_client/edinet_clientの実データで埋め、市況解釈が必要な項目（価格が上下した理由）は空欄のまま
 - `scripts/inspect_schema.py`: J-QuantsレスポンスのカラムをAPI実物で確認する検証用スクリプト
 
 ## 未決事項（今後詰める内容）

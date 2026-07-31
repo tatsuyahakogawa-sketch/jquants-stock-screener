@@ -16,6 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
+from src import excel_export
 from src.jquants_client import JQuantsAuthError, JQuantsClient
 from src.pipeline import RULE_LABELS, POSITIVE_RULES, run_screening, build_summary, enrich_with_market_data
 
@@ -81,7 +82,7 @@ st.subheader("絞り込み条件（実行前に選択）")
 count_target_rules = st.multiselect(
     "対象にする条件（「合致数」のカウント対象。複数条件に合致する銘柄を探すのに使う）",
     options=POSITIVE_RULES,
-    default=POSITIVE_RULES,
+    default=[r for r in POSITIVE_RULES if r != "equity_ratio_high"],
     format_func=lambda k: RULE_LABELS[k],
 )
 min_match = st.slider(
@@ -123,6 +124,26 @@ def _format_date(value) -> str:
     if value is None or pd.isna(value):
         return ""
     return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+def _call_jquants(fn):
+    """J-Quants呼び出しを実行し、認証・レート制限等のエラーを共通のメッセージで表示する。"""
+    try:
+        return fn()
+    except excel_export.NotCommonStockError as e:
+        st.warning(str(e))
+    except JQuantsAuthError as e:
+        st.error(f"J-Quants への認証に失敗しました: {e}")
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        body = e.response.text if e.response is not None else str(e)
+        if status == 400:
+            st.error(f"J-Quants への取得条件が不正です（契約プランの取得可能期間外の可能性）。\n\n{body}")
+        elif status == 429:
+            st.error("J-Quants のレート制限に達しました。1分ほど待ってから再実行してください。")
+        else:
+            st.error(f"J-Quants API呼び出しでエラーが発生しました (status={status})。\n\n{body}")
+    return None
 
 
 if "summary" in st.session_state:
@@ -221,6 +242,58 @@ if "summary" in st.session_state:
                 file_name="screening_events.csv",
                 mime="text/csv",
             )
+
+st.divider()
+st.subheader("個別銘柄のExcel出力（企業詳細・実行表）")
+st.caption(
+    "銘柄コードを入力すると、時価総額・PBR・PER・配当利回り・株価・四半期業績（売上・経常利益）を"
+    "Excelテンプレートに自動入力します。事業概要・主要株主・将来予想等の自由記述はJ-Quantsだけでは"
+    "自動化できないため空欄のままです。生成後、手動で追記のうえ印刷してください。"
+)
+export_code = st.text_input("銘柄コード", key="export_code", placeholder="例: 6584")
+
+exp_col1, exp_col2 = st.columns(2)
+with exp_col1:
+    if st.button("企業詳細を生成"):
+        code = export_code.strip()
+        if not code:
+            st.warning("銘柄コードを入力してください。")
+        else:
+            with st.spinner("企業詳細Excelを生成しています…"):
+                client = JQuantsClient()
+                data = _call_jquants(lambda: excel_export.build_company_detail_excel(client, code))
+            if data is not None:
+                st.session_state["detail_excel"] = data
+                st.session_state["detail_excel_code"] = code
+with exp_col2:
+    if st.button("実行表を生成"):
+        code = export_code.strip()
+        if not code:
+            st.warning("銘柄コードを入力してください。")
+        else:
+            with st.spinner("実行表Excelを生成しています…"):
+                client = JQuantsClient()
+                data = _call_jquants(lambda: excel_export.build_execution_table_excel(client, code))
+            if data is not None:
+                st.session_state["table_excel"] = data
+                st.session_state["table_excel_code"] = code
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+if "detail_excel" in st.session_state:
+    st.download_button(
+        "企業詳細をダウンロード",
+        data=st.session_state["detail_excel"],
+        file_name=f"企業詳細_{st.session_state['detail_excel_code']}.xlsx",
+        mime=_XLSX_MIME,
+    )
+if "table_excel" in st.session_state:
+    st.download_button(
+        "実行表をダウンロード",
+        data=st.session_state["table_excel"],
+        file_name=f"実行表_{st.session_state['table_excel_code']}.xlsx",
+        mime=_XLSX_MIME,
+    )
 
 st.caption(
     "本アプリの結果は投資判断の参考情報であり、投資助言ではありません。"

@@ -152,6 +152,87 @@ def _last_valid_eps_annualized(df: pd.DataFrame) -> float | None:
     return eps_numeric.loc[idx] * factor
 
 
+def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> dict:
+    """財務履歴と株価履歴から、時価総額・PER・PBR・配当利回り・最新終値等を計算する。
+
+    enrich_with_market_data（銘柄集計テーブル用）とexcel_export（Excel出力用）の
+    両方から呼ばれる共通ロジック。
+    """
+    latest_close = None
+    latest_price_date = None
+    if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
+        price_history = price_history.copy()
+        price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
+        price_history = price_history.dropna(subset=["Date"]).sort_values("Date")
+        if not price_history.empty:
+            latest_close = _to_numeric(price_history["C"]).iloc[-1]
+            latest_price_date = price_history["Date"].iloc[-1]
+
+    feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
+    if not fins.empty and "DiscDate" in fins.columns:
+        fins = fins.copy()
+        fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
+        fins = fins.dropna(subset=["DiscDate"]).sort_values("DiscDate")
+        if not fins.empty:
+            feps = _last_valid_value(fins, "FEPS")
+            bps = _last_valid_value(fins, "BPS")
+            shares_out = _last_valid_value(fins, "ShOutFY")
+            treasury_shares = _last_valid_value(fins, "TrShFY")
+            div_ann = _last_valid_value(fins, "FDivAnn")
+            annualized_eps = _last_valid_eps_annualized(fins)
+
+    market_cap = per = pbr = dividend_yield = None
+    if latest_close is not None and pd.notna(latest_close):
+        per_eps = feps if feps and pd.notna(feps) and feps > 0 else annualized_eps
+        if per_eps and pd.notna(per_eps) and per_eps > 0:
+            per = latest_close / per_eps
+        if bps is not None and pd.notna(bps) and bps > 0:
+            pbr = latest_close / bps
+        if shares_out is not None and pd.notna(shares_out):
+            float_shares = shares_out - (treasury_shares if pd.notna(treasury_shares) else 0)
+            market_cap = latest_close * float_shares
+        if div_ann is not None and pd.notna(div_ann) and div_ann >= 0:
+            # div_ann == 0 は「無配予定」の明示的な開示であり、未開示(NaN)とは区別する
+            dividend_yield = div_ann / latest_close
+
+    return {
+        "latest_close": latest_close,
+        "latest_price_date": latest_price_date,
+        "market_cap": market_cap,
+        "per": per,
+        "pbr": pbr,
+        "dividend_yield": dividend_yield,
+        "shares_out": shares_out,
+    }
+
+
+def estimate_listing_date(
+    price_history: pd.DataFrame,
+    lookback_years: int = LISTING_LOOKBACK_YEARS,
+) -> tuple[dt.date | None, bool | None]:
+    """株価履歴の最古日から、上場日の近似値を推定する。
+
+    契約プランの取得可能期間（Lightは過去5年）の開始日付近から既にデータが
+    ある場合は、それより前から上場していた可能性があるため正確な上場日は
+    不明とする（戻り値は (None, False)）。取得可能期間の開始日より明確に
+    後ろから始まっている場合は、新規上場の可能性が高いとみなす。
+    """
+    window_start = dt.date.today() - dt.timedelta(days=1) - dt.timedelta(days=365 * lookback_years)
+    if price_history.empty or "Date" not in price_history.columns:
+        return None, None
+
+    ph = price_history.copy()
+    ph["Date"] = pd.to_datetime(ph["Date"], errors="coerce")
+    ph = ph.dropna(subset=["Date"]).sort_values("Date")
+    if ph.empty:
+        return None, None
+
+    earliest_date = ph["Date"].iloc[0].date()
+    if (earliest_date - window_start).days > LISTING_DATE_BOUNDARY_TOLERANCE_DAYS:
+        return earliest_date, True
+    return None, False
+
+
 def enrich_with_market_data(client: JQuantsClient, summary: pd.DataFrame) -> pd.DataFrame:
     """銘柄ごとに最新の株価・決算情報を取得し、時価総額・PER・PBR・配当利回りを付与する。
 
@@ -176,74 +257,22 @@ def enrich_with_market_data(client: JQuantsClient, summary: pd.DataFrame) -> pd.
     if summary.empty:
         return summary.assign(**{c: pd.Series(dtype="float64") for c in new_cols})
 
-    window_start = dt.date.today() - dt.timedelta(days=1) - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS)
-
     rows = []
     for code in summary["Code"]:
         fins = endpoints.get_financials_by_code(client, code)
         price_history = endpoints.get_price_history_by_code(client, code)
 
-        latest_close = None
-        latest_price_date = None
-        estimated_listing_date = None
-        recently_listed = None
-        if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
-            price_history = price_history.copy()
-            price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
-            price_history = price_history.dropna(subset=["Date"]).sort_values("Date")
-            if not price_history.empty:
-                latest_close = _to_numeric(price_history["C"]).iloc[-1]
-                latest_price_date = price_history["Date"].iloc[-1]
-
-                earliest_date = price_history["Date"].iloc[0].date()
-                if (earliest_date - window_start).days > LISTING_DATE_BOUNDARY_TOLERANCE_DAYS:
-                    # データ取得可能期間の開始日より明確に後ろから始まっている
-                    # -> その頃に新規上場した可能性が高いと推定する
-                    estimated_listing_date = earliest_date
-                    recently_listed = True
-                else:
-                    # 取得可能期間の開始日付近から既にデータがある
-                    # -> それより前から上場していた可能性があり、正確な上場日は不明
-                    recently_listed = False
-
-        feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
-        if not fins.empty and "DiscDate" in fins.columns:
-            fins = fins.copy()
-            fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
-            fins = fins.dropna(subset=["DiscDate"]).sort_values("DiscDate")
-            if not fins.empty:
-                # 項目ごとに「最後に開示された値」を使う（BPS等は開示されない回もあるため、
-                # 直近1件の開示だけでは埋まらないケースが多い）
-                feps = _last_valid_value(fins, "FEPS")
-                bps = _last_valid_value(fins, "BPS")
-                shares_out = _last_valid_value(fins, "ShOutFY")
-                treasury_shares = _last_valid_value(fins, "TrShFY")
-                div_ann = _last_valid_value(fins, "FDivAnn")
-                annualized_eps = _last_valid_eps_annualized(fins)
-
-        market_cap = per = pbr = dividend_yield = None
-        if latest_close is not None and pd.notna(latest_close):
-            # PERは会社の通期予想EPS(FEPS)を優先し、無ければ実績EPSを年率換算して代用する
-            per_eps = feps if feps and pd.notna(feps) and feps > 0 else annualized_eps
-            if per_eps and pd.notna(per_eps) and per_eps > 0:
-                per = latest_close / per_eps
-            if bps is not None and pd.notna(bps) and bps > 0:
-                pbr = latest_close / bps
-            if shares_out is not None and pd.notna(shares_out):
-                float_shares = shares_out - (treasury_shares if pd.notna(treasury_shares) else 0)
-                market_cap = latest_close * float_shares
-            if div_ann is not None and pd.notna(div_ann) and div_ann >= 0:
-                # div_ann == 0 は「無配予定」の明示的な開示であり、未開示(NaN)とは区別する
-                dividend_yield = div_ann / latest_close
+        metrics = compute_market_metrics(fins, price_history)
+        estimated_listing_date, recently_listed = estimate_listing_date(price_history)
 
         rows.append({
             "Code": code,
-            "LatestClose": latest_close,
-            "LatestPriceDate": latest_price_date,
-            "MarketCap": market_cap,
-            "PER": per,
-            "PBR": pbr,
-            "DividendYield": dividend_yield,
+            "LatestClose": metrics["latest_close"],
+            "LatestPriceDate": metrics["latest_price_date"],
+            "MarketCap": metrics["market_cap"],
+            "PER": metrics["per"],
+            "PBR": metrics["pbr"],
+            "DividendYield": metrics["dividend_yield"],
             "EstimatedListingDate": estimated_listing_date,
             "RecentlyListed": recently_listed,
         })
