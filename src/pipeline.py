@@ -138,6 +138,20 @@ def _last_valid_value(df: pd.DataFrame, column: str) -> float | None:
     return values.iloc[-1] if not values.empty else None
 
 
+def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
+    """dfの中でcolumnが数値として読める最後の値を、CurPerType=='FY'の行だけから探す。
+
+    会社予想の修正開示(EarnForecastRevision等)の中には、CurPerTypeが四半期
+    (1Q等)のまま会社予想値を更新しているものがあり、単純に「最後に開示された値」
+    を取ると通期予想と四半期限定の値を区別できず、PER等の計算が大きく壊れる
+    （例: 通期予想EPSのつもりで四半期分の小さい値を使ってしまう）。そのため
+    会社予想EPS(FEPS)等は必ず通期(FY)区分の開示に限定する。
+    """
+    if column not in df.columns or "CurPerType" not in df.columns:
+        return None
+    return _last_valid_value(df.loc[df["CurPerType"] == "FY"], column)
+
+
 def _last_valid_eps_annualized(df: pd.DataFrame) -> float | None:
     """実績EPS(EPS)の最後の開示値を、その開示時点のCurPerTypeに応じて年率換算する。"""
     if "EPS" not in df.columns:
@@ -174,11 +188,11 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
         fins = fins.dropna(subset=["DiscDate"]).sort_values("DiscDate")
         if not fins.empty:
-            feps = _last_valid_value(fins, "FEPS")
+            feps = _last_valid_full_year_value(fins, "FEPS")
             bps = _last_valid_value(fins, "BPS")
             shares_out = _last_valid_value(fins, "ShOutFY")
             treasury_shares = _last_valid_value(fins, "TrShFY")
-            div_ann = _last_valid_value(fins, "FDivAnn")
+            div_ann = _last_valid_full_year_value(fins, "FDivAnn")
             annualized_eps = _last_valid_eps_annualized(fins)
 
     market_cap = per = pbr = dividend_yield = None

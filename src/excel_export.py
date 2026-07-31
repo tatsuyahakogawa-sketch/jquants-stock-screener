@@ -254,6 +254,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     f["DiscDate"] = pd.to_datetime(f["DiscDate"], errors="coerce")
     f["Sales"] = _to_numeric(f["Sales"])
     f["OdP"] = _to_numeric(f["OdP"])
+    f["OP"] = _to_numeric(f["OP"]) if "OP" in f.columns else float("nan")
     f = f.dropna(subset=["CurFYEn"])
 
     # 決算短信以外の開示（配当予想の修正等）はSales/OdPが空でもCurFYEnを持つため、
@@ -275,6 +276,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         latest_fy_row = fy_actual_rows.sort_values("DiscDate").iloc[-1]
         nx_fsales = _to_numeric(pd.Series([latest_fy_row.get("NxFSales")])).iloc[0]
         nx_fodp = _to_numeric(pd.Series([latest_fy_row.get("NxFOdP")])).iloc[0]
+        if pd.isna(nx_fodp):
+            # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(NxFOP)で代用する。
+            nx_fodp = _to_numeric(pd.Series([latest_fy_row.get("NxFOP")])).iloc[0]
         nxt_fy_end = pd.to_datetime(latest_fy_row.get("NxtFYEn"), errors="coerce")
         if pd.notna(nx_fsales) and pd.notna(nxt_fy_end) and nxt_fy_end.year not in actual_years:
             forecast_year = nxt_fy_end.year
@@ -286,7 +290,6 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         wb.save(buf)
         return buf.getvalue()
 
-    # 実績年度は新しい方からM,K,I,G,E,Cの順に右詰めで割り当てる。
     # C列から左詰めで実績年度を並べ、予想年度はその直後の列に置く。
     col_for_year = {}
     for i, year in enumerate(actual_years):
@@ -307,10 +310,13 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             continue
         sales = row["Sales"]
         profit = row["OdP"]
+        if pd.isna(profit) and pd.notna(row.get("OP")):
+            # IFRS採用企業には経常利益の区分が無いため、営業利益(OP)で代用する。
+            profit = row["OP"]
         if pd.notna(sales):
             sales_cell = ws[f"{col}{_ROW_SALES[period_type]}"]
             sales_cell.value = math.floor(sales / 1e8)
-            sales_cell.number_format = "0;[Red](0);-"
+            sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
             ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 2)
         close = _nearest_close(prices, row["CurPerEn"])
@@ -322,7 +328,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         if latest_forecast_sales is not None and pd.notna(latest_forecast_sales):
             forecast_sales_cell = ws[f"{forecast_col}{_ROW_SALES['FY']}"]
             forecast_sales_cell.value = math.floor(latest_forecast_sales / 1e8)
-            forecast_sales_cell.number_format = "0;[Red](0);-"
+            forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if latest_forecast_profit is not None and pd.notna(latest_forecast_profit):
             ws[f"{forecast_col}{_ROW_PROFIT['FY']}"] = round(latest_forecast_profit / 1e8, 2)
 
@@ -341,10 +347,13 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         latest_row = year_rows.sort_values("DiscDate").iloc[-1]
         fsales = _to_numeric(pd.Series([latest_row.get("FSales")])).iloc[0]
         fodp = _to_numeric(pd.Series([latest_row.get("FOdP")])).iloc[0]
+        if pd.isna(fodp):
+            # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(FOP)で代用する。
+            fodp = _to_numeric(pd.Series([latest_row.get("FOP")])).iloc[0]
         if pd.notna(fsales):
             cell = ws[f"{col}{_ROW_SALES['FY']}"]
             cell.value = math.floor(fsales / 1e8)
-            cell.number_format = "0;[Red](0);-"
+            cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
             ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 2)
 
