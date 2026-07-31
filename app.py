@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pandas as pd
 import requests
@@ -22,7 +23,45 @@ from src.pipeline import RULE_LABELS, POSITIVE_RULES, run_screening, build_summa
 
 load_dotenv()
 
+# Streamlit Community CloudではAPIキーをst.secrets（Settings > Secrets）で
+# 設定するが、jquants_client.py/edinet_client.pyはos.environから読む設計の
+# ため、ここでst.secretsの値をos.environに橋渡しする（ローカル実行で
+# secrets.tomlが無い場合はStreamlitSecretNotFoundErrorになるので何もしない）。
+try:
+    for _key in ("JQUANTS_API_KEY", "EDINET_API_KEY"):
+        if _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
+
 st.set_page_config(page_title="日本株スクリーニング", layout="wide")
+
+
+def _check_password() -> bool:
+    """クラウド公開時、無関係な人に開かれてAPIキー（レート制限）を消費されるのを
+    防ぐための簡易パスワード認証。secrets.tomlにapp_passwordが設定されていない
+    場合（ローカル実行等）は認証をスキップする。
+    """
+    try:
+        correct = st.secrets["app_password"]
+    except (KeyError, FileNotFoundError):
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("日本株スクリーニング")
+    password = st.text_input("パスワード", type="password")
+    if password:
+        if password == correct:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います")
+    return False
+
+
+if not _check_password():
+    st.stop()
 
 # 印刷時は入力欄・ボタン・サイドバー等を隠し、結果テーブルだけを表示する。
 # st.dataframeは仮想スクロールのグリッドで画面外の行が印刷に出ないため、

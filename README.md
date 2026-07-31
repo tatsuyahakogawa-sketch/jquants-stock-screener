@@ -48,6 +48,19 @@ cp .env.example .env
 streamlit run app.py
 ```
 
+`src/`以下のコードを更新した場合、Streamlitのホットリロードはapp.py本体は再実行するがサブモジュール（`pipeline.py`, `excel_export.py`等）の変更を反映しないことがあるため、コード修正後はプロセスを完全に再起動（Ctrl+Cで停止して`streamlit run app.py`を再実行）すること。
+
+### 複数PCでの利用・クラウドデプロイ
+
+複数のPCで作業する場合、各PCでローカルにStreamlitを起動する方式は「pull忘れ」「プロセス再起動忘れ」「PCごとのキャッシュのズレ」で結果が食い違いやすい。代わりにStreamlit Community Cloud（無料）にデプロイし、GitHubリポジトリに接続しておけば、どのPCからプッシュしてもクラウド側が自動的に再デプロイされ、常に同じ1つのアプリを見ることになる。
+
+デプロイ手順:
+1. https://share.streamlit.io/ でGitHubアカウント連携し、このリポジトリ（プライベートでも可）を指定してアプリを作成
+2. アプリの管理画面「Settings > Secrets」に `.streamlit/secrets.toml.example` の内容を参考に、`app_password`（アプリの合言葉）・`JQUANTS_API_KEY`・`EDINET_API_KEY` を設定する
+3. 以降はGitHubにプッシュするたびに自動で再デプロイされる
+
+`app_password`を設定すると、アプリを開いたときにパスワード入力画面が出る（`app.py`の`_check_password`）。これはURLを知っている第三者が自分のAPIキーでレート制限を消費してしまうのを防ぐための簡易ゲートで、ローカル実行時（`.streamlit/secrets.toml`を作らない場合）は認証をスキップする。
+
 ### V2移行について
 
 2026年1月にJ-Quants APIは V2 に移行し、認証方式が
