@@ -90,3 +90,27 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 
 - APIキーや認証情報を絶対にコード・リポジトリに直接書き込まない
 - 個人情報（氏名・住所・電話番号等）を含むファイルをコードベースに含めない
+
+## 複数PCでの開発（デスクトップ・ノートPC）
+
+このプロジェクトフォルダ自体をOneDrive等のクラウド同期フォルダに置くことは禁止
+（`.git`をファイル同期ツールと併用すると、同時操作でリポジトリが壊れたり
+「ファイル名 (1).py」のような重複ファイルが生じたりする実績多数のため）。
+
+代わりにGitHub（private repo: `tatsuyahakogawa-sketch/jquants-stock-screener`）
+を経由する。各PCでの作業ルール:
+
+- 作業を始める前に必ず `git pull origin main`
+- 作業が終わったら `git add` → `git commit` → `git push origin main`
+- `src/`以下のコードを変更した後、ローカルでStreamlitを動かして確認する場合は
+  プロセスを完全に再起動すること（`streamlit run app.py`のホットリロードは
+  app.py本体は再実行するが、`pipeline.py`や`excel_export.py`等のサブモジュールの
+  変更はプロセスを再起動しないと反映されないことがあると2026-07-31に実機で確認済み）
+
+利用者向けのアプリ自体はStreamlit Community Cloudにデプロイ済み
+（GitHubのmainブランチにプッシュすると自動再デプロイされる）。アプリ設定の
+「Secrets」に`app_password`・`JQUANTS_API_KEY`・`EDINET_API_KEY`を設定し、
+「Sharing」を「このアプリは公開されており、検索可能です」にしておくことで、
+URLとアプリ内のパスワードさえ分かればどのPC・ブラウザからでも同じ最新版に
+アクセスできる（Streamlit Cloud自体の非公開設定と、アプリ内のパスワード認証は
+別レイヤーなので両方確認すること）。
