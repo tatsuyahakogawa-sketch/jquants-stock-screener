@@ -291,6 +291,8 @@ st.caption(
 )
 export_code = st.text_input("銘柄コード", key="export_code", placeholder="例: 6584")
 
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
 exp_col1, exp_col2 = st.columns(2)
 with exp_col1:
     if st.button("企業詳細を生成"):
@@ -304,6 +306,13 @@ with exp_col1:
             if data is not None:
                 st.session_state["detail_excel"] = data
                 st.session_state["detail_excel_code"] = code
+    if "detail_excel" in st.session_state:
+        st.download_button(
+            "企業詳細をダウンロード",
+            data=st.session_state["detail_excel"],
+            file_name=f"企業詳細_{st.session_state['detail_excel_code']}.xlsx",
+            mime=_XLSX_MIME,
+        )
 with exp_col2:
     if st.button("実行表を生成"):
         code = export_code.strip()
@@ -316,23 +325,13 @@ with exp_col2:
             if data is not None:
                 st.session_state["table_excel"] = data
                 st.session_state["table_excel_code"] = code
-
-_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-if "detail_excel" in st.session_state:
-    st.download_button(
-        "企業詳細をダウンロード",
-        data=st.session_state["detail_excel"],
-        file_name=f"企業詳細_{st.session_state['detail_excel_code']}.xlsx",
-        mime=_XLSX_MIME,
-    )
-if "table_excel" in st.session_state:
-    st.download_button(
-        "実行表をダウンロード",
-        data=st.session_state["table_excel"],
-        file_name=f"実行表_{st.session_state['table_excel_code']}.xlsx",
-        mime=_XLSX_MIME,
-    )
+    if "table_excel" in st.session_state:
+        st.download_button(
+            "実行表をダウンロード",
+            data=st.session_state["table_excel"],
+            file_name=f"実行表_{st.session_state['table_excel_code']}.xlsx",
+            mime=_XLSX_MIME,
+        )
 
 st.caption(
     "本アプリの結果は投資判断の参考情報であり、投資助言ではありません。"
