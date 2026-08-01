@@ -86,6 +86,18 @@ st.markdown(
     .print-only th, .print-only td {
         border: 1px solid #999; padding: 4px 6px; text-align: left;
     }
+    /* multiselectの選択タグ（赤いタグ）が画面幅不足で条件名を省略表示するのを防ぐ。
+       小さい画面でもタグ内テキストを折り返して全文表示する。 */
+    [data-baseweb="tag"] {
+        max-width: none !important;
+        height: auto !important;
+    }
+    [data-baseweb="tag"] span {
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: unset !important;
+        max-width: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -124,12 +136,18 @@ count_target_rules = st.multiselect(
     default=[r for r in POSITIVE_RULES if r != "equity_ratio_high"],
     format_func=lambda k: RULE_LABELS[k],
 )
-min_match = st.slider(
-    "最低いくつの条件に合致した銘柄を表示するか",
-    min_value=1,
-    max_value=max(len(count_target_rules), 1),
-    value=1,
-)
+rule_count = len(count_target_rules)
+if rule_count <= 1:
+    # st.sliderはmin_value < max_valueを要求するため、対象条件が1つ（または0）の
+    # ときはスライダーを出さず固定値にする（1つしか無ければ「最低1つ」で確定するため）。
+    min_match = 1
+else:
+    min_match = st.slider(
+        "最低いくつの条件に合致した銘柄を表示するか",
+        min_value=1,
+        max_value=rule_count,
+        value=1,
+    )
 exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True)
 
 if st.button("スクリーニング実行", type="primary"):
