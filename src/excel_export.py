@@ -145,7 +145,9 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
         ws["M2"] = round(per, 2)
     dividend_yield = metrics["dividend_yield"]
     if dividend_yield is not None and pd.notna(dividend_yield):
-        ws["Q2"] = dividend_yield
+        # 表示形式(0.0%)による四捨五入を避けるため、小数点第1位（0.1%単位）に
+        # あらかじめ切り捨てておく。
+        ws["Q2"] = math.trunc(dividend_yield * 1000) / 1000
 
     latest_close = metrics["latest_close"]
     if latest_close is not None and pd.notna(latest_close):
@@ -241,7 +243,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     if metrics["per"] is not None and pd.notna(metrics["per"]):
         ws["J2"] = round(metrics["per"], 2)
     if metrics["dividend_yield"] is not None and pd.notna(metrics["dividend_yield"]):
-        ws["O2"] = metrics["dividend_yield"] * 100
+        # 表示形式(0.0)による四捨五入を避けるため、小数点第1位にあらかじめ
+        # 切り捨てておく。
+        ws["O2"] = math.trunc(metrics["dividend_yield"] * 1000) / 10
     if metrics["latest_close"] is not None and pd.notna(metrics["latest_close"]):
         ws["B3"] = round(metrics["latest_close"])
 
