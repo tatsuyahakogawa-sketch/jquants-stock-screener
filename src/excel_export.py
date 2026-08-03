@@ -208,10 +208,10 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     テンプレート(templates/execution_table_template.xlsx、元の三桜工業実行表から
     個社データを除いたもの)のレイアウト・書式・数式(利益率・検算)をそのまま使い、
     値セルだけを埋める。対象年度は契約プラン（Lightは過去5年）でJ-Quantsから
-    取得できる実績年度＋会社予想年度（今期・来期の2年分まで、開示されている
-    範囲で）に自動で限定される（テンプレートの列数7枠が上限で、予想年度分の
-    枠を確保した残りに実績年度を割り当てる。それより古い年度は手動での追記が
-    必要）。
+    取得できる実績年度（直近5年分）＋今期・来期の予想年度2年分に自動で限定
+    される（テンプレートの列数7枠が上限）。予想の2列は会社予想が未開示でも
+    見出しだけ用意し、値は開示されていれば自動で、無ければ手動で入力する。
+    それより古い実績年度は手動での追記が必要。
     """
     code = str(code)
     master_row = _get_master_row(client, code)
@@ -241,7 +241,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     if metrics["per"] is not None and pd.notna(metrics["per"]):
         ws["J2"] = round(metrics["per"], 2)
     if metrics["dividend_yield"] is not None and pd.notna(metrics["dividend_yield"]):
-        ws["O2"] = round(metrics["dividend_yield"] * 100, 2)
+        ws["O2"] = metrics["dividend_yield"] * 100
     if metrics["latest_close"] is not None and pd.notna(metrics["latest_close"]):
         ws["B3"] = round(metrics["latest_close"])
 
@@ -300,15 +300,31 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         for year, sales, profit in forecast_candidates
         if year not in all_actual_years
     }
-    forecast_years = sorted(forecast_data.keys())
+
+    # 今期・来期（直近の実績年度の次の2年）は、会社予想がまだ開示されていない
+    # 場合でも「YYYY年予想」の列見出し自体は常に用意する（値は空欄のまま手動
+    # 入力できるようにする）。開示済みの予想がある場合はforecast_dataの値で
+    # 自動的に埋まる。
+    last_actual_year = max(all_actual_years) if all_actual_years else None
+    default_forecast_years = (
+        [last_actual_year + 1, last_actual_year + 2] if last_actual_year is not None else []
+    )
+    forecast_years = sorted(
+        {
+            year
+            for year in set(forecast_data.keys()) | set(default_forecast_years)
+            if year not in all_actual_years
+        }
+    )[:2]
 
     if not all_actual_years and not forecast_years:
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
 
-    # テンプレートの年度枠は7つ。予想年度分の枠を確保した残りに、実績年度を
-    # 直近優先でC列から左詰めで並べ、予想年度はその直後の列に置く。
+    # テンプレートの年度枠は7つ。予想年度分の枠(今期・来期の2つ)を確保した
+    # 残りに、実績年度を直近優先でC列から左詰めで並べ、予想年度はその直後の
+    # 列に置く。
     max_actual = max(len(_YEAR_COLS) - len(forecast_years), 0)
     actual_years = all_actual_years[-max_actual:] if max_actual else []
 
@@ -321,7 +337,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             col_for_year[year] = _YEAR_COLS[idx]
 
     for year, col in col_for_year.items():
-        ws[f"{col}4"] = f"{year}年予想" if year in forecast_data else f"{year}年"
+        ws[f"{col}4"] = f"{year}年予想" if year in forecast_years else f"{year}年"
 
     for _, row in f_actual.sort_values(["CurFYEn", "CurPerType"]).iterrows():
         period_type = row["CurPerType"]
