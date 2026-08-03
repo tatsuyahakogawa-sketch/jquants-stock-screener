@@ -86,6 +86,18 @@ st.markdown(
     .print-only th, .print-only td {
         border: 1px solid #999; padding: 4px 6px; text-align: left;
     }
+    /* multiselectの選択タグ（赤いタグ）が画面幅不足で条件名を省略表示するのを防ぐ。
+       小さい画面でもタグ内テキストを折り返して全文表示する。 */
+    [data-baseweb="tag"] {
+        max-width: none !important;
+        height: auto !important;
+    }
+    [data-baseweb="tag"] span {
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: unset !important;
+        max-width: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -124,12 +136,18 @@ count_target_rules = st.multiselect(
     default=[r for r in POSITIVE_RULES if r != "equity_ratio_high"],
     format_func=lambda k: RULE_LABELS[k],
 )
-min_match = st.slider(
-    "最低いくつの条件に合致した銘柄を表示するか",
-    min_value=1,
-    max_value=max(len(count_target_rules), 1),
-    value=1,
-)
+rule_count = len(count_target_rules)
+if rule_count <= 1:
+    # st.sliderはmin_value < max_valueを要求するため、対象条件が1つ（または0）の
+    # ときはスライダーを出さず固定値にする（1つしか無ければ「最低1つ」で確定するため）。
+    min_match = 1
+else:
+    min_match = st.slider(
+        "最低いくつの条件に合致した銘柄を表示するか",
+        min_value=1,
+        max_value=rule_count,
+        value=1,
+    )
 exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True)
 
 if st.button("スクリーニング実行", type="primary"):
@@ -291,6 +309,8 @@ st.caption(
 )
 export_code = st.text_input("銘柄コード", key="export_code", placeholder="例: 6584")
 
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
 exp_col1, exp_col2 = st.columns(2)
 with exp_col1:
     if st.button("企業詳細を生成"):
@@ -304,6 +324,13 @@ with exp_col1:
             if data is not None:
                 st.session_state["detail_excel"] = data
                 st.session_state["detail_excel_code"] = code
+    if "detail_excel" in st.session_state:
+        st.download_button(
+            "企業詳細をダウンロード",
+            data=st.session_state["detail_excel"],
+            file_name=f"企業詳細_{st.session_state['detail_excel_code']}.xlsx",
+            mime=_XLSX_MIME,
+        )
 with exp_col2:
     if st.button("実行表を生成"):
         code = export_code.strip()
@@ -316,23 +343,13 @@ with exp_col2:
             if data is not None:
                 st.session_state["table_excel"] = data
                 st.session_state["table_excel_code"] = code
-
-_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-if "detail_excel" in st.session_state:
-    st.download_button(
-        "企業詳細をダウンロード",
-        data=st.session_state["detail_excel"],
-        file_name=f"企業詳細_{st.session_state['detail_excel_code']}.xlsx",
-        mime=_XLSX_MIME,
-    )
-if "table_excel" in st.session_state:
-    st.download_button(
-        "実行表をダウンロード",
-        data=st.session_state["table_excel"],
-        file_name=f"実行表_{st.session_state['table_excel_code']}.xlsx",
-        mime=_XLSX_MIME,
-    )
+    if "table_excel" in st.session_state:
+        st.download_button(
+            "実行表をダウンロード",
+            data=st.session_state["table_excel"],
+            file_name=f"実行表_{st.session_state['table_excel_code']}.xlsx",
+            mime=_XLSX_MIME,
+        )
 
 st.caption(
     "本アプリの結果は投資判断の参考情報であり、投資助言ではありません。"

@@ -23,6 +23,8 @@ RULE_LABELS = {
     "stock_split": "株式分割・併合等（調整係数の変化を検知）",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
+    "pbr_low": "PBR1倍以下",
+    "two_quarter_growth": "四半期決算2期連続増収増益",
     "market_upgrade_to_prime": "スタンダード/グロースからプライムへ市場変更",
     "new_facility_or_store": "新工場・新店舗の開示（TDnetタイトル検出・要確認）",
     "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場（TDnetタイトル検出・要確認）",
@@ -63,6 +65,8 @@ def run_screening(
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
         rules.detect_profit_doubling(statements_df),
+        rules.detect_low_pbr(statements_df, quotes_df),
+        rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
         rules.detect_market_upgrade_to_prime(master_history_df),
     ]

@@ -25,6 +25,7 @@ from src.config import (
     PROFIT_DOUBLING_YEARS,
     PROFIT_DOUBLING_MULTIPLE,
     DOWNWARD_REVISION_THRESHOLD,
+    PBR_LOW_THRESHOLD,
 )
 
 # --- 列名定数（要: 実際のAPIレスポンスと突き合わせて確認） -----------------
@@ -48,6 +49,7 @@ STMT_EQUITY_RATIO = "EqAR"  # 自己資本比率。0.6 = 60% のような比率�
 STMT_FORECAST_NET_SALES = "FSales"
 STMT_FORECAST_OPERATING_PROFIT = "FOP"
 STMT_FORECAST_PROFIT = "FNP"
+STMT_BPS = "BPS"  # 1株あたり純資産（PBR計算用）
 
 MASTER_CODE = "Code"
 MASTER_DATE = "Date"
@@ -253,6 +255,106 @@ def detect_downward_revision(statements_df: pd.DataFrame) -> pd.DataFrame:
     return hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
         columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
     )
+
+
+def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """直近2四半期が共に増収増益（売上高・経常利益とも前年同期を上回る）の開示を検出する。
+
+    増収増益の判定は同一銘柄・同一決算期タイプ(CurPerType)内で前年同期と比較する
+    （detect_sales_growthと同じ手法）。「2期連続」は、対象の開示とその銘柄の
+    時系列上ひとつ前の開示（決算期タイプが変わってもよい。例: 1Q→2Q）の
+    両方が増収増益であることを見る。
+    """
+    required = {
+        STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_DISCLOSED_DATE,
+        STMT_NET_SALES, STMT_ORDINARY_PROFIT,
+    }
+    if statements_df.empty or not required.issubset(statements_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = statements_df.copy()
+    df[STMT_NET_SALES] = _to_numeric(df[STMT_NET_SALES])
+    df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
+    df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
+    df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
+    df = df.dropna(subset=[STMT_NET_SALES, STMT_ORDINARY_PROFIT, STMT_PERIOD_END, STMT_DISCLOSED_DATE])
+
+    df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
+    df["prev_sales"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_NET_SALES].shift(1)
+    df["prev_profit"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_ORDINARY_PROFIT].shift(1)
+    df["prev_period_end"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_PERIOD_END].shift(1)
+
+    gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
+    yoy_ok = gap_days.between(330, 400)
+    df["grew_yoy"] = (
+        yoy_ok
+        & df["prev_sales"].notna() & (df["prev_sales"] > 0) & (df[STMT_NET_SALES] > df["prev_sales"])
+        & df["prev_profit"].notna() & (df["prev_profit"] > 0) & (df[STMT_ORDINARY_PROFIT] > df["prev_profit"])
+    )
+
+    # 「2期連続」判定のため、銘柄内を時系列(開示日)順に並べ直して直前の開示と比較する
+    df = df.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
+    df["prev_grew_yoy"] = df.groupby(STMT_CODE)["grew_yoy"].shift(1)
+    two_in_a_row = df["grew_yoy"] & df["prev_grew_yoy"].fillna(False)
+
+    hit = df.loc[two_in_a_row].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "two_quarter_growth"
+    hit["detail"] = (
+        "増収増益2期連続（売上 " + hit["prev_sales"].round(0).astype(str) + "→" + hit[STMT_NET_SALES].round(0).astype(str)
+        + "、経常利益 " + hit["prev_profit"].round(0).astype(str) + "→" + hit[STMT_ORDINARY_PROFIT].round(0).astype(str)
+        + "）"
+    )
+    return hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
+        columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
+    )
+
+
+def detect_low_pbr(statements_df: pd.DataFrame, quotes_df: pd.DataFrame) -> pd.DataFrame:
+    """PBR(株価純資産倍率)が1倍以下の開示を検出する。
+
+    開示時点のBPS(1株純資産)と、開示日以前で直近の株価終値(quotes_df)から計算する
+    （現在の株価ではなく、開示時点のPBRで判定する）。
+    """
+    required_stmt = {STMT_CODE, STMT_DISCLOSED_DATE, STMT_BPS}
+    required_quotes = {QUOTES_CODE, QUOTES_DATE, QUOTES_CLOSE}
+    if statements_df.empty or not required_stmt.issubset(statements_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+    if quotes_df.empty or not required_quotes.issubset(quotes_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = statements_df.copy()
+    df[STMT_BPS] = _to_numeric(df[STMT_BPS])
+    df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
+    df = df.dropna(subset=[STMT_BPS, STMT_DISCLOSED_DATE])
+    df = df.loc[df[STMT_BPS] > 0]
+    if df.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    quotes = quotes_df[[QUOTES_CODE, QUOTES_DATE, QUOTES_CLOSE]].copy()
+    quotes[QUOTES_DATE] = pd.to_datetime(quotes[QUOTES_DATE], errors="coerce")
+    quotes[QUOTES_CLOSE] = _to_numeric(quotes[QUOTES_CLOSE])
+    quotes = quotes.dropna(subset=[QUOTES_DATE, QUOTES_CLOSE])
+    quotes = quotes.rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date", QUOTES_CLOSE: "Close"})
+    quotes = quotes.sort_values("Date")
+
+    df = df.rename(columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}).sort_values("Date")
+    merged = pd.merge_asof(df, quotes, by="Code", on="Date", direction="backward")
+
+    valid = merged[STMT_BPS].notna() & merged["Close"].notna()
+    merged["pbr"] = pd.NA
+    merged.loc[valid, "pbr"] = merged.loc[valid, "Close"] / merged.loc[valid, STMT_BPS]
+    merged["pbr"] = _to_numeric(merged["pbr"])
+
+    result = merged.loc[valid & (merged["pbr"] <= PBR_LOW_THRESHOLD)].copy()
+    if result.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    result["rule"] = "pbr_low"
+    result["detail"] = "PBR " + result["pbr"].round(2).astype(str) + "倍"
+    return result[["Code", "Date", "rule", "detail"]]
 
 
 def detect_market_upgrade_to_prime(master_history_df: pd.DataFrame) -> pd.DataFrame:
