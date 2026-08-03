@@ -192,8 +192,9 @@ def _format_shareholders_text(shareholders: pd.DataFrame, top_n: int = 6) -> str
 EXECUTION_TABLE_TEMPLATE = TEMPLATE_DIR / "execution_table_template.xlsx"
 
 # テンプレート(templates/execution_table_template.xlsx)の固定レイアウト。
-# 年度列は7枠(C,E,G,I,K,M,O)あり、C列から左詰めで実績年度を並べ、直近の
-# 会社予想年度はその直後の列に置く（Oの右隣に単位列があるのと同じ構成）。
+# 年度列は7枠(C,E,G,I,K,M,O)あり、C列から左詰めで実績年度を並べ、会社予想
+# 年度（今期・来期の2年分まで、開示されている範囲で）はその直後の列に置く
+# （Oの右隣に単位列があるのと同じ構成）。
 _YEAR_COLS = ["C", "E", "G", "I", "K", "M", "O"]
 _ROW_SALES = {"1Q": 5, "2Q": 6, "3Q": 7, "FY": 8}
 _ROW_PROFIT = {"1Q": 9, "2Q": 10, "3Q": 11, "FY": 12}
@@ -207,8 +208,10 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     テンプレート(templates/execution_table_template.xlsx、元の三桜工業実行表から
     個社データを除いたもの)のレイアウト・書式・数式(利益率・検算)をそのまま使い、
     値セルだけを埋める。対象年度は契約プラン（Lightは過去5年）でJ-Quantsから
-    取得できる実績年度（直近6年分、テンプレートの列数に合わせる）＋直近の
-    会社予想年度に自動で限定される（それより古い年度は手動での追記が必要）。
+    取得できる実績年度＋会社予想年度（今期・来期の2年分まで、開示されている
+    範囲で）に自動で限定される（テンプレートの列数7枠が上限で、予想年度分の
+    枠を確保した残りに実績年度を割り当てる。それより古い年度は手動での追記が
+    必要）。
     """
     code = str(code)
     master_row = _get_master_row(client, code)
@@ -260,45 +263,65 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     # 決算短信以外の開示（配当予想の修正等）はSales/OdPが空でもCurFYEnを持つため、
     # 実績データの年度は「Salesが実際に入っている行」だけから拾う。
     f_actual = f.dropna(subset=["Sales"])
-    actual_years = sorted(f_actual["CurFYEn"].dt.year.unique().tolist())
-    # テンプレートの実績年度枠は6つ(C,E,G,I,K,M)なので、直近6年分に絞る。
-    actual_years = actual_years[-6:]
+    all_actual_years = sorted(f_actual["CurFYEn"].dt.year.unique().tolist())
 
-    # 本決算(FY)実績の開示時点では、会社予想は「次の期(NxtFYEn)」に対する
-    # NxFSales/NxFOdPとして入っている（FSales/FOdPはその期自体の予想であり、
-    # 実績が確定済みのため空になる）。直近の本決算開示から次期の予想年度を
-    # 求め、その年度がまだ無ければ追加する（テンプレートのO列＝予想専用枠）。
-    forecast_year = None
-    latest_forecast_sales = None
-    latest_forecast_profit = None
-    fy_actual_rows = f_actual.loc[f_actual["CurPerType"] == "FY"]
-    if not fy_actual_rows.empty:
-        latest_fy_row = fy_actual_rows.sort_values("DiscDate").iloc[-1]
+    # 「今期」の会社予想(FSales/FOdP)・「来期」の会社予想(NxFSales/NxFOdP)は、
+    # CurPerType="FY"の開示（本決算実績、または本決算の会社予想を修正する
+    # EarnForecastRevision等）でのみ年間換算の値になる。四半期(1Q/2Q/3Q)を
+    # 対象にしたEarnForecastRevisionではFSales等がその四半期だけの予想値に
+    # なることがあるため、それらは使わずCurPerType="FY"の開示だけから拾う
+    # （本決算実績の開示時点ではFSales/FOdPは実績確定済みのため空になり、
+    # NxFSales/NxFOdPだけが次期予想として入っている）。
+    forecast_candidates: list[tuple[int, float, float]] = []
+    fy_rows = f.loc[f["CurPerType"] == "FY"]
+    if not fy_rows.empty:
+        latest_fy_row = fy_rows.sort_values("DiscDate").iloc[-1]
+
+        cur_fy_end = latest_fy_row["CurFYEn"]
+        fsales = _to_numeric(pd.Series([latest_fy_row.get("FSales")])).iloc[0]
+        fodp = _to_numeric(pd.Series([latest_fy_row.get("FOdP")])).iloc[0]
+        if pd.isna(fodp):
+            # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(FOP)で代用する。
+            fodp = _to_numeric(pd.Series([latest_fy_row.get("FOP")])).iloc[0]
+        if pd.notna(cur_fy_end) and pd.notna(fsales):
+            forecast_candidates.append((int(cur_fy_end.year), fsales, fodp))
+
+        nxt_fy_end = pd.to_datetime(latest_fy_row.get("NxtFYEn"), errors="coerce")
         nx_fsales = _to_numeric(pd.Series([latest_fy_row.get("NxFSales")])).iloc[0]
         nx_fodp = _to_numeric(pd.Series([latest_fy_row.get("NxFOdP")])).iloc[0]
         if pd.isna(nx_fodp):
             # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(NxFOP)で代用する。
             nx_fodp = _to_numeric(pd.Series([latest_fy_row.get("NxFOP")])).iloc[0]
-        nxt_fy_end = pd.to_datetime(latest_fy_row.get("NxtFYEn"), errors="coerce")
-        if pd.notna(nx_fsales) and pd.notna(nxt_fy_end) and nxt_fy_end.year not in actual_years:
-            forecast_year = nxt_fy_end.year
-            latest_forecast_sales = nx_fsales
-            latest_forecast_profit = nx_fodp
+        if pd.notna(nxt_fy_end) and pd.notna(nx_fsales):
+            forecast_candidates.append((int(nxt_fy_end.year), nx_fsales, nx_fodp))
 
-    if not actual_years and forecast_year is None:
+    forecast_data: dict[int, tuple[float, float]] = {
+        year: (sales, profit)
+        for year, sales, profit in forecast_candidates
+        if year not in all_actual_years
+    }
+    forecast_years = sorted(forecast_data.keys())
+
+    if not all_actual_years and not forecast_years:
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
 
-    # C列から左詰めで実績年度を並べ、予想年度はその直後の列に置く。
+    # テンプレートの年度枠は7つ。予想年度分の枠を確保した残りに、実績年度を
+    # 直近優先でC列から左詰めで並べ、予想年度はその直後の列に置く。
+    max_actual = max(len(_YEAR_COLS) - len(forecast_years), 0)
+    actual_years = all_actual_years[-max_actual:] if max_actual else []
+
     col_for_year = {}
     for i, year in enumerate(actual_years):
         col_for_year[year] = _YEAR_COLS[i]
-    if forecast_year is not None and len(actual_years) < len(_YEAR_COLS):
-        col_for_year[forecast_year] = _YEAR_COLS[len(actual_years)]
+    for i, year in enumerate(forecast_years):
+        idx = len(actual_years) + i
+        if idx < len(_YEAR_COLS):
+            col_for_year[year] = _YEAR_COLS[idx]
 
     for year, col in col_for_year.items():
-        ws[f"{col}4"] = f"{year}予想" if year == forecast_year else f"{year}年"
+        ws[f"{col}4"] = f"{year}年予想" if year in forecast_data else f"{year}年"
 
     for _, row in f_actual.sort_values(["CurFYEn", "CurPerType"]).iterrows():
         period_type = row["CurPerType"]
@@ -323,21 +346,24 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
 
-    if forecast_year is not None:
-        forecast_col = col_for_year[forecast_year]
-        if latest_forecast_sales is not None and pd.notna(latest_forecast_sales):
-            forecast_sales_cell = ws[f"{forecast_col}{_ROW_SALES['FY']}"]
-            forecast_sales_cell.value = math.floor(latest_forecast_sales / 1e8)
+    for year, (sales, profit) in forecast_data.items():
+        col = col_for_year.get(year)
+        if col is None:
+            continue
+        if pd.notna(sales):
+            forecast_sales_cell = ws[f"{col}{_ROW_SALES['FY']}"]
+            forecast_sales_cell.value = math.floor(sales / 1e8)
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
-        if latest_forecast_profit is not None and pd.notna(latest_forecast_profit):
-            ws[f"{forecast_col}{_ROW_PROFIT['FY']}"] = round(latest_forecast_profit / 1e8, 2)
+        if pd.notna(profit):
+            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 2)
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
     # 直近の開示に入っている会社予想(FSales/FOdP、その期自体の予想)で埋める
     # （本決算が実際に出れば、次回生成時に実績値へ自動的に置き換わる）。
-    for year, col in col_for_year.items():
-        if year == forecast_year:
+    for year in actual_years:
+        col = col_for_year.get(year)
+        if col is None:
             continue
         if ws[f"{col}{_ROW_SALES['FY']}"].value is not None:
             continue
