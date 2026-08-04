@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import logging
 import math
 from pathlib import Path
 
@@ -17,6 +18,8 @@ import pandas as pd
 
 from src import edinet_client, endpoints, pipeline
 from src.jquants_client import JQuantsClient
+
+logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
 COMPANY_DETAIL_TEMPLATE = TEMPLATE_DIR / "company_detail_template.xlsx"
@@ -276,10 +279,11 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     # なることがあるため、それらは使わずCurPerType="FY"の開示だけから拾う
     # （本決算実績の開示時点ではFSales/FOdPは実績確定済みのため空になり、
     # NxFSales/NxFOdPだけが次期予想として入っている）。
-    forecast_candidates: list[tuple[int, float, float]] = []
+    forecast_candidates: list[tuple[int, float, float, pd.Timestamp]] = []
     fy_rows = f.loc[f["CurPerType"] == "FY"]
     if not fy_rows.empty:
         latest_fy_row = fy_rows.sort_values("DiscDate").iloc[-1]
+        disc_date = latest_fy_row["DiscDate"]
 
         cur_fy_end = latest_fy_row["CurFYEn"]
         fsales = _to_numeric(pd.Series([latest_fy_row.get("FSales")])).iloc[0]
@@ -288,7 +292,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(FOP)で代用する。
             fodp = _to_numeric(pd.Series([latest_fy_row.get("FOP")])).iloc[0]
         if pd.notna(cur_fy_end) and pd.notna(fsales):
-            forecast_candidates.append((int(cur_fy_end.year), fsales, fodp))
+            forecast_candidates.append((int(cur_fy_end.year), fsales, fodp, disc_date))
 
         nxt_fy_end = pd.to_datetime(latest_fy_row.get("NxtFYEn"), errors="coerce")
         nx_fsales = _to_numeric(pd.Series([latest_fy_row.get("NxFSales")])).iloc[0]
@@ -297,13 +301,21 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             # IFRS採用企業には経常利益予想の区分が無いため、営業利益予想(NxFOP)で代用する。
             nx_fodp = _to_numeric(pd.Series([latest_fy_row.get("NxFOP")])).iloc[0]
         if pd.notna(nxt_fy_end) and pd.notna(nx_fsales):
-            forecast_candidates.append((int(nxt_fy_end.year), nx_fsales, nx_fodp))
+            forecast_candidates.append((int(nxt_fy_end.year), nx_fsales, nx_fodp, disc_date))
 
-    forecast_data: dict[int, tuple[float, float]] = {
-        year: (sales, profit)
-        for year, sales, profit in forecast_candidates
+    forecast_data: dict[int, tuple[float, float, pd.Timestamp]] = {
+        year: (sales, profit, disc_date)
+        for year, sales, profit, disc_date in forecast_candidates
         if year not in all_actual_years
     }
+    logger.info(
+        "[%s] 最新実績決算期=%s 会社予想決算期=%s 会社予想売上=%s 会社予想経常利益=%s",
+        code,
+        all_actual_years[-1] if all_actual_years else None,
+        sorted(forecast_data.keys()),
+        {y: v[0] for y, v in forecast_data.items()},
+        {y: v[1] for y, v in forecast_data.items()},
+    )
 
     # 今期・来期（直近の実績年度の次の2年）は、会社予想がまだ開示されていない
     # 場合でも「YYYY年予想」の列見出し自体は常に用意する（値は空欄のまま手動
@@ -366,7 +378,8 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
 
-    for year, (sales, profit) in forecast_data.items():
+    forecast_source_notes = []
+    for year, (sales, profit, disc_date) in forecast_data.items():
         col = col_for_year.get(year)
         if col is None:
             continue
@@ -376,6 +389,10 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
             ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 2)
+        if pd.notna(disc_date):
+            forecast_source_notes.append(
+                f"{year}年会社予想：J-Quants /fins/summary、開示日 {disc_date.date()}"
+            )
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
@@ -403,9 +420,32 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         if pd.notna(fodp):
             ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 2)
 
+    notes = []
+    missing_forecast_years = [year for year in forecast_years if year not in forecast_data]
+    for year in missing_forecast_years:
+        notes.append(
+            f"{year}年会社予想は未発表（J-Quantsでは直近1年先までの予想数値のみ取得可能。"
+            "中期経営計画等から補うには手動で確認が必要）"
+        )
+    notes.extend(forecast_source_notes)
+    if metrics["dividend_yield"] is None:
+        notes.append("配当利回り：会社予想・実績配当のデータ不足のため空欄")
     split_text = _stock_split_events_text(prices_raw)
     if split_text:
-        ws["Q10"] = split_text
+        notes.append(split_text)
+    if notes:
+        ws["Q10"] = "\n".join(notes)
+
+    logger.info(
+        "[%s] 会社予想EPS=%s 会社予想年間配当=%s 最新株価=%s PER=%s 配当利回り=%s 列割当=%s",
+        code,
+        pipeline._last_valid_full_year_value(f, "FEPS"),
+        pipeline._dividend_forecast_or_trailing(f),
+        metrics["latest_close"],
+        metrics["per"],
+        metrics["dividend_yield"],
+        col_for_year,
+    )
 
     buf = io.BytesIO()
     wb.save(buf)

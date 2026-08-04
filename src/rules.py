@@ -62,6 +62,7 @@ STORE_KEYWORDS = ["新店舗", "新規出店", "店舗新設", "新規開設"]
 # 「新工場」「第二工場」等は閉鎖・計画中止のニュースにも一致してしまうため、
 # これらの語を含むタイトルは逆方向（ネガティブ）の話として除外する。
 FACILITY_STORE_EXCLUSION_KEYWORDS = ["閉鎖", "中止", "撤退", "廃止", "休止", "縮小"]
+STOCK_SPLIT_KEYWORDS = ["株式分割", "株式併合"]
 REGIONAL_EXCHANGES = ["札幌証券取引所", "福岡証券取引所", "名古屋証券取引所"]
 TOKYO_EXCHANGE_KEYWORDS = ["東京証券取引所", "東証"]
 
@@ -91,6 +92,32 @@ def detect_stock_split(quotes_df: pd.DataFrame) -> pd.DataFrame:
     factors = factor.loc[hit.index]
     hit["detail"] = "調整係数 " + factors.astype(str) + "（分割/併合等の可能性）"
     return hit.rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date"})
+
+
+def detect_stock_split_announcement(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+    """TDnet開示タイトルから株式分割・併合の「発表」を検出する。
+
+    detect_stock_split(AdjFactorの変化)は分割が実際に効力を持つ日（株価調整に
+    反映される日）を検知するため、発表からかなり遅れる（あるいは取得期間に
+    実施日の株価データが入っていないと検知できない）。株式分割は発表時点で
+    好材料として反応することが多いため、TDnetの開示タイトルから発表日ベースで
+    検出する（タイトルのキーワード一致のため、内容は必ずリンク先で確認する）。
+    """
+    required = {"company_code", "title", "pubdate"}
+    if disclosures_df.empty or not required.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = disclosures_df.copy()
+    titles = df["title"].fillna("")
+    mask = titles.apply(lambda t: any(k in t for k in STOCK_SPLIT_KEYWORDS))
+    hit = df.loc[mask, ["company_code", "pubdate", "title"]].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "stock_split_announcement"
+    hit["detail"] = "開示タイトル: " + hit["title"]
+    hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
+    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
 
 
 def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:

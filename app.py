@@ -151,7 +151,9 @@ else:
 exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True)
 
 if st.button("スクリーニング実行", type="primary"):
-    if start_date > end_date:
+    if rule_count == 0:
+        st.error("対象にする条件を1つ以上選択してください。")
+    elif start_date > end_date:
         st.error("開始日は終了日より前にしてください。")
     else:
         with st.spinner("J-Quants からデータを取得し、条件判定しています…"):

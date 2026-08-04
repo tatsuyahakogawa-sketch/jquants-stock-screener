@@ -20,7 +20,8 @@ RULE_LABELS = {
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
     "earnings_beat": "本決算が会社予想を上回った",
-    "stock_split": "株式分割・併合等（調整係数の変化を検知）",
+    "stock_split_announcement": "株式分割・併合の発表（TDnetタイトル検出・要確認）",
+    "stock_split": "株式分割・併合等の実施（株価調整係数の変化を検知、発表日ではなく効力発生日）",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
     "pbr_low": "PBR1倍以下",
@@ -75,10 +76,11 @@ def run_screening(
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
         hits.append(rules.detect_new_facility_or_store(disclosures_df))
         hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
+        hits.append(rules.detect_stock_split_announcement(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
         # 他のルールの結果は返す（README参照）。
-        warnings.warn(f"TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍の検出をスキップします）: {e}")
+        warnings.warn(f"TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割発表の検出をスキップします）: {e}")
 
     hits = [h for h in hits if not h.empty]
     if not hits:
@@ -156,6 +158,25 @@ def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
     return _last_valid_value(df.loc[df["CurPerType"] == "FY"], column)
 
 
+def _dividend_forecast_or_trailing(df: pd.DataFrame) -> float | None:
+    """年間配当（1株あたり）を、開示されている中で最も「今の実力」に近い値で返す。
+
+    本決算実績の開示時点ではFDivAnn（当期の配当予想）は確定済みのため空になり、
+    NxFDivAnn（来期の配当予想）が入る。会社によってはさらに、業績が定まらない
+    等の理由で配当予想自体を出さない（FDivAnn・NxFDivAnnとも常に空）こともある。
+    その場合は「無配」と区別するため、直前に実際に支払われた年間配当(DivAnn)を
+    参考値として使う（会社予想ではなく実績配当に基づく利回りになる）。
+    """
+    if "CurPerType" not in df.columns:
+        return None
+    fy_rows = df.loc[df["CurPerType"] == "FY"]
+    for column in ("FDivAnn", "NxFDivAnn", "DivAnn"):
+        value = _last_valid_value(fy_rows, column)
+        if value is not None and pd.notna(value):
+            return value
+    return None
+
+
 def _last_valid_eps_annualized(df: pd.DataFrame) -> float | None:
     """実績EPS(EPS)の最後の開示値を、その開示時点のCurPerTypeに応じて年率換算する。"""
     if "EPS" not in df.columns:
@@ -196,7 +217,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
             bps = _last_valid_value(fins, "BPS")
             shares_out = _last_valid_value(fins, "ShOutFY")
             treasury_shares = _last_valid_value(fins, "TrShFY")
-            div_ann = _last_valid_full_year_value(fins, "FDivAnn")
+            div_ann = _dividend_forecast_or_trailing(fins)
             annualized_eps = _last_valid_eps_annualized(fins)
 
     market_cap = per = pbr = dividend_yield = None
