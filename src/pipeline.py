@@ -11,7 +11,7 @@ import warnings
 
 import pandas as pd
 
-from src import endpoints, rules, tdnet_client
+from src import endpoints, rules, score, tdnet_client
 from src.config import (
     LISTING_LOOKBACK_YEARS,
     LISTING_DATE_BOUNDARY_TOLERANCE_DAYS,
@@ -32,6 +32,8 @@ RULE_LABELS = {
     "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表（TDnetタイトル検出・要確認）",
     "new_facility_or_store": "新工場・新店舗の開示（TDnetタイトル検出・要確認）",
     "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場（TDnetタイトル検出・要確認）",
+    "large_order": "大型・大口受注の発表（TDnetタイトル検出・要確認）",
+    "world_first": "世界初の製品・サービスの発表（TDnetタイトル検出・要確認）",
     "downward_revision": "業績予想の下方修正（マイナス要因）",
 }
 
@@ -91,12 +93,14 @@ def run_screening(
         hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
         hits.append(rules.detect_stock_split(disclosures_df))
         hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
+        hits.append(rules.detect_large_order(disclosures_df))
+        hits.append(rules.detect_world_first(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
         # 他のルールの結果は返す（README参照）。
         warnings.warn(
-            "TDnet開示情報の取得に失敗しました"
-            f"（新工場・新店舗・東証移籍・株式分割・プライム市場変更の発表の検出をスキップします）: {e}"
+            "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
+            f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
         )
 
     hits = [h for h in hits if not h.empty]
@@ -154,20 +158,29 @@ def _to_numeric(series: pd.Series) -> pd.Series:
 _EPS_ANNUALIZE_FACTOR = {"1Q": 4.0, "2Q": 2.0, "3Q": 4 / 3, "4Q": 1.0, "FY": 1.0}
 
 
-def _last_valid_value(df: pd.DataFrame, column: str) -> float | None:
-    """dfの中でcolumnが数値として読める最後の（最新の）値を返す。
+def _last_valid_value_with_date(df: pd.DataFrame, column: str) -> tuple[float | None, pd.Timestamp | None]:
+    """dfの中でcolumnが数値として読める最後の（最新の）値と、その開示日を返す。
 
     決算短信は開示形式によって一部の項目（BPS等）が入っていない回があるため、
-    直近1件だけでなく履歴全体から「最後に開示された値」を探す。
+    直近1件だけでなく履歴全体から「最後に開示された値」を探す。開示日を返すのは、
+    後で株式分割・併合による1株当たり指標のズレを補正するために必要なため。
     """
-    if column not in df.columns:
-        return None
+    if column not in df.columns or "DiscDate" not in df.columns:
+        return None, None
     values = pd.to_numeric(df[column], errors="coerce").dropna()
-    return values.iloc[-1] if not values.empty else None
+    if values.empty:
+        return None, None
+    idx = values.index[-1]
+    return values.loc[idx], df.loc[idx, "DiscDate"]
 
 
-def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
-    """dfの中でcolumnが数値として読める最後の値を、CurPerType=='FY'の行だけから探す。
+def _last_valid_value(df: pd.DataFrame, column: str) -> float | None:
+    value, _ = _last_valid_value_with_date(df, column)
+    return value
+
+
+def _last_valid_full_year_value_with_date(df: pd.DataFrame, column: str) -> tuple[float | None, pd.Timestamp | None]:
+    """dfの中でcolumnが数値として読める最後の値と開示日を、CurPerType=='FY'の行だけから探す。
 
     会社予想の修正開示(EarnForecastRevision等)の中には、CurPerTypeが四半期
     (1Q等)のまま会社予想値を更新しているものがあり、単純に「最後に開示された値」
@@ -176,12 +189,17 @@ def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
     会社予想EPS(FEPS)等は必ず通期(FY)区分の開示に限定する。
     """
     if column not in df.columns or "CurPerType" not in df.columns:
-        return None
-    return _last_valid_value(df.loc[df["CurPerType"] == "FY"], column)
+        return None, None
+    return _last_valid_value_with_date(df.loc[df["CurPerType"] == "FY"], column)
 
 
-def _dividend_forecast_or_trailing(df: pd.DataFrame) -> float | None:
-    """年間配当（1株あたり）を、開示されている中で最も「今の実力」に近い値で返す。
+def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
+    value, _ = _last_valid_full_year_value_with_date(df, column)
+    return value
+
+
+def _dividend_forecast_or_trailing_with_date(df: pd.DataFrame) -> tuple[float | None, pd.Timestamp | None]:
+    """年間配当（1株あたり）を、開示されている中で最も「今の実力」に近い値と開示日で返す。
 
     本決算実績の開示時点ではFDivAnn（当期の配当予想）は確定済みのため空になり、
     NxFDivAnn（来期の配当予想）が入る。会社によってはさらに、業績が定まらない
@@ -190,27 +208,68 @@ def _dividend_forecast_or_trailing(df: pd.DataFrame) -> float | None:
     参考値として使う（会社予想ではなく実績配当に基づく利回りになる）。
     """
     if "CurPerType" not in df.columns:
-        return None
+        return None, None
     fy_rows = df.loc[df["CurPerType"] == "FY"]
     for column in ("FDivAnn", "NxFDivAnn", "DivAnn"):
-        value = _last_valid_value(fy_rows, column)
+        value, date = _last_valid_value_with_date(fy_rows, column)
         if value is not None and pd.notna(value):
-            return value
-    return None
+            return value, date
+    return None, None
 
 
-def _last_valid_eps_annualized(df: pd.DataFrame) -> float | None:
-    """実績EPS(EPS)の最後の開示値を、その開示時点のCurPerTypeに応じて年率換算する。"""
+def _dividend_forecast_or_trailing(df: pd.DataFrame) -> float | None:
+    value, _ = _dividend_forecast_or_trailing_with_date(df)
+    return value
+
+
+def _last_valid_eps_annualized_with_date(df: pd.DataFrame) -> tuple[float | None, pd.Timestamp | None]:
+    """実績EPS(EPS)の最後の開示値を、その開示時点のCurPerTypeに応じて年率換算し、開示日も返す。"""
     if "EPS" not in df.columns:
-        return None
+        return None, None
     eps_numeric = pd.to_numeric(df["EPS"], errors="coerce")
     valid_idx = eps_numeric.dropna().index
     if len(valid_idx) == 0:
-        return None
+        return None, None
     idx = valid_idx[-1]
     period_type = df.loc[idx, "CurPerType"] if "CurPerType" in df.columns else None
     factor = _EPS_ANNUALIZE_FACTOR.get(period_type, 1.0)
-    return eps_numeric.loc[idx] * factor
+    return eps_numeric.loc[idx] * factor, df.loc[idx, "DiscDate"]
+
+
+def _last_valid_eps_annualized(df: pd.DataFrame) -> float | None:
+    value, _ = _last_valid_eps_annualized_with_date(df)
+    return value
+
+
+def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
+    """since_date時点の1株当たり指標(EPS/BPS/年間配当等)を、現在の株式数基準に
+    換算するための倍率を返す。
+
+    J-QuantsのAdjC(調整後終値)は、その後に起きた株式分割・併合を遡って反映した
+    終値のため、ある日の「調整後終値÷未調整終値」がその日以降に起きた分割等の
+    累積倍率と一致する。決算開示のEPS/BPS/配当は開示当時の株式数のままで、後から
+    分割があっても遡って調整されないため、開示日以降に分割があると現在の株価
+    (調整済み)と組み合わせたPER/PBR/配当利回りの計算がずれる
+    （例: 開示後に1→8の分割があると、PER/PBRが実際の8倍小さく、配当利回りが
+    実際の8倍大きく出てしまう）。分割等が無い、またはデータが無い場合は1.0
+    （無調整）を返す。
+    """
+    if since_date is None or pd.isna(since_date):
+        return 1.0
+    if price_history.empty or not {"Date", "C", "AdjC"}.issubset(price_history.columns):
+        return 1.0
+    p = price_history.copy()
+    p["Date"] = pd.to_datetime(p["Date"], errors="coerce")
+    p = p.dropna(subset=["Date"]).sort_values("Date")
+    on_or_before = p.loc[p["Date"] <= pd.Timestamp(since_date)]
+    if on_or_before.empty:
+        return 1.0
+    row = on_or_before.iloc[-1]
+    c = _to_numeric(pd.Series([row.get("C")])).iloc[0]
+    adj_c = _to_numeric(pd.Series([row.get("AdjC")])).iloc[0]
+    if pd.isna(c) or pd.isna(adj_c) or c == 0:
+        return 1.0
+    return float(adj_c / c)
 
 
 def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> dict:
@@ -235,12 +294,24 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
         fins = fins.dropna(subset=["DiscDate"]).sort_values("DiscDate")
         if not fins.empty:
-            feps = _last_valid_full_year_value(fins, "FEPS")
-            bps = _last_valid_value(fins, "BPS")
+            feps, feps_date = _last_valid_full_year_value_with_date(fins, "FEPS")
+            bps, bps_date = _last_valid_value_with_date(fins, "BPS")
             shares_out = _last_valid_value(fins, "ShOutFY")
             treasury_shares = _last_valid_value(fins, "TrShFY")
-            div_ann = _dividend_forecast_or_trailing(fins)
-            annualized_eps = _last_valid_eps_annualized(fins)
+            div_ann, div_ann_date = _dividend_forecast_or_trailing_with_date(fins)
+            annualized_eps, annualized_eps_date = _last_valid_eps_annualized_with_date(fins)
+
+            # 開示日以降に株式分割・併合があった場合、1株当たり指標(EPS/BPS/配当)を
+            # 現在の株式数基準に換算する（開示日ちょうどの倍率でその後の分割の
+            # 有無に関わらず補正されるため、分割が無い場合は倍率1.0で無害）。
+            if feps is not None:
+                feps = feps * _split_adjustment_since(price_history, feps_date)
+            if bps is not None:
+                bps = bps * _split_adjustment_since(price_history, bps_date)
+            if div_ann is not None:
+                div_ann = div_ann * _split_adjustment_since(price_history, div_ann_date)
+            if annualized_eps is not None:
+                annualized_eps = annualized_eps * _split_adjustment_since(price_history, annualized_eps_date)
 
     market_cap = per = pbr = dividend_yield = None
     if latest_close is not None and pd.notna(latest_close):
@@ -340,3 +411,296 @@ def enrich_with_market_data(client: JQuantsClient, summary: pd.DataFrame) -> pd.
 
     enrichment = pd.DataFrame(rows)
     return summary.merge(enrichment, on="Code", how="left")
+
+
+# 「10倍株候補スコア」の各加減点項目の表示ラベル（画面上の並び順にもなる）。
+# 四半期成長加速(9)・52週高値接近(10)・出来高急増(11)はJ-Quants全銘柄の
+# 長期株価一括取得が新たに必要になるため未実装（README参照）。
+TENX_SCORE_LABELS = {
+    "market_cap": "小型時価総額",
+    "three_year_revenue_growth": "3期連続増収",
+    "revenue_cagr": "3年間の売上CAGR",
+    "profit_growth_exceeds_sales_growth": "利益成長が売上成長を上回る",
+    "margin_improvement": "経常利益率の改善",
+    "turnaround": "赤字から黒字への転換",
+    "upward_revision": "会社予想の上方修正",
+    "progress_ratio": "高進捗率",
+    "dilution": "発行済株式数の増加（希薄化）",
+    "downward_revision": "下方修正",
+}
+
+_YOY_GAP_MIN_DAYS = 330
+_YOY_GAP_MAX_DAYS = 400
+
+
+def _combine_profit(row: pd.Series) -> float | None:
+    """経常利益(OdP)。IFRS採用企業等でOdPが無い場合は営業利益(OP)で代用する。"""
+    value = row.get("OdP")
+    if pd.isna(value):
+        value = row.get("OP")
+    return value if pd.notna(value) else None
+
+
+def _latest_yoy_profit_comparison(g: pd.DataFrame) -> dict | None:
+    """同一CurPerType・前年同期(330〜400日前)との比較が取れる最新の開示を1件返す。"""
+    d = g.dropna(subset=["Sales"]).sort_values(["CurPerType", "CurPerEn"]).copy()
+    if d.empty:
+        return None
+    d["prev_sales"] = d.groupby("CurPerType")["Sales"].shift(1)
+    d["prev_period_end"] = d.groupby("CurPerType")["CurPerEn"].shift(1)
+    d["prev_op"] = d.groupby("CurPerType")["OP"].shift(1)
+    d["prev_odp"] = d.groupby("CurPerType")["OdP"].shift(1)
+    gap_days = (d["CurPerEn"] - d["prev_period_end"]).dt.days
+    valid = d.loc[gap_days.between(_YOY_GAP_MIN_DAYS, _YOY_GAP_MAX_DAYS) & d["prev_sales"].notna() & (d["prev_sales"] > 0)]
+    if valid.empty:
+        return None
+    latest = valid.sort_values("DiscDate").iloc[-1]
+    prev_profit = latest["prev_odp"] if pd.notna(latest["prev_odp"]) else latest["prev_op"]
+    curr_profit = _combine_profit(latest)
+    sales_growth = (latest["Sales"] - latest["prev_sales"]) / latest["prev_sales"]
+    return {
+        "sales_growth": sales_growth,
+        "prev_profit": prev_profit if pd.notna(prev_profit) else None,
+        "curr_profit": curr_profit,
+        "sales": latest["Sales"],
+        "prev_sales": latest["prev_sales"],
+        "disc_date": latest["DiscDate"],
+    }
+
+
+def _score_three_year_revenue_growth_and_cagr(g: pd.DataFrame) -> tuple[float, str, float, float | None]:
+    fy = g.loc[(g["CurPerType"] == "FY") & g["Sales"].notna()].drop_duplicates(subset=["CurFYEn"], keep="last")
+    fy = fy.sort_values("CurFYEn")
+    sales_series = fy[["CurFYEn", "Sales"]].tail(4)
+    values = sales_series["Sales"].tolist()
+    padded = ([None] * max(0, 4 - len(values)) + values)[-4:]
+    growth_points, growth_label = score.score_three_year_revenue_growth(padded)
+
+    cagr_points, cagr = 0.0, None
+    if len(sales_series) >= 4:
+        first_row = sales_series.iloc[-4]
+        last_row = sales_series.iloc[-1]
+        gap_days = (last_row["CurFYEn"] - first_row["CurFYEn"]).days
+        if abs(gap_days - 3 * 365) <= 120:
+            cagr_points, cagr = score.score_revenue_cagr(first_row["Sales"], last_row["Sales"])
+    return growth_points, growth_label, cagr_points, cagr
+
+
+def _score_upward_revision_for_code(g: pd.DataFrame) -> tuple[float, float | None, int, pd.Timestamp | None]:
+    d = g.dropna(subset=["FSales"]).sort_values(["CurFYEn", "DiscDate"]).copy()
+    if d.empty:
+        return 0.0, None, 0, None
+    d["prev_fsales"] = d.groupby("CurFYEn")["FSales"].shift(1)
+    d["prev_fodp"] = d.groupby("CurFYEn")["FOdP"].shift(1)
+    d["prev_fop"] = d.groupby("CurFYEn")["FOP"].shift(1)
+    valid = d.dropna(subset=["prev_fsales"])
+    valid = valid.loc[valid["prev_fsales"] > 0]
+    if valid.empty:
+        return 0.0, None, 0, None
+
+    latest = valid.sort_values("DiscDate").iloc[-1]
+    sales_revision_pct = (latest["FSales"] - latest["prev_fsales"]) / latest["prev_fsales"]
+    fodp_now = latest["FOdP"] if pd.notna(latest["FOdP"]) else latest["FOP"]
+    fodp_prev = latest["prev_fodp"] if pd.notna(latest["prev_fodp"]) else latest["prev_fop"]
+    profit_revision_pct = None
+    if pd.notna(fodp_now) and pd.notna(fodp_prev) and fodp_prev > 0:
+        profit_revision_pct = (fodp_now - fodp_prev) / fodp_prev
+
+    same_fy = valid.loc[valid["CurFYEn"] == latest["CurFYEn"]].sort_values("DiscDate")
+    is_upward = (same_fy["FSales"] > same_fy["prev_fsales"]).tolist()
+    streak = 0
+    for up in reversed(is_upward):
+        if up:
+            streak += 1
+        else:
+            break
+
+    points = score.score_upward_revision(sales_revision_pct, profit_revision_pct, streak)
+    return points, sales_revision_pct, streak, latest["DiscDate"]
+
+
+def _score_progress_ratio_for_code(g: pd.DataFrame) -> tuple[float, str, float | None]:
+    qtr = g.loc[g["CurPerType"].isin(["1Q", "2Q", "3Q"]) & g["OdP"].notna() & g["FOdP"].notna() & (g["FOdP"] != 0)]
+    if qtr.empty:
+        return 0.0, "判定不能", None
+    latest = qtr.sort_values("DiscDate").iloc[-1]
+    progress_now = latest["OdP"] / latest["FOdP"] * 100
+
+    prev_year_progress = None
+    same_period = qtr.loc[qtr["CurPerType"] == latest["CurPerType"]].sort_values("CurPerEn")
+    gap_days = (latest["CurPerEn"] - same_period["CurPerEn"]).dt.days
+    candidates = same_period.loc[gap_days.between(_YOY_GAP_MIN_DAYS, _YOY_GAP_MAX_DAYS)]
+    if not candidates.empty:
+        prev_row = candidates.sort_values("CurPerEn").iloc[-1]
+        if prev_row["FOdP"] != 0:
+            prev_year_progress = prev_row["OdP"] / prev_row["FOdP"] * 100
+
+    points, label = score.score_progress_ratio(latest["CurPerType"], progress_now, prev_year_progress)
+    return points, label, progress_now
+
+
+def _score_dilution_for_code(g: pd.DataFrame) -> tuple[float, str]:
+    d = g.dropna(subset=["ShOutFY"]).sort_values(["CurPerType", "CurPerEn"]).copy()
+    if d.empty:
+        return 0.0, "未判定"
+    d["prev_sh"] = d.groupby("CurPerType")["ShOutFY"].shift(1)
+    d["prev_period_end"] = d.groupby("CurPerType")["CurPerEn"].shift(1)
+    d["prev_bps"] = d.groupby("CurPerType")["BPS"].shift(1)
+    gap_days = (d["CurPerEn"] - d["prev_period_end"]).dt.days
+    valid = d.loc[gap_days.between(_YOY_GAP_MIN_DAYS, _YOY_GAP_MAX_DAYS) & d["prev_sh"].notna() & (d["prev_sh"] > 0)]
+    if valid.empty:
+        return 0.0, "未判定"
+
+    latest = valid.sort_values("DiscDate").iloc[-1]
+    shares_growth = (latest["ShOutFY"] - latest["prev_sh"]) / latest["prev_sh"]
+    bps_growth = None
+    if pd.notna(latest["BPS"]) and pd.notna(latest["prev_bps"]) and latest["prev_bps"] > 0:
+        bps_growth = (latest["BPS"] - latest["prev_bps"]) / latest["prev_bps"]
+    looks_like_split = score.looks_like_stock_split(shares_growth, bps_growth)
+    return score.score_dilution(shares_growth, looks_like_split)
+
+
+def _score_one_code(code: str, g: pd.DataFrame, market_cap: float | None, has_downward: bool, downward_penalize_only: bool) -> dict:
+    market_cap_oku = market_cap / 1e8 if market_cap is not None and pd.notna(market_cap) else None
+    cap_points, cap_label = score.score_market_cap(market_cap_oku)
+
+    growth_points, growth_label, cagr_points, cagr = _score_three_year_revenue_growth_and_cagr(g)
+
+    yoy = _latest_yoy_profit_comparison(g)
+    profit_growth_pct = None
+    profit_vs_sales_points, profit_vs_sales_label = 0.0, "判定不能"
+    margin_points, margin_diff = 0.0, None
+    turnaround_points, turned = 0.0, False
+    if yoy is not None:
+        if yoy["prev_profit"] is not None and yoy["prev_profit"] > 0 and yoy["curr_profit"] is not None:
+            profit_growth_pct = (yoy["curr_profit"] - yoy["prev_profit"]) / yoy["prev_profit"]
+        profit_vs_sales_points, profit_vs_sales_label = score.score_profit_growth_exceeds_sales_growth(
+            yoy["sales_growth"], profit_growth_pct, yoy["prev_profit"], yoy["curr_profit"]
+        )
+        if yoy["curr_profit"] is not None and yoy["sales"]:
+            margin_now = yoy["curr_profit"] / yoy["sales"] * 100
+            margin_prev = (
+                yoy["prev_profit"] / yoy["prev_sales"] * 100
+                if yoy["prev_profit"] is not None and yoy["prev_sales"]
+                else None
+            )
+            if margin_prev is not None:
+                margin_diff = margin_now - margin_prev
+        margin_points = score.score_margin_improvement(margin_diff)
+
+        recent_profits = g.assign(_profit=g.apply(_combine_profit, axis=1)).dropna(subset=["_profit"]).sort_values("DiscDate")
+        sustained = False
+        if len(recent_profits) >= 3:
+            sustained = bool((recent_profits["_profit"].tail(3) > 0).all())
+        turnaround_points, turned = score.score_turnaround(yoy["prev_profit"], yoy["curr_profit"], sustained)
+
+    revision_points, sales_revision_pct, revision_streak, _ = _score_upward_revision_for_code(g)
+    progress_points, progress_label, progress_pct = _score_progress_ratio_for_code(g)
+    dilution_points, dilution_label = _score_dilution_for_code(g)
+    downward_points = score.score_downward_revision(has_downward, downward_penalize_only)
+
+    points_map = {
+        "market_cap": cap_points,
+        "three_year_revenue_growth": growth_points,
+        "revenue_cagr": cagr_points,
+        "profit_growth_exceeds_sales_growth": profit_vs_sales_points,
+        "margin_improvement": margin_points,
+        "turnaround": turnaround_points,
+        "upward_revision": revision_points,
+        "progress_ratio": progress_points,
+        "dilution": dilution_points,
+        "downward_revision": downward_points,
+    }
+    total = sum(points_map.values())
+    positive_reasons = "、".join(TENX_SCORE_LABELS[k] for k, v in points_map.items() if v > 0)
+    negative_reasons = "、".join(TENX_SCORE_LABELS[k] for k, v in points_map.items() if v < 0)
+    undetermined = "、".join(
+        label for label, cond in [
+            (TENX_SCORE_LABELS["market_cap"], cap_label == "判定不能"),
+            (TENX_SCORE_LABELS["three_year_revenue_growth"], growth_label == "判定不能"),
+            (TENX_SCORE_LABELS["progress_ratio"], progress_label == "判定不能"),
+            (TENX_SCORE_LABELS["dilution"], dilution_label == "未判定"),
+        ] if cond
+    )
+
+    return {
+        "Code": code,
+        "TenXScore": total,
+        "MarketCapBand": cap_label,
+        "ThreeYearRevenueGrowth": growth_label,
+        "RevenueCAGR": cagr,
+        "ProfitGrowthRate": profit_growth_pct,
+        "MarginImprovement": margin_diff,
+        "Turnaround": turned,
+        "UpwardRevisionPct": sales_revision_pct,
+        "UpwardRevisionCount": revision_streak,
+        "ProgressRatio": progress_pct,
+        "PositiveReasons": positive_reasons,
+        "NegativeReasons": negative_reasons,
+        "UndeterminedItems": undetermined,
+    }
+
+
+def compute_tenx_scores(
+    client: JQuantsClient,
+    start: dt.date,
+    end: dt.date,
+    summary: pd.DataFrame,
+    downward_penalize_only: bool = True,
+) -> pd.DataFrame:
+    """summaryの各銘柄について「10倍株候補スコア」を計算する。
+
+    財務データはrun_screeningが比較用に遡って取得している範囲と同じ条件で
+    再取得するが、日付単位でローカルキャッシュされているため追加のAPI呼び出しは
+    発生しない（キャッシュファイルを再度読み込むだけ）。
+    """
+    empty_cols = [
+        "Code", "TenXScore", "MarketCapBand", "ThreeYearRevenueGrowth", "RevenueCAGR",
+        "ProfitGrowthRate", "MarginImprovement", "Turnaround", "UpwardRevisionPct",
+        "UpwardRevisionCount", "ProgressRatio", "PositiveReasons", "NegativeReasons",
+        "UndeterminedItems",
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+    statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
+
+    codes = summary["Code"].astype(str).tolist()
+    if statements_df.empty:
+        f = pd.DataFrame(columns=["Code"])
+    else:
+        f = statements_df.copy()
+        f["Code"] = f["Code"].astype(str)
+        f = f.loc[f["Code"].isin(codes)].copy()
+        f["DiscDate"] = pd.to_datetime(f["DiscDate"], errors="coerce")
+        f["CurFYEn"] = pd.to_datetime(f["CurFYEn"], errors="coerce")
+        f["CurPerEn"] = pd.to_datetime(f.get("CurPerEn"), errors="coerce")
+        for col in ["Sales", "OP", "OdP", "FSales", "FOP", "FOdP", "ShOutFY", "BPS"]:
+            f[col] = pd.to_numeric(f[col], errors="coerce") if col in f.columns else float("nan")
+        f = f.dropna(subset=["Code", "DiscDate", "CurPerEn"])
+
+    market_cap_map = dict(zip(summary["Code"].astype(str), summary.get("MarketCap", pd.Series(dtype="float64"))))
+    if "HasDownwardRevision" in summary.columns:
+        downward_map = dict(zip(summary["Code"].astype(str), summary["HasDownwardRevision"]))
+    else:
+        downward_map = {}
+
+    rows = []
+    for code in codes:
+        g = f.loc[f["Code"] == code] if not f.empty else f
+        if g.empty:
+            rows.append({
+                "Code": code, "TenXScore": 0.0, "MarketCapBand": score.score_market_cap(
+                    (market_cap_map.get(code) or float("nan")) / 1e8
+                )[1],
+                "ThreeYearRevenueGrowth": "判定不能", "RevenueCAGR": None, "ProfitGrowthRate": None,
+                "MarginImprovement": None, "Turnaround": False, "UpwardRevisionPct": None,
+                "UpwardRevisionCount": 0, "ProgressRatio": None, "PositiveReasons": "",
+                "NegativeReasons": "", "UndeterminedItems": "決算データ",
+            })
+            continue
+        rows.append(_score_one_code(code, g, market_cap_map.get(code), bool(downward_map.get(code, False)), downward_penalize_only))
+
+    return pd.DataFrame(rows)

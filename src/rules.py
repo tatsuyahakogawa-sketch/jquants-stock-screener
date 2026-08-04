@@ -58,6 +58,10 @@ STORE_KEYWORDS = ["新店舗", "新規出店", "店舗新設", "新規開設"]
 # これらの語を含むタイトルは逆方向（ネガティブ）の話として除外する。
 FACILITY_STORE_EXCLUSION_KEYWORDS = ["閉鎖", "中止", "撤退", "廃止", "休止", "縮小"]
 STOCK_SPLIT_KEYWORDS = ["株式分割", "株式併合"]
+LARGE_ORDER_KEYWORDS = ["大型受注", "大口受注", "大型案件受注"]
+# 「開示基準変更」は受注そのものの発表ではなく開示ルールの変更のお知らせのため除外する。
+LARGE_ORDER_EXCLUSION_KEYWORDS = ["開示基準", "取消", "中止", "解除"]
+WORLD_FIRST_KEYWORDS = ["世界初"]
 REGIONAL_EXCHANGES = ["札幌証券取引所", "福岡証券取引所", "名古屋証券取引所"]
 TOKYO_EXCHANGE_KEYWORDS = ["東京証券取引所", "東証"]
 
@@ -99,6 +103,55 @@ def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
     hit["rule"] = "stock_split"
+    hit["detail"] = "開示タイトル: " + hit["title"]
+    hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
+    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
+
+
+def detect_large_order(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+    """TDnet開示タイトルから「大型受注」「大口受注」等の発表を検出する。
+
+    タイトルだけを見たキーワード一致であり、誤検出（例:開示基準の変更のお知らせ
+    が「大口受注」を含む等）の可能性がある。detail列に開示タイトルそのものを
+    入れているので、実際に使う際はリンク先で内容を確認すること。
+    """
+    required = {"company_code", "title", "pubdate"}
+    if disclosures_df.empty or not required.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = disclosures_df.copy()
+    titles = df["title"].fillna("")
+    mentions_keyword = titles.apply(lambda t: any(k in t for k in LARGE_ORDER_KEYWORDS))
+    mentions_exclusion = titles.apply(lambda t: any(k in t for k in LARGE_ORDER_EXCLUSION_KEYWORDS))
+    hit = df.loc[mentions_keyword & ~mentions_exclusion, ["company_code", "pubdate", "title"]].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "large_order"
+    hit["detail"] = "開示タイトル: " + hit["title"]
+    hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
+    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
+
+
+def detect_world_first(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+    """TDnet開示タイトルから「世界初」を含む発表を検出する。
+
+    タイトルだけを見たキーワード一致であり、誤検出の可能性がある。detail列に
+    開示タイトルそのものを入れているので、実際に使う際はリンク先で内容を
+    確認すること。
+    """
+    required = {"company_code", "title", "pubdate"}
+    if disclosures_df.empty or not required.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = disclosures_df.copy()
+    titles = df["title"].fillna("")
+    mask = titles.apply(lambda t: any(k in t for k in WORLD_FIRST_KEYWORDS))
+    hit = df.loc[mask, ["company_code", "pubdate", "title"]].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "world_first"
     hit["detail"] = "開示タイトル: " + hit["title"]
     hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
     return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})

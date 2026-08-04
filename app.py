@@ -26,6 +26,7 @@ from src.pipeline import (
     run_screening,
     build_summary,
     enrich_with_market_data,
+    compute_tenx_scores,
 )
 
 load_dotenv()
@@ -156,7 +157,17 @@ for attr_col, rule in zip(attr_cols, ATTRIBUTE_RULES):
         if st.checkbox(RULE_LABELS[rule], key=f"attr_{rule}"):
             selected_attributes.append(rule)
 
-exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True)
+exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True, key="exclude_downward")
+
+st.markdown(
+    "**10倍株候補スコア**（時価総額・増収率・利益成長等をJ-Quantsの決算データだけで採点し、"
+    "結果テーブルに参考情報として表示します。未来の業績を推計するものではありません）"
+)
+st.caption(
+    "四半期成長の加速・52週高値接近・出来高急増は、全銘柄分の長期株価データを新たに"
+    "取得する必要があるため未実装です（今後追加予定）。"
+)
+tenx_enabled = st.checkbox("10倍株候補スコアを計算して表示する", key="tenx_enabled")
 
 if st.button("スクリーニング実行", type="primary"):
     if not selected_events and not selected_attributes:
@@ -172,6 +183,13 @@ if st.button("スクリーニング実行", type="primary"):
                 if not summary.empty:
                     with st.spinner(f"合致した{len(summary)}銘柄の時価総額・PER・PBR・配当利回りを取得しています…"):
                         summary = enrich_with_market_data(client, summary)
+                    if tenx_enabled:
+                        with st.spinner("10倍株候補スコアを計算しています…"):
+                            tenx_scores = compute_tenx_scores(
+                                client, start_date, end_date, summary,
+                                downward_penalize_only=not exclude_downward,
+                            )
+                            summary = summary.merge(tenx_scores, on="Code", how="left")
                 st.session_state["summary"] = summary
             except JQuantsAuthError as e:
                 st.error(f"J-Quants への認証に失敗しました: {e}")
@@ -216,6 +234,8 @@ if "summary" in st.session_state:
     summary = st.session_state["summary"]
 
     expected_cols = {f"{r}_matched" for r in (selected_events + selected_attributes)}
+    if tenx_enabled:
+        expected_cols.add("TenXScore")
     if not summary.empty and not expected_cols.issubset(summary.columns):
         st.warning("コード更新により前回の結果が古くなっています。もう一度「スクリーニング実行」を押してください。")
     elif summary.empty:
@@ -258,8 +278,7 @@ if "summary" in st.session_state:
             "StopHighDate", "MarketCapOku", "PER", "PBR", "DividendYield",
             "ListingDateDisplay", "HasDownwardRevision",
         ]
-        display_cols = [c for c in display_cols if c in view.columns]
-        display = view[display_cols].rename(columns={
+        rename_map = {
             "Sector": "業種",
             "MatchedCountSelected": "合致数",
             "MatchedConditions": "合致した条件",
@@ -270,7 +289,42 @@ if "summary" in st.session_state:
             "DividendYield": "配当利回り",
             "ListingDateDisplay": "推定上場日（近似）",
             "HasDownwardRevision": "下方修正歴あり",
-        }).sort_values("合致数", ascending=False)
+        }
+        sort_key = "合致数"
+        if tenx_enabled and "TenXScore" in view.columns:
+            display_cols += [
+                "TenXScore", "MarketCapBand", "ThreeYearRevenueGrowth", "RevenueCAGR",
+                "ProfitGrowthRate", "MarginImprovement", "Turnaround", "UpwardRevisionPct",
+                "UpwardRevisionCount", "ProgressRatio", "PositiveReasons", "NegativeReasons",
+                "UndeterminedItems",
+            ]
+            rename_map.update({
+                "TenXScore": "10倍株候補スコア",
+                "MarketCapBand": "時価総額区分",
+                "ThreeYearRevenueGrowth": "3期連続増収",
+                "RevenueCAGR": "売上CAGR",
+                "ProfitGrowthRate": "経常利益成長率",
+                "MarginImprovement": "経常利益率改善幅",
+                "Turnaround": "黒字転換",
+                "UpwardRevisionPct": "上方修正率",
+                "UpwardRevisionCount": "上方修正回数",
+                "ProgressRatio": "通期予想進捗率",
+                "PositiveReasons": "加点理由",
+                "NegativeReasons": "減点理由",
+                "UndeterminedItems": "判定不能項目",
+            })
+            sort_key = "10倍株候補スコア"
+
+        display_cols = [c for c in display_cols if c in view.columns]
+        display = view[display_cols].rename(columns=rename_map).sort_values(sort_key, ascending=False)
+
+        for pct_col in ["売上CAGR", "経常利益成長率", "上方修正率"]:
+            if pct_col in display.columns:
+                display[pct_col] = (display[pct_col] * 100).round(1)
+        if "経常利益率改善幅" in display.columns:
+            display["経常利益率改善幅"] = display["経常利益率改善幅"].round(1)
+        if "通期予想進捗率" in display.columns:
+            display["通期予想進捗率"] = display["通期予想進捗率"].round(1)
 
         if "PER(予想/実績年率換算)" in display.columns:
             display["PER(予想/実績年率換算)"] = display["PER(予想/実績年率換算)"].round(1)
