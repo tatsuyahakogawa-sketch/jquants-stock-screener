@@ -19,7 +19,14 @@ from dotenv import load_dotenv
 
 from src import excel_export
 from src.jquants_client import JQuantsAuthError, JQuantsClient
-from src.pipeline import RULE_LABELS, POSITIVE_RULES, run_screening, build_summary, enrich_with_market_data
+from src.pipeline import (
+    RULE_LABELS,
+    EVENT_RULES,
+    ATTRIBUTE_RULES,
+    run_screening,
+    build_summary,
+    enrich_with_market_data,
+)
 
 load_dotenv()
 
@@ -130,29 +137,30 @@ with col2:
     end_date = st.date_input("終了日", value=default_end, max_value=max_end)
 
 st.subheader("絞り込み条件（実行前に選択）")
-count_target_rules = st.multiselect(
-    "対象にする条件（「合致数」のカウント対象。複数条件に合致する銘柄を探すのに使う）",
-    options=POSITIVE_RULES,
-    default=[r for r in POSITIVE_RULES if r != "equity_ratio_high"],
+
+st.markdown("**イベント条件**（押した条件が赤くなります。選んだ条件のうち何個に合致したかで並び替えます）")
+selected_events = st.pills(
+    "対象にするイベント条件",
+    options=EVENT_RULES,
     format_func=lambda k: RULE_LABELS[k],
+    selection_mode="multi",
+    default=[],
+    label_visibility="collapsed",
 )
-rule_count = len(count_target_rules)
-if rule_count <= 1:
-    # st.sliderはmin_value < max_valueを要求するため、対象条件が1つ（または0）の
-    # ときはスライダーを出さず固定値にする（1つしか無ければ「最低1つ」で確定するため）。
-    min_match = 1
-else:
-    min_match = st.slider(
-        "最低いくつの条件に合致した銘柄を表示するか",
-        min_value=1,
-        max_value=rule_count,
-        value=1,
-    )
+
+st.markdown("**属性条件**（チェックした条件だけで銘柄を絞り込みます）")
+attr_cols = st.columns(len(ATTRIBUTE_RULES))
+selected_attributes = []
+for attr_col, rule in zip(attr_cols, ATTRIBUTE_RULES):
+    with attr_col:
+        if st.checkbox(RULE_LABELS[rule], key=f"attr_{rule}"):
+            selected_attributes.append(rule)
+
 exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True)
 
 if st.button("スクリーニング実行", type="primary"):
-    if rule_count == 0:
-        st.error("対象にする条件を1つ以上選択してください。")
+    if not selected_events and not selected_attributes:
+        st.error("イベント条件または属性条件を1つ以上選択してください。")
     elif start_date > end_date:
         st.error("開始日は終了日より前にしてください。")
     else:
@@ -164,7 +172,6 @@ if st.button("スクリーニング実行", type="primary"):
                 if not summary.empty:
                     with st.spinner(f"合致した{len(summary)}銘柄の時価総額・PER・PBR・配当利回りを取得しています…"):
                         summary = enrich_with_market_data(client, summary)
-                st.session_state["hits"] = hits
                 st.session_state["summary"] = summary
             except JQuantsAuthError as e:
                 st.error(f"J-Quants への認証に失敗しました: {e}")
@@ -207,25 +214,26 @@ def _call_jquants(fn):
 
 if "summary" in st.session_state:
     summary = st.session_state["summary"]
-    hits = st.session_state["hits"]
 
-    expected_cols = {f"{r}_matched" for r in count_target_rules}
+    expected_cols = {f"{r}_matched" for r in (selected_events + selected_attributes)}
     if not summary.empty and not expected_cols.issubset(summary.columns):
         st.warning("コード更新により前回の結果が古くなっています。もう一度「スクリーニング実行」を押してください。")
     elif summary.empty:
         st.warning("条件に合致した銘柄はありませんでした。")
     else:
         view = summary.copy()
-        if count_target_rules:
-            view["MatchedCountSelected"] = view[[f"{r}_matched" for r in count_target_rules]].sum(axis=1)
+        if selected_events:
+            view["MatchedCountSelected"] = view[[f"{r}_matched" for r in selected_events]].sum(axis=1)
+            view = view[view["MatchedCountSelected"] >= 1]
         else:
             view["MatchedCountSelected"] = 0
         view["MatchedConditions"] = view.apply(
-            lambda row: "、".join(RULE_LABELS[r] for r in count_target_rules if row[f"{r}_matched"]),
+            lambda row: "、".join(RULE_LABELS[r] for r in selected_events if row[f"{r}_matched"]),
             axis=1,
         )
 
-        view = view[view["MatchedCountSelected"] >= min_match]
+        for attr_rule in selected_attributes:
+            view = view[view[f"{attr_rule}_matched"]]
         if exclude_downward:
             view = view[~view["HasDownwardRevision"]]
 
@@ -292,15 +300,6 @@ if "summary" in st.session_state:
             f'<div class="print-only">{display.to_html(index=False, escape=True)}</div>',
             unsafe_allow_html=True,
         )
-
-        with st.expander("個別イベントの一覧（いつ何が起きたかの詳細）"):
-            st.dataframe(hits, width="stretch", hide_index=True)
-            st.download_button(
-                "CSVダウンロード（イベント一覧）",
-                data=hits.to_csv(index=False).encode("utf-8-sig"),
-                file_name="screening_events.csv",
-                mime="text/csv",
-            )
 
 st.divider()
 st.subheader("個別銘柄のExcel出力（企業詳細・実行表）")

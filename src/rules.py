@@ -34,7 +34,6 @@ QUOTES_CODE = "Code"
 QUOTES_DATE = "Date"
 QUOTES_CLOSE = "C"
 QUOTES_UPPER_LIMIT_FLAG = "UL"  # "1"=ストップ高で終値確定, "0"=それ以外
-QUOTES_ADJUSTMENT_FACTOR = "AdjFactor"  # 分割・併合等があった日は1.0以外になる
 
 STMT_CODE = "Code"
 STMT_DISCLOSED_DATE = "DiscDate"
@@ -50,10 +49,6 @@ STMT_FORECAST_NET_SALES = "FSales"
 STMT_FORECAST_OPERATING_PROFIT = "FOP"
 STMT_FORECAST_PROFIT = "FNP"
 STMT_BPS = "BPS"  # 1株あたり純資産（PBR計算用）
-
-MASTER_CODE = "Code"
-MASTER_DATE = "Date"
-MASTER_MKT_NAME = "MktNm"  # 市場区分名。「プライム」「スタンダード」「グロース」等
 
 # TDnet開示タイトルのキーワード（誤検出のリスクがあるため、詳細列に開示タイトルを
 # そのまま出し、ユーザー自身がリンク先で確認できるようにしている）
@@ -82,26 +77,15 @@ def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
     return hit.drop(columns=[QUOTES_CLOSE]).rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date"})
 
 
-def detect_stock_split(quotes_df: pd.DataFrame) -> pd.DataFrame:
-    """株式分割・併合等でAdjustmentFactorが1.0以外になった(Code, Date)の一覧。"""
-    if quotes_df.empty or QUOTES_ADJUSTMENT_FACTOR not in quotes_df.columns:
-        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
-    factor = _to_numeric(quotes_df[QUOTES_ADJUSTMENT_FACTOR])
-    hit = quotes_df.loc[factor.notna() & (factor != 1.0), [QUOTES_CODE, QUOTES_DATE]].copy()
-    hit["rule"] = "stock_split"
-    factors = factor.loc[hit.index]
-    hit["detail"] = "調整係数 " + factors.astype(str) + "（分割/併合等の可能性）"
-    return hit.rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date"})
-
-
-def detect_stock_split_announcement(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     """TDnet開示タイトルから株式分割・併合の「発表」を検出する。
 
-    detect_stock_split(AdjFactorの変化)は分割が実際に効力を持つ日（株価調整に
-    反映される日）を検知するため、発表からかなり遅れる（あるいは取得期間に
-    実施日の株価データが入っていないと検知できない）。株式分割は発表時点で
-    好材料として反応することが多いため、TDnetの開示タイトルから発表日ベースで
-    検出する（タイトルのキーワード一致のため、内容は必ずリンク先で確認する）。
+    AdjFactor(株価調整係数)の変化を見る方法は、分割が実際に効力を持つ日（株価
+    調整に反映される日）しか検知できず、発表からかなり遅れる（発表時点では
+    株価がまだ反応していないため、好材料として先取りするには使えない）。
+    株式分割は発表時点で好材料として反応することが多いため、価格が変動する前に
+    検知できるよう、TDnetの開示タイトルから発表日ベースで検出する（タイトルの
+    キーワード一致のため、内容は必ずリンク先で確認する）。
     """
     required = {"company_code", "title", "pubdate"}
     if disclosures_df.empty or not required.issubset(disclosures_df.columns):
@@ -114,7 +98,7 @@ def detect_stock_split_announcement(disclosures_df: pd.DataFrame) -> pd.DataFram
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
-    hit["rule"] = "stock_split_announcement"
+    hit["rule"] = "stock_split"
     hit["detail"] = "開示タイトル: " + hit["title"]
     hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
     return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
@@ -384,29 +368,41 @@ def detect_low_pbr(statements_df: pd.DataFrame, quotes_df: pd.DataFrame) -> pd.D
     return result[["Code", "Date", "rule", "detail"]]
 
 
-def detect_market_upgrade_to_prime(master_history_df: pd.DataFrame) -> pd.DataFrame:
-    """上場銘柄マスタの日次履歴から、スタンダード/グロース市場からプライム市場への
-    市場変更を検出する。equities/masterはdateパラメータで過去時点の市場区分を
-    遡って返すため、期間内の日次スナップショットを比較して変更日を特定する。
+MARKET_UPGRADE_TO_PRIME_KEYWORDS = ["プライム市場への市場区分変更", "プライム市場への上場市場区分変更"]
+# 申請準備等を後から取り下げる「開示事項の中止」のお知らせにも同じキーワードが
+# 含まれてしまうため、中止系のタイトルは逆方向（ネガティブ）の話として除外する。
+MARKET_UPGRADE_TO_PRIME_EXCLUSION_KEYWORDS = ["中止", "取りやめ", "取り下げ", "延期"]
+
+
+def detect_market_upgrade_to_prime(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+    """TDnet開示タイトルから、スタンダード/グロース市場からプライム市場への
+    市場区分変更の「申請」または「承認」の発表を検出する。
+
+    以前はequities/masterの日次スナップショットを比較して実際の変更日（効力
+    発生日）を検知していたが、これは申請・承認の発表からかなり後になる。
+    株価は発表時点で反応することが多いため、株式分割と同様にTDnetの開示
+    タイトルから発表日ベースで検出する（タイトルのキーワード一致のため、
+    内容は必ずリンク先で確認する。「プライム市場からの」移行、すなわち
+    プライムからの降格はキーワードに含まれないため誤検出しない）。
     """
-    required = {MASTER_CODE, MASTER_DATE, MASTER_MKT_NAME}
-    if master_history_df.empty or not required.issubset(master_history_df.columns):
+    required = {"company_code", "title", "pubdate"}
+    if disclosures_df.empty or not required.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
-    df = master_history_df.copy()
-    df[MASTER_DATE] = pd.to_datetime(df[MASTER_DATE], errors="coerce")
-    df = df.dropna(subset=[MASTER_DATE]).sort_values([MASTER_CODE, MASTER_DATE])
-    df = df.drop_duplicates(subset=[MASTER_CODE, MASTER_DATE])
-
-    df["prev_mkt"] = df.groupby(MASTER_CODE)[MASTER_MKT_NAME].shift(1)
-    upgraded = df["prev_mkt"].isin(["スタンダード", "グロース"]) & (df[MASTER_MKT_NAME] == "プライム")
-
-    hit = df.loc[upgraded, [MASTER_CODE, MASTER_DATE, "prev_mkt", MASTER_MKT_NAME]].copy()
-    hit["rule"] = "market_upgrade_to_prime"
-    hit["detail"] = hit["prev_mkt"] + " → " + hit[MASTER_MKT_NAME] + " へ市場変更"
-    return hit[[MASTER_CODE, MASTER_DATE, "rule", "detail"]].rename(
-        columns={MASTER_CODE: "Code", MASTER_DATE: "Date"}
+    df = disclosures_df.copy()
+    titles = df["title"].fillna("")
+    mentions_keyword = titles.apply(lambda t: any(k in t for k in MARKET_UPGRADE_TO_PRIME_KEYWORDS))
+    mentions_exclusion = titles.apply(
+        lambda t: any(k in t for k in MARKET_UPGRADE_TO_PRIME_EXCLUSION_KEYWORDS)
     )
+    hit = df.loc[mentions_keyword & ~mentions_exclusion, ["company_code", "pubdate", "title"]].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "market_upgrade_to_prime"
+    hit["detail"] = "開示タイトル: " + hit["title"]
+    hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
+    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
 
 
 def detect_new_facility_or_store(disclosures_df: pd.DataFrame) -> pd.DataFrame:

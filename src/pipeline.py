@@ -12,7 +12,11 @@ import warnings
 import pandas as pd
 
 from src import endpoints, rules, tdnet_client
-from src.config import LISTING_LOOKBACK_YEARS, LISTING_DATE_BOUNDARY_TOLERANCE_DAYS
+from src.config import (
+    LISTING_LOOKBACK_YEARS,
+    LISTING_DATE_BOUNDARY_TOLERANCE_DAYS,
+    PROFIT_DOUBLING_YEARS,
+)
 from src.jquants_client import JQuantsClient
 
 RULE_LABELS = {
@@ -20,13 +24,12 @@ RULE_LABELS = {
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
     "earnings_beat": "本決算が会社予想を上回った",
-    "stock_split_announcement": "株式分割・併合の発表（TDnetタイトル検出・要確認）",
-    "stock_split": "株式分割・併合等の実施（株価調整係数の変化を検知、発表日ではなく効力発生日）",
+    "stock_split": "株式分割・併合の発表（TDnetタイトル検出・要確認）",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
     "pbr_low": "PBR1倍以下",
     "two_quarter_growth": "四半期決算2期連続増収増益",
-    "market_upgrade_to_prime": "スタンダード/グロースからプライムへ市場変更",
+    "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表（TDnetタイトル検出・要確認）",
     "new_facility_or_store": "新工場・新店舗の開示（TDnetタイトル検出・要確認）",
     "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場（TDnetタイトル検出・要確認）",
     "downward_revision": "業績予想の下方修正（マイナス要因）",
@@ -35,6 +38,11 @@ RULE_LABELS = {
 # サマリーの「合致数」に含めるルール（downward_revisionはマイナス要因なので除外用に別扱い）
 POSITIVE_RULES = [r for r in RULE_LABELS if r != "downward_revision"]
 NEGATIVE_RULES = ["downward_revision"]
+
+# PBR・自己資本比率は「いつ起きたか」というイベントではなく、開示時点での銘柄の
+# 属性（状態）を見るルールのため、UI上はイベント条件とは別枠の絞り込みとして扱う。
+ATTRIBUTE_RULES = ["pbr_low", "equity_ratio_high"]
+EVENT_RULES = [r for r in POSITIVE_RULES if r not in ATTRIBUTE_RULES]
 
 
 def run_screening(
@@ -56,12 +64,18 @@ def run_screening(
             sector_map = dict(zip(listed_info["Code"], listed_info["S33Nm"]))
 
     quotes_df = endpoints.get_daily_quotes_range(client, start, end)
-    statements_df = endpoints.get_statements_range(client, start, end)
-    master_history_df = endpoints.get_listed_info_range(client, start, end)
+    # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
+    # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
+    # start〜end だけで取得すると比較対象の過去開示がそもそも取得できておらず、
+    # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
+    # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
+    # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
+    comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+    statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
         rules.detect_stop_high(quotes_df),
-        rules.detect_stock_split(quotes_df),
         rules.detect_sales_growth(statements_df),
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
@@ -69,18 +83,21 @@ def run_screening(
         rules.detect_low_pbr(statements_df, quotes_df),
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
-        rules.detect_market_upgrade_to_prime(master_history_df),
     ]
 
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
         hits.append(rules.detect_new_facility_or_store(disclosures_df))
         hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
-        hits.append(rules.detect_stock_split_announcement(disclosures_df))
+        hits.append(rules.detect_stock_split(disclosures_df))
+        hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
         # 他のルールの結果は返す（README参照）。
-        warnings.warn(f"TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割発表の検出をスキップします）: {e}")
+        warnings.warn(
+            "TDnet開示情報の取得に失敗しました"
+            f"（新工場・新店舗・東証移籍・株式分割・プライム市場変更の発表の検出をスキップします）: {e}"
+        )
 
     hits = [h for h in hits if not h.empty]
     if not hits:
@@ -92,6 +109,11 @@ def run_screening(
     result["Sector"] = result["Code"].map(sector_map).fillna("")
     result["RuleLabel"] = result["Rule"].map(RULE_LABELS).fillna(result["Rule"])
     result["Date"] = pd.to_datetime(result["Date"])
+    # 比較用に遡って取得した過去開示分がヒットに混ざらないよう、実際の開示日が
+    # ユーザーの選択期間(start〜end)に入っているものだけに絞り込む。
+    result = result.loc[
+        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] <= pd.Timestamp(end))
+    ]
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]]
 

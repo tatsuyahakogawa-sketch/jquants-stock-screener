@@ -30,31 +30,6 @@ def get_listed_info(client: JQuantsClient, date: dt.date | None = None) -> pd.Da
     return pd.DataFrame.from_records(records)
 
 
-def get_listed_info_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
-    """指定日時点の上場銘柄マスタ(/v2/equities/master)を取得する（キャッシュ利用）。
-
-    equities/masterはdateパラメータを渡すとその時点の市場区分等を遡って返す
-    （2026-07-28に実機確認済み）。市場区分の変更履歴を検出するために使う。
-    """
-    date_str = date.strftime("%Y%m%d")
-    cached = cache.load("listed_info", date_str)
-    if cached is not None:
-        return cached
-    records = list(client.get_all_pages("/equities/master", {"date": date_str}))
-    df = pd.DataFrame.from_records(records)
-    cache.save("listed_info", date_str, df)
-    return df
-
-
-def get_listed_info_range(client: JQuantsClient, start: dt.date, end: dt.date) -> pd.DataFrame:
-    """期間内の各日について上場銘柄マスタを取得し1つのDataFrameにまとめる。"""
-    frames = [get_listed_info_by_date(client, d) for d in _daterange(start, end)]
-    frames = [f for f in frames if not f.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
 def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
     """指定日の全銘柄分の株価四本値(/v2/equities/bars/daily)を取得する（キャッシュ利用）。"""
     date_str = date.strftime("%Y%m%d")
