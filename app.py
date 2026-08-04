@@ -23,11 +23,63 @@ from src.pipeline import (
     RULE_LABELS,
     EVENT_RULES,
     ATTRIBUTE_RULES,
+    TDNET_TITLE_BASED_RULES,
     run_screening,
     build_summary,
     enrich_with_market_data,
     compute_tenx_scores,
 )
+
+# EVENT_RULESを画面上の見た目だけ2グループに分ける（判定ロジックは変更しない）。
+_MATERIAL_EVENT_RULES = [
+    "stop_high", "stock_split", "new_facility_or_store", "large_order",
+    "world_first", "market_upgrade_to_prime", "exchange_transfer_to_tokyo",
+]
+_PERFORMANCE_EVENT_RULES = [
+    "sales_growth_major", "sales_growth_explosive", "earnings_beat",
+    "two_quarter_growth", "profit_doubling",
+]
+
+_MARKET_CAP_CEILINGS = {"30億円以下": 30, "100億円以下": 100, "300億円以下": 300, "500億円以下": 500, "1000億円以下": 1000}
+_PER_CEILINGS = {"10以下": 10, "15以下": 15, "20以下": 20, "30以下": 30}
+_DIVIDEND_FLOORS = {"1%以上": 1, "2%以上": 2, "3%以上": 3, "4%以上": 4, "5%以上": 5}
+_ROE_FLOORS = {"10%以上": 10, "15%以上": 15, "20%以上": 20}
+_MARGIN_FLOORS = {"5%以上": 5, "10%以上": 10, "15%以上": 15, "20%以上": 20}
+_NO_LIMIT = "制限なし"
+
+# プリセット。テーマ性の強いもの（半導体・AI・データセンター・宇宙・量子等）は、
+# 会社名や業種名の単純一致では誤判定が多く実用にならないため今回は含めていない
+# （テーマ検索機能の実装待ち）。ここにあるのは既存データで確実に判定できるものだけ。
+_PRESETS = {
+    "テンバガー": {
+        "tenx_enabled": True,
+        "market_cap_ceiling": "300億円以下",
+        "margin_floor": "10%以上",
+    },
+    "高配当": {
+        "dividend_floor": "4%以上",
+        "exclude_downward": True,
+    },
+    "地方銀行": {
+        "sector_filter": "銀行業",
+    },
+    "黒字転換": {
+        # スコアでの絞り込みは行わない方針のため、スコアを表示して
+        # 「加点理由」に黒字転換が出た銘柄を目視できるようにするだけ。
+        "tenx_enabled": True,
+    },
+    "爆発決算": {
+        "selected_events": ["sales_growth_explosive", "earnings_beat"],
+        "event_logic": "OR検索",
+    },
+    "割安株": {
+        "selected_attributes": ["pbr_low"],
+        "per_ceiling": "15以下",
+    },
+    "IPO": {
+        "recently_listed_only": True,
+    },
+}
 
 load_dotenv()
 
@@ -117,8 +169,9 @@ st.info(
     "現在このアプリで自動判定できるのは、以下の条件です。\n\n"
     + "\n".join(f"- {label}" for label in RULE_LABELS.values())
     + "\n\n"
-    "「新工場・新店舗の開示」「東証移籍」はTDnet開示タイトルのキーワード検出のため、"
-    "誤検出の可能性があります。イベント一覧の開示タイトルで内容を確認してください。\n\n"
+    "次の条件はTDnet開示タイトルのキーワード検出のため、誤検出の可能性があります: "
+    + "、".join(RULE_LABELS[r] for r in TDNET_TITLE_BASED_RULES)
+    + "。銘柄コードを確認し、TDnet（適時開示情報閲覧サービス）等で開示内容を確認してください。\n\n"
     "「オーナー経営」「取引先」は、大株主・取引先情報が構造化データとして提供されていないため、"
     "このバージョンでは未対応です（README参照）。\n\n"
     "「上場日」はJ-Quantsに存在しないため、株価データが取得できる最古の日付から推定した近似値"
@@ -139,35 +192,175 @@ with col2:
 
 st.subheader("絞り込み条件（実行前に選択）")
 
-st.markdown("**イベント条件**（押した条件が赤くなります。選んだ条件のうち何個に合致したかで並び替えます）")
-selected_events = st.pills(
-    "対象にするイベント条件",
-    options=EVENT_RULES,
-    format_func=lambda k: RULE_LABELS[k],
-    selection_mode="multi",
-    default=[],
-    label_visibility="collapsed",
-)
 
-st.markdown("**属性条件**（チェックした条件だけで銘柄を絞り込みます）")
-attr_cols = st.columns(len(ATTRIBUTE_RULES))
-selected_attributes = []
-for attr_col, rule in zip(attr_cols, ATTRIBUTE_RULES):
-    with attr_col:
-        if st.checkbox(RULE_LABELS[rule], key=f"attr_{rule}"):
-            selected_attributes.append(rule)
+def _apply_settings(settings: dict) -> None:
+    """プリセット・保存済み条件を各ウィジェットのkeyへ反映して再実行する。
 
-exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True, key="exclude_downward")
+    この下にある対象ウィジェットが生成される前（このブロック内）で
+    session_stateへ書き込む必要がある（Streamlitの制約）。
+    """
+    st.session_state["tenx_enabled"] = settings.get("tenx_enabled", False)
+    st.session_state["market_cap_ceiling"] = settings.get("market_cap_ceiling", _NO_LIMIT)
+    st.session_state["per_ceiling"] = settings.get("per_ceiling", _NO_LIMIT)
+    st.session_state["dividend_floor"] = settings.get("dividend_floor", _NO_LIMIT)
+    st.session_state["roe_floor"] = settings.get("roe_floor", _NO_LIMIT)
+    st.session_state["margin_floor"] = settings.get("margin_floor", _NO_LIMIT)
+    st.session_state["exclude_downward"] = settings.get("exclude_downward", True)
+    st.session_state["sector_filter"] = settings.get("sector_filter", "")
+    st.session_state["recently_listed_only"] = settings.get("recently_listed_only", False)
+    st.session_state["event_logic"] = settings.get("event_logic", "OR検索")
+    preset_events = set(settings.get("selected_events", []))
+    st.session_state["material_events_pills"] = [r for r in _MATERIAL_EVENT_RULES if r in preset_events]
+    st.session_state["performance_events_pills"] = [r for r in _PERFORMANCE_EVENT_RULES if r in preset_events]
+    preset_attrs = set(settings.get("selected_attributes", []))
+    for rule in ATTRIBUTE_RULES:
+        st.session_state[f"attr_{rule}"] = rule in preset_attrs
+    st.rerun()
 
-st.markdown(
-    "**10倍株候補スコア**（時価総額・増収率・利益成長等をJ-Quantsの決算データだけで採点し、"
-    "結果テーブルに参考情報として表示します。未来の業績を推計するものではありません）"
-)
+
+def _current_settings_snapshot() -> dict:
+    return {
+        "tenx_enabled": st.session_state.get("tenx_enabled", False),
+        "market_cap_ceiling": st.session_state.get("market_cap_ceiling", _NO_LIMIT),
+        "per_ceiling": st.session_state.get("per_ceiling", _NO_LIMIT),
+        "dividend_floor": st.session_state.get("dividend_floor", _NO_LIMIT),
+        "roe_floor": st.session_state.get("roe_floor", _NO_LIMIT),
+        "margin_floor": st.session_state.get("margin_floor", _NO_LIMIT),
+        "exclude_downward": st.session_state.get("exclude_downward", True),
+        "sector_filter": st.session_state.get("sector_filter", ""),
+        "recently_listed_only": st.session_state.get("recently_listed_only", False),
+        "event_logic": st.session_state.get("event_logic", "OR検索"),
+        "selected_events": st.session_state.get("selected_events", []),
+        "selected_attributes": [r for r in ATTRIBUTE_RULES if st.session_state.get(f"attr_{r}")],
+    }
+
+
+st.markdown("**プリセット**（クリックで下の条件に反映されます。あとから自由に変更できます）")
 st.caption(
-    "四半期成長の加速・52週高値接近・出来高急増は、全銘柄分の長期株価データを新たに"
-    "取得する必要があるため未実装です（今後追加予定）。"
+    "半導体・AI・データセンター・宇宙・量子等のテーマ別プリセットは、会社名の単純一致では"
+    "精度が出ないため今回は含めていません（テーマ検索機能の実装待ち）。"
 )
-tenx_enabled = st.checkbox("10倍株候補スコアを計算して表示する", key="tenx_enabled")
+preset_cols = st.columns(4)
+for i, preset_name in enumerate(_PRESETS):
+    if preset_cols[i % 4].button(preset_name, key=f"preset_{preset_name}"):
+        _apply_settings(_PRESETS[preset_name])
+
+with st.expander("💾 検索条件の保存・呼び出し（このブラウザを閉じるまで有効）"):
+    saved_searches = st.session_state.setdefault("saved_searches", {})
+    save_col1, save_col2 = st.columns([3, 1])
+    with save_col1:
+        save_name = st.text_input("保存名", key="save_search_name", placeholder="例: 銀行高配当", label_visibility="collapsed")
+    with save_col2:
+        if st.button("⭐ 現在の条件を保存"):
+            if save_name.strip():
+                saved_searches[save_name.strip()] = _current_settings_snapshot()
+                st.success(f"「{save_name.strip()}」として保存しました。")
+            else:
+                st.warning("保存名を入力してください。")
+    if saved_searches:
+        load_col1, load_col2 = st.columns([3, 1])
+        with load_col1:
+            load_name = st.selectbox("保存済みの条件", options=list(saved_searches.keys()), label_visibility="collapsed")
+        with load_col2:
+            if st.button("この条件を呼び出す"):
+                _apply_settings(saved_searches[load_name])
+
+st.divider()
+
+with st.container(border=True):
+    st.markdown("### 🚀 イベント・材料")
+    event_and_or = st.radio(
+        "イベント条件の組み合わせ方",
+        options=["OR検索", "AND検索"],
+        index=0,
+        horizontal=True,
+        key="event_logic",
+        help="OR＝選んだ条件のうち1つでも合致すれば表示。AND＝選んだ条件すべてに合致した銘柄だけ表示。",
+    )
+    material_events = st.pills(
+        "対象にするイベント・材料条件",
+        options=_MATERIAL_EVENT_RULES,
+        format_func=lambda k: RULE_LABELS[k],
+        selection_mode="multi",
+        default=[],
+        key="material_events_pills",
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "※次の条件はTDnet開示タイトルのキーワード検出のため誤検出の可能性があります: "
+        + "、".join(RULE_LABELS[r] for r in TDNET_TITLE_BASED_RULES if r in _MATERIAL_EVENT_RULES)
+    )
+    st.caption(f"{len(material_events)}件選択中")
+
+with st.container(border=True):
+    st.markdown("### 📈 業績")
+    performance_events = st.pills(
+        "対象にする業績条件",
+        options=_PERFORMANCE_EVENT_RULES,
+        format_func=lambda k: RULE_LABELS[k],
+        selection_mode="multi",
+        default=[],
+        key="performance_events_pills",
+        label_visibility="collapsed",
+    )
+    st.caption("黒字転換（今後追加予定・現在は10倍株候補スコアの加点理由でのみ確認できます）")
+    st.caption(f"{len(performance_events)}件選択中")
+
+# st.pillsは複数ウィジェットを同じ変数名にできないため、2カードの選択結果をここで結合する
+# （検索ロジック自体はEVENT_RULES全体に対して変わらず動く）。
+selected_events = list(material_events) + list(performance_events)
+st.session_state["selected_events"] = selected_events
+
+with st.container(border=True):
+    st.markdown("### 💰 財務")
+    attr_cols = st.columns(len(ATTRIBUTE_RULES))
+    selected_attributes = []
+    for attr_col, rule in zip(attr_cols, ATTRIBUTE_RULES):
+        with attr_col:
+            if st.checkbox(RULE_LABELS[rule], key=f"attr_{rule}"):
+                selected_attributes.append(rule)
+    exclude_downward = st.checkbox("業績予想の下方修正歴がある銘柄を除外する", value=True, key="exclude_downward")
+
+    fin_col1, fin_col2 = st.columns(2)
+    with fin_col1:
+        per_ceiling = st.radio("PER（上限）", options=[_NO_LIMIT, *_PER_CEILINGS], key="per_ceiling")
+        roe_floor = st.radio("ROE（下限）", options=[_NO_LIMIT, *_ROE_FLOORS], key="roe_floor")
+    with fin_col2:
+        dividend_floor = st.radio("配当利回り（下限）", options=[_NO_LIMIT, *_DIVIDEND_FLOORS], key="dividend_floor")
+        margin_floor = st.radio("営業利益率（下限）", options=[_NO_LIMIT, *_MARGIN_FLOORS], key="margin_floor")
+
+    sector_filter = st.text_input(
+        "業種で絞り込む（部分一致・任意）", key="sector_filter", placeholder="例: 銀行業"
+    )
+    recently_listed_only = st.checkbox(
+        "上場5年以内（推定）の銘柄のみ", key="recently_listed_only"
+    )
+    selected_count = (
+        len(selected_attributes) + int(exclude_downward) + int(per_ceiling != _NO_LIMIT)
+        + int(dividend_floor != _NO_LIMIT) + int(roe_floor != _NO_LIMIT) + int(margin_floor != _NO_LIMIT)
+        + int(bool(sector_filter.strip())) + int(recently_listed_only)
+    )
+    st.caption(f"{selected_count}件選択中")
+
+with st.container(border=True):
+    st.markdown("### ⭐ テンバガー候補")
+    tenx_enabled = st.checkbox("10倍株候補スコアを利用する", key="tenx_enabled")
+    st.caption(
+        "時価総額・増収率・利益成長等をJ-Quantsの決算データだけで採点し、結果テーブルに"
+        "スコアと加点・減点理由を表示します。未来の業績を推計するものではありません。"
+    )
+    if tenx_enabled:
+        st.caption(
+            "四半期成長の加速・52週高値接近・出来高急増は、全銘柄分の長期株価データを新たに"
+            "取得する必要があるため未実装です（今後追加予定）。"
+        )
+        market_cap_ceiling = st.radio(
+            "時価総額（上限・テンバガー候補では重要）",
+            options=[_NO_LIMIT, *_MARKET_CAP_CEILINGS],
+            key="market_cap_ceiling",
+        )
+    else:
+        market_cap_ceiling = st.session_state.get("market_cap_ceiling", _NO_LIMIT)
 
 if st.button("スクリーニング実行", type="primary"):
     if not selected_events and not selected_attributes:
@@ -244,7 +437,10 @@ if "summary" in st.session_state:
         view = summary.copy()
         if selected_events:
             view["MatchedCountSelected"] = view[[f"{r}_matched" for r in selected_events]].sum(axis=1)
-            view = view[view["MatchedCountSelected"] >= 1]
+            if event_and_or == "AND検索":
+                view = view[view["MatchedCountSelected"] == len(selected_events)]
+            else:
+                view = view[view["MatchedCountSelected"] >= 1]
         else:
             view["MatchedCountSelected"] = 0
         view["MatchedConditions"] = view.apply(
@@ -256,6 +452,26 @@ if "summary" in st.session_state:
             view = view[view[f"{attr_rule}_matched"]]
         if exclude_downward:
             view = view[~view["HasDownwardRevision"]]
+
+        if "MarketCap" in view.columns:
+            view["MarketCapOku"] = (view["MarketCap"] / 1e8).round(1)
+            # 上限フィルターは⭐テンバガー候補カードが開いている(tenx_enabled)時だけ
+            # 効かせる。閉じている間はウィジェットが非表示になり値を変更できないため、
+            # 見えないフィルターが働き続けることを避ける。
+            if tenx_enabled and market_cap_ceiling != _NO_LIMIT:
+                view = view[view["MarketCapOku"] <= _MARKET_CAP_CEILINGS[market_cap_ceiling]]
+        if per_ceiling != _NO_LIMIT and "PER" in view.columns:
+            view = view[view["PER"] <= _PER_CEILINGS[per_ceiling]]
+        if dividend_floor != _NO_LIMIT and "DividendYield" in view.columns:
+            view = view[(view["DividendYield"] * 100) >= _DIVIDEND_FLOORS[dividend_floor]]
+        if roe_floor != _NO_LIMIT and "ROE" in view.columns:
+            view = view[(view["ROE"] * 100) >= _ROE_FLOORS[roe_floor]]
+        if margin_floor != _NO_LIMIT and "OperatingMargin" in view.columns:
+            view = view[view["OperatingMargin"] >= _MARGIN_FLOORS[margin_floor]]
+        if sector_filter.strip() and "Sector" in view.columns:
+            view = view[view["Sector"].str.contains(sector_filter.strip(), na=False)]
+        if recently_listed_only and "RecentlyListed" in view.columns:
+            view = view[view["RecentlyListed"].fillna(False)]
 
         if "stop_high_date" in view.columns:
             view["StopHighDate"] = view["stop_high_date"].apply(_format_date)
@@ -270,13 +486,24 @@ if "summary" in st.session_state:
                 axis=1,
             )
 
-        if "MarketCap" in view.columns:
-            view["MarketCapOku"] = (view["MarketCap"] / 1e8).round(1)
+        # 危険フラグ：参考情報のみで、絞り込み条件には使わない。大株主売却・継続企業注記・
+        # 公募増資（希薄化以外の意味での）は、J-Quantsの決算開示データからは検出できないため
+        # 含めていない（README・仕様確認済み）。
+        def _danger_flags(row) -> str:
+            flags = []
+            if row.get("HasDownwardRevision"):
+                flags.append("⚠下方修正")
+            negative_reasons = row.get("NegativeReasons")
+            if isinstance(negative_reasons, str) and "発行済株式数" in negative_reasons:
+                flags.append("⚠希薄化")
+            return "、".join(flags)
+
+        view["DangerFlags"] = view.apply(_danger_flags, axis=1)
 
         display_cols = [
             "Code", "CompanyName", "Sector", "MatchedCountSelected", "MatchedConditions",
-            "StopHighDate", "MarketCapOku", "PER", "PBR", "DividendYield",
-            "ListingDateDisplay", "HasDownwardRevision",
+            "StopHighDate", "MarketCapOku", "PER", "PBR", "DividendYield", "ROE", "OperatingMargin",
+            "ListingDateDisplay", "HasDownwardRevision", "DangerFlags",
         ]
         rename_map = {
             "Sector": "業種",
@@ -287,19 +514,26 @@ if "summary" in st.session_state:
             "PER": "PER(予想/実績年率換算)",
             "PBR": "PBR",
             "DividendYield": "配当利回り",
+            "ROE": "ROE",
+            "OperatingMargin": "営業利益率",
             "ListingDateDisplay": "推定上場日（近似）",
             "HasDownwardRevision": "下方修正歴あり",
+            "DangerFlags": "危険フラグ（参考情報）",
         }
         sort_key = "合致数"
         if tenx_enabled and "TenXScore" in view.columns:
+            view["TenXStars"] = view["TenXScore"].apply(
+                lambda s: "★" * max(0, min(5, round(s / 2))) if pd.notna(s) else ""
+            )
             display_cols += [
-                "TenXScore", "MarketCapBand", "ThreeYearRevenueGrowth", "RevenueCAGR",
+                "TenXScore", "TenXStars", "MarketCapBand", "ThreeYearRevenueGrowth", "RevenueCAGR",
                 "ProfitGrowthRate", "MarginImprovement", "Turnaround", "UpwardRevisionPct",
                 "UpwardRevisionCount", "ProgressRatio", "PositiveReasons", "NegativeReasons",
                 "UndeterminedItems",
             ]
             rename_map.update({
                 "TenXScore": "10倍株候補スコア",
+                "TenXStars": "評価",
                 "MarketCapBand": "時価総額区分",
                 "ThreeYearRevenueGrowth": "3期連続増収",
                 "RevenueCAGR": "売上CAGR",
@@ -329,12 +563,23 @@ if "summary" in st.session_state:
         if "PER(予想/実績年率換算)" in display.columns:
             display["PER(予想/実績年率換算)"] = display["PER(予想/実績年率換算)"].round(1)
         if "PBR" in display.columns:
-            display["PBR"] = display["PBR"].round(2)
+            display["PBR"] = display["PBR"].round(1)
         if "配当利回り" in display.columns:
-            display["配当利回り"] = (display["配当利回り"] * 100).round(2)
+            display["配当利回り"] = (display["配当利回り"] * 100).round(1)
+        if "ROE" in display.columns:
+            display["ROE"] = (display["ROE"] * 100).round(1)
+        if "営業利益率" in display.columns:
+            display["営業利益率"] = display["営業利益率"].round(1)
 
         st.success(f"{len(display)} 銘柄が条件に合致しました（列見出しクリックでソート可能）。")
-        st.dataframe(display, width="stretch", hide_index=True)
+        if "危険フラグ（参考情報）" in display.columns:
+            styled = display.style.map(
+                lambda v: "color: #d32f2f; font-weight: bold" if v else "",
+                subset=["危険フラグ（参考情報）"],
+            )
+            st.dataframe(styled, width="stretch", hide_index=True)
+        else:
+            st.dataframe(display, width="stretch", hide_index=True)
         st.download_button(
             "CSVダウンロード（銘柄集計）",
             data=display.to_csv(index=False).encode("utf-8-sig"),

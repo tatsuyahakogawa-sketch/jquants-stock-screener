@@ -24,18 +24,29 @@ RULE_LABELS = {
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
     "earnings_beat": "本決算が会社予想を上回った",
-    "stock_split": "株式分割・併合の発表（TDnetタイトル検出・要確認）",
+    "stock_split": "株式分割・併合の発表",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
     "pbr_low": "PBR1倍以下",
     "two_quarter_growth": "四半期決算2期連続増収増益",
-    "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表（TDnetタイトル検出・要確認）",
-    "new_facility_or_store": "新工場・新店舗の開示（TDnetタイトル検出・要確認）",
-    "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場（TDnetタイトル検出・要確認）",
-    "large_order": "大型・大口受注の発表（TDnetタイトル検出・要確認）",
-    "world_first": "世界初の製品・サービスの発表（TDnetタイトル検出・要確認）",
+    "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表",
+    "new_facility_or_store": "新工場・新店舗の開示",
+    "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場",
+    "large_order": "大型・大口受注の発表",
+    "world_first": "世界初の製品・サービスの発表",
     "downward_revision": "業績予想の下方修正（マイナス要因）",
 }
+
+# タイトルのキーワード一致で判定しているため誤検出の可能性があるルール
+# （detail列・開示タイトルで内容を確認する運用が前提）。
+TDNET_TITLE_BASED_RULES = [
+    "stock_split",
+    "market_upgrade_to_prime",
+    "new_facility_or_store",
+    "exchange_transfer_to_tokyo",
+    "large_order",
+    "world_first",
+]
 
 # サマリーの「合致数」に含めるルール（downward_revisionはマイナス要因なので除外用に別扱い）
 POSITIVE_RULES = [r for r in RULE_LABELS if r != "downward_revision"]
@@ -59,11 +70,22 @@ def run_screening(
     listed_info = endpoints.get_listed_info(client)
     name_map: dict[str, str] = {}
     sector_map: dict[str, str] = {}
+    valid_codes: set[str] = set()
     if not listed_info.empty and "Code" in listed_info.columns:
+        valid_codes = set(listed_info["Code"].astype(str))
         if "CoName" in listed_info.columns:
             name_map = dict(zip(listed_info["Code"], listed_info["CoName"]))
         if "S33Nm" in listed_info.columns:
             sector_map = dict(zip(listed_info["Code"], listed_info["S33Nm"]))
+        # TOKYO PRO MARKETはプロ投資家向け市場で、個人が通常の口座では取引できず、
+        # 決算開示(/fins/summary)も株価データもほぼ提供されないため、時価総額・
+        # PER等が全く出せない「空欄だらけ」の行になってしまう。この銘柄群は
+        # 通常のスクリーニング対象から除外する。
+        if "MktNm" in listed_info.columns:
+            pro_market_codes = set(
+                listed_info.loc[listed_info["MktNm"] == "TOKYO PRO MARKET", "Code"].astype(str)
+            )
+            valid_codes -= pro_market_codes
 
     quotes_df = endpoints.get_daily_quotes_range(client, start, end)
     # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
@@ -109,6 +131,12 @@ def run_screening(
 
     result = pd.concat(hits, ignore_index=True)
     result = result.rename(columns={"rule": "Rule", "detail": "Detail"})
+    result["Code"] = result["Code"].astype(str)
+    if valid_codes:
+        # 現在の上場銘柄マスタに存在しない銘柄（上場廃止済み等、決算開示だけが
+        # 残っているケース）は、会社名も株価・時価総額も取得できず「空欄だらけ」
+        # の行になってしまうため除外する。
+        result = result.loc[result["Code"].isin(valid_codes)]
     result["CompanyName"] = result["Code"].map(name_map).fillna("")
     result["Sector"] = result["Code"].map(sector_map).fillna("")
     result["RuleLabel"] = result["Rule"].map(RULE_LABELS).fillna(result["Rule"])
@@ -272,6 +300,26 @@ def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
     return float(adj_c / c)
 
 
+def _latest_operating_margin(fins: pd.DataFrame) -> float | None:
+    """直近開示(期間区分を問わない)の売上高・営業利益から営業利益率(%)を計算する。
+
+    四半期の値も含めて「直近の実力」を見る（経常利益率は10倍株候補スコア側で
+    別途、前年同期比較の文脈で計算しているため、ここではPER等と同じく単純に
+    最新開示1件のスナップショットとする）。
+    """
+    if "OP" not in fins.columns or "Sales" not in fins.columns:
+        return None
+    d = fins.copy()
+    d["Sales"] = _to_numeric(d["Sales"])
+    d["OP"] = _to_numeric(d["OP"])
+    d = d.dropna(subset=["Sales", "OP", "DiscDate"])
+    d = d.loc[d["Sales"] != 0]
+    if d.empty:
+        return None
+    row = d.sort_values("DiscDate").iloc[-1]
+    return float(row["OP"] / row["Sales"] * 100)
+
+
 def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> dict:
     """財務履歴と株価履歴から、時価総額・PER・PBR・配当利回り・最新終値等を計算する。
 
@@ -289,6 +337,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
             latest_price_date = price_history["Date"].iloc[-1]
 
     feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
+    roe = operating_margin = None
     if not fins.empty and "DiscDate" in fins.columns:
         fins = fins.copy()
         fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
@@ -300,6 +349,8 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
             treasury_shares = _last_valid_value(fins, "TrShFY")
             div_ann, div_ann_date = _dividend_forecast_or_trailing_with_date(fins)
             annualized_eps, annualized_eps_date = _last_valid_eps_annualized_with_date(fins)
+            roe = _last_valid_value(fins, "ROE")
+            operating_margin = _latest_operating_margin(fins)
 
             # 開示日以降に株式分割・併合があった場合、1株当たり指標(EPS/BPS/配当)を
             # 現在の株式数基準に換算する（開示日ちょうどの倍率でその後の分割の
@@ -335,6 +386,8 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         "pbr": pbr,
         "dividend_yield": dividend_yield,
         "shares_out": shares_out,
+        "roe": roe,
+        "operating_margin": operating_margin,
     }
 
 
@@ -384,7 +437,7 @@ def enrich_with_market_data(client: JQuantsClient, summary: pd.DataFrame) -> pd.
     """
     new_cols = [
         "LatestClose", "LatestPriceDate", "MarketCap", "PER", "PBR", "DividendYield",
-        "EstimatedListingDate", "RecentlyListed",
+        "EstimatedListingDate", "RecentlyListed", "ROE", "OperatingMargin",
     ]
     if summary.empty:
         return summary.assign(**{c: pd.Series(dtype="float64") for c in new_cols})
@@ -407,6 +460,8 @@ def enrich_with_market_data(client: JQuantsClient, summary: pd.DataFrame) -> pd.
             "DividendYield": metrics["dividend_yield"],
             "EstimatedListingDate": estimated_listing_date,
             "RecentlyListed": recently_listed,
+            "ROE": metrics["roe"],
+            "OperatingMargin": metrics["operating_margin"],
         })
 
     enrichment = pd.DataFrame(rows)
