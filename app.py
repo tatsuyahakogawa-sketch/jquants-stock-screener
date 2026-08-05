@@ -182,7 +182,7 @@ st.caption("契約プラン（Light）は遅延なしで過去5年分のデー�
 
 max_end = dt.date.today() - dt.timedelta(days=1)
 default_end = max_end
-default_start = default_end - dt.timedelta(days=30)
+default_start = default_end
 
 col1, col2 = st.columns(2)
 with col1:
@@ -432,7 +432,7 @@ if "summary" in st.session_state:
     if not summary.empty and not expected_cols.issubset(summary.columns):
         st.warning("コード更新により前回の結果が古くなっています。もう一度「スクリーニング実行」を押してください。")
     elif summary.empty:
-        st.warning("条件に合致した銘柄はありませんでした。")
+        st.warning("該当なし（条件に合致した銘柄はありませんでした）。")
     else:
         view = summary.copy()
         if selected_events:
@@ -571,7 +571,10 @@ if "summary" in st.session_state:
         if "営業利益率" in display.columns:
             display["営業利益率"] = display["営業利益率"].round(1)
 
-        st.success(f"{len(display)} 銘柄が条件に合致しました（列見出しクリックでソート可能）。")
+        if len(display) == 0:
+            st.warning("該当なし（絞り込み条件を満たす銘柄はありませんでした）。")
+        else:
+            st.success(f"{len(display)} 銘柄が条件に合致しました（列見出しクリックでソート可能）。")
         if "危険フラグ（参考情報）" in display.columns:
             styled = display.style.map(
                 lambda v: "color: #d32f2f; font-weight: bold" if v else "",
