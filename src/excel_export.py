@@ -373,7 +373,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             sales_cell.value = math.floor(sales / 1e8)
             sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 2)
+            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 1)
         close = _nearest_close(prices, row["CurPerEn"])
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
@@ -388,7 +388,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.value = math.floor(sales / 1e8)
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 2)
+            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 1)
         if pd.notna(disc_date):
             forecast_source_notes.append(
                 f"{year}年会社予想：J-Quants /fins/summary、開示日 {disc_date.date()}"
@@ -418,7 +418,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             cell.value = math.floor(fsales / 1e8)
             cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 2)
+            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 1)
 
     notes = []
     missing_forecast_years = [year for year in forecast_years if year not in forecast_data]
