@@ -270,7 +270,14 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     # 決算短信以外の開示（配当予想の修正等）はSales/OdPが空でもCurFYEnを持つため、
     # 実績データの年度は「Salesが実際に入っている行」だけから拾う。
     f_actual = f.dropna(subset=["Sales"])
-    all_actual_years = sorted(f_actual["CurFYEn"].dt.year.unique().tolist())
+    # 「実績年度」（見出しに"予想"を付けず、今期・来期予想欄の基準にもする年度）
+    # は、本決算(FY)自体の実績が確定した年度だけに限る。決算期が3月以外の会社等
+    # では、進行中の期でも1Q/2Q/3Qの実績Salesは入っているため、これを含めると
+    # 本決算がまだ来ていない進行中の期まで「実績」と誤認し、実際には会社予想
+    # （FSales/FOdP）で埋まっているだけの決算行が実績のように見えたり、今期・
+    # 来期の予想欄が1期ズレて空欄になったりする。
+    f_actual_fy = f_actual.loc[f_actual["CurPerType"] == "FY"]
+    all_actual_years = sorted(f_actual_fy["CurFYEn"].dt.year.unique().tolist())
 
     # 「今期」の会社予想(FSales/FOdP)・「来期」の会社予想(NxFSales/NxFOdP)は、
     # CurPerType="FY"の開示（本決算実績、または本決算の会社予想を修正する
