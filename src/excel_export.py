@@ -346,10 +346,16 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         return buf.getvalue()
 
     # テンプレートの年度枠は7つ。予想年度分の枠(今期・来期の2つ)を確保した
-    # 残りに、実績年度を直近優先でC列から左詰めで並べ、予想年度はその直後の
-    # 列に置く。
+    # 残りは、直近の実績年度を起点にした「連続したカレンダー年」を固定で
+    # C列から並べる（実績が無い年でも列自体は必ず用意し、その年だけ空欄に
+    # する）。データが存在する年だけを詰めて並べると、欠けている年がある
+    # 銘柄（市場変更・上場間もない等）で列と年の対応がずれてしまうため。
     max_actual = max(len(_YEAR_COLS) - len(forecast_years), 0)
-    actual_years = all_actual_years[-max_actual:] if max_actual else []
+    actual_years = (
+        list(range(last_actual_year - max_actual + 1, last_actual_year + 1))
+        if last_actual_year is not None and max_actual
+        else []
+    )
 
     col_for_year = {}
     for i, year in enumerate(actual_years):
