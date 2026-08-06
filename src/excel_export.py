@@ -385,7 +385,6 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
 
-    forecast_source_notes = []
     for year, (sales, profit, disc_date) in forecast_data.items():
         col = col_for_year.get(year)
         if col is None:
@@ -396,10 +395,6 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
             ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 1)
-        if pd.notna(disc_date):
-            forecast_source_notes.append(
-                f"{year}年会社予想：J-Quants /fins/summary、開示日 {disc_date.date()}"
-            )
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
@@ -426,22 +421,6 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
             ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 1)
-
-    notes = []
-    missing_forecast_years = [year for year in forecast_years if year not in forecast_data]
-    for year in missing_forecast_years:
-        notes.append(
-            f"{year}年会社予想は未発表（J-Quantsでは直近1年先までの予想数値のみ取得可能。"
-            "中期経営計画等から補うには手動で確認が必要）"
-        )
-    notes.extend(forecast_source_notes)
-    if metrics["dividend_yield"] is None:
-        notes.append("配当利回り：会社予想・実績配当のデータ不足のため空欄")
-    split_text = _stock_split_events_text(prices_raw)
-    if split_text:
-        notes.append(split_text)
-    if notes:
-        ws["Q10"] = "\n".join(notes)
 
     logger.info(
         "[%s] 会社予想EPS=%s 会社予想年間配当=%s 最新株価=%s PER=%s 配当利回り=%s 列割当=%s",
