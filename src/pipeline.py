@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import warnings
 
 import pandas as pd
@@ -18,6 +19,8 @@ from src.config import (
     PROFIT_DOUBLING_YEARS,
 )
 from src.jquants_client import JQuantsClient
+
+logger = logging.getLogger(__name__)
 
 RULE_LABELS = {
     "stop_high": "ストップ高",
@@ -203,9 +206,15 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-# EPSはCurPerType（1Q/2Q/3Q/FY等）の期間累計値で開示されるため、会社予想EPS(FEPS)が
-# 無いときに実績EPSで代用する場合は年率換算してから使う。
+# EPSはCurPerType（1Q/2Q/3Q/FY等）の期間累計値で開示されるため、実績EPSを
+# 年率換算する際に使う（表示するPERには使わず、source_perという参考値・
+# 乖離チェック用にのみ使う。過去実績EPSと最新株価を組み合わせて表示用PERを
+# 計算しない）。
 _EPS_ANNUALIZE_FACTOR = {"1Q": 4.0, "2Q": 2.0, "3Q": 4 / 3, "4Q": 1.0, "FY": 1.0}
+
+# 予想EPS基準PER(calculated_per)と実績EPS基準PER(source_per)がこの割合以上
+# 乖離した場合、EPSの取得ミス・分割調整前後の混在等を疑ってログに警告を出す。
+_PER_SANITY_DIVERGENCE_THRESHOLD = 0.20
 
 
 def _last_valid_value_with_date(df: pd.DataFrame, column: str) -> tuple[float | None, pd.Timestamp | None]:
@@ -246,6 +255,34 @@ def _last_valid_full_year_value_with_date(df: pd.DataFrame, column: str) -> tupl
 def _last_valid_full_year_value(df: pd.DataFrame, column: str) -> float | None:
     value, _ = _last_valid_full_year_value_with_date(df, column)
     return value
+
+
+def _last_valid_full_year_forecast_eps_with_date(df: pd.DataFrame) -> tuple[float | None, pd.Timestamp | None]:
+    """会社予想EPSを、直近のFY区分開示から取得する。FEPS(今期・連結)→FNCEPS(今期・
+    非連結)→NxFEPS(来期・連結)→NxFNCEPS(来期・非連結)の順にフォールバックする。
+
+    - FEPS→FNCEPS: 決算発表直前の業績予想の修正等で、直近のFY区分開示がFEPS
+      (連結)を出さずFNCEPS(非連結)だけを更新していることがある。
+    - FEPS/FNCEPS→NxFEPS/NxFNCEPS: 直近のFY区分開示が本決算実績そのものの場合、
+      今期分の予想(FEPS/FNCEPS)は実績確定済みのため空になり、来期の予想
+      (NxFEPS/NxFNCEPS)だけが入っている（例: 4527・5711・3422は直近が本決算
+      実績の開示で、FEPSは空・NxFEPSに来期予想が入っていた）。
+    単純に_last_valid_full_year_value_with_date(df, "FEPS")を使うと、その開示
+    より前の古いFEPSまで遡ってしまい直近の会社予想を反映できないため、直近の
+    FY開示から1件ずつ確認し、同じ開示の中で優先順に確認する（excel_export.py
+    のFOdP→FOP、IFRS採用企業向けフォールバックと同じ考え方）。
+    """
+    if "CurPerType" not in df.columns or "DiscDate" not in df.columns:
+        return None, None
+    fy_rows = df.loc[df["CurPerType"] == "FY"].sort_values("DiscDate")
+    for _, row in fy_rows.iloc[::-1].iterrows():
+        for column in ("FEPS", "FNCEPS", "NxFEPS", "NxFNCEPS"):
+            if column not in row.index:
+                continue
+            value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            if pd.notna(value):
+                return float(value), row["DiscDate"]
+    return None, None
 
 
 def _dividend_forecast_or_trailing_with_date(df: pd.DataFrame) -> tuple[float | None, pd.Timestamp | None]:
@@ -366,7 +403,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         fins["DiscDate"] = pd.to_datetime(fins["DiscDate"], errors="coerce")
         fins = fins.dropna(subset=["DiscDate"]).sort_values("DiscDate")
         if not fins.empty:
-            feps, feps_date = _last_valid_full_year_value_with_date(fins, "FEPS")
+            feps, feps_date = _last_valid_full_year_forecast_eps_with_date(fins)
             bps, bps_date = _last_valid_value_with_date(fins, "BPS")
             shares_out = _last_valid_value(fins, "ShOutFY")
             treasury_shares = _last_valid_value(fins, "TrShFY")
@@ -388,14 +425,26 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
                 annualized_eps = annualized_eps * _split_adjustment_since(price_history, annualized_eps_date)
 
     market_cap = per = pbr = dividend_yield = None
-    per_eps_date = None
+    calculated_per = source_per = per_difference_rate = None
     if latest_close is not None and pd.notna(latest_close):
+        # PERは会社予想EPS(feps)だけを使う。過去実績EPSと最新株価を組み合わせて
+        # PERを計算しない（会社予想が未開示・0以下ならPERはNoneのまま = 画面では
+        # 「―」表示）。annualized_eps（実績EPSの年率換算）は表示には使わず、
+        # calculated_perとの乖離チェック用の参考値(source_per)としてのみ使う。
         if feps and pd.notna(feps) and feps > 0:
-            per_eps, per_eps_date = feps, feps_date
-        else:
-            per_eps, per_eps_date = annualized_eps, annualized_eps_date
-        if per_eps and pd.notna(per_eps) and per_eps > 0:
-            per = latest_close / per_eps
+            calculated_per = latest_close / feps
+        per = calculated_per
+        if annualized_eps and pd.notna(annualized_eps) and annualized_eps > 0:
+            source_per = latest_close / annualized_eps
+        if calculated_per is not None and source_per is not None and source_per != 0:
+            per_difference_rate = abs(calculated_per - source_per) / source_per
+            if per_difference_rate >= _PER_SANITY_DIVERGENCE_THRESHOLD:
+                logger.warning(
+                    "PERが予想EPS基準と実績EPS基準で%.0f%%乖離: 予想EPS基準PER=%.1f"
+                    "（feps=%s, %s） 実績EPS基準PER=%.1f（annualized_eps=%s, %s）",
+                    per_difference_rate * 100, calculated_per, feps, feps_date,
+                    source_per, annualized_eps, annualized_eps_date,
+                )
         if bps is not None and pd.notna(bps) and bps > 0:
             pbr = latest_close / bps
         if shares_out is not None and pd.notna(shares_out):
@@ -421,9 +470,19 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         # 離れているかを見れば、値がどの時点のデータの組み合わせかを追える。
         "metrics_as_of": {
             "latest_price_date": latest_price_date,
-            "per_eps_date": per_eps_date,
+            "per_eps_date": feps_date,
             "bps_date": bps_date,
             "dividend_source_date": div_ann_date,
+        },
+        # PERの検算用デバッグ情報（画面には出さない）。calculated_perが実際に
+        # 表示されるperと同じ値。source_perは実績EPS基準の参考値で、perには
+        # 使わない。per_difference_rateが大きい場合はログにも警告が出る。
+        "per_debug": {
+            "forecast_eps": feps,
+            "forecast_eps_date": feps_date,
+            "calculated_per": calculated_per,
+            "source_per": source_per,
+            "per_difference_rate": per_difference_rate,
         },
     }
 

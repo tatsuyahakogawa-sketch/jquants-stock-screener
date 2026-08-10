@@ -341,7 +341,7 @@ if "summary" in st.session_state:
             "MatchedConditions": "合致した条件",
             "StopHighDate": "ストップ高日付",
             "MarketCapOku": "時価総額(億円)",
-            "PER": "PER(予想/実績年率換算)",
+            "PER": "PER(予想)",
             "PBR": "PBR",
             "DividendYield": "配当利回り",
             "ListingDateDisplay": "推定上場日（近似）",
@@ -351,8 +351,8 @@ if "summary" in st.session_state:
         display_cols = [c for c in display_cols if c in view.columns]
         display = view[display_cols].rename(columns=rename_map).sort_values("合致数", ascending=False)
 
-        if "PER(予想/実績年率換算)" in display.columns:
-            display["PER(予想/実績年率換算)"] = display["PER(予想/実績年率換算)"].round(1)
+        if "PER(予想)" in display.columns:
+            display["PER(予想)"] = display["PER(予想)"].round(1)
         if "PBR" in display.columns:
             display["PBR"] = display["PBR"].round(1)
         if "配当利回り" in display.columns:
