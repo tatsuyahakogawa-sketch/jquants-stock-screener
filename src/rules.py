@@ -58,6 +58,19 @@ STORE_KEYWORDS = ["新店舗", "新規出店", "店舗新設", "新規開設"]
 # これらの語を含むタイトルは逆方向（ネガティブ）の話として除外する。
 FACILITY_STORE_EXCLUSION_KEYWORDS = ["閉鎖", "中止", "撤退", "廃止", "休止", "縮小"]
 STOCK_SPLIT_KEYWORDS = ["株式分割", "株式併合"]
+# 「株式分割に伴う配当予想の修正」のように、分割・併合の決定そのものではなく
+# その後始末（配当予想修正・株主優待変更・新株予約権調整等）だけを知らせる
+# 開示は新規発表として扱わない。タイトル中のSTOCK_SPLIT_KEYWORDSが、常に
+# これらの接続表現に支配された形でしか出現しない場合、新規発表ではないと判断する
+# （逆に「株式分割及び定款の一部変更に関するお知らせ」のように独立して出現する
+# 場合は、後ろに定款変更等が続いていても新規発表の一部として扱う）。
+STOCK_SPLIT_FOLLOWUP_CONNECTORS = ["に伴う", "に伴い", "を受けた", "を受けて", "後の", "後に"]
+# 接続表現が無くても、これらの語だけを主題にした開示は分割・併合の後日談・
+# 事務的な知らせであることが多いため、独立した出現が無い場合の除外判定に使う。
+STOCK_SPLIT_FOLLOWUP_TOPIC_KEYWORDS = [
+    "配当予想の修正", "配当予想修正", "株主優待", "新株予約権",
+    "発行済株式数", "実施日", "基準日", "効力発生", "自己株式",
+]
 LARGE_ORDER_KEYWORDS = ["大型受注", "大口受注", "大型案件受注"]
 # 「開示基準変更」は受注そのものの発表ではなく開示ルールの変更のお知らせのため除外する。
 LARGE_ORDER_EXCLUSION_KEYWORDS = ["開示基準", "取消", "中止", "解除"]
@@ -81,15 +94,49 @@ def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
     return hit.drop(columns=[QUOTES_CLOSE]).rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date"})
 
 
+def _classify_stock_split_title(title: str) -> tuple[bool, str]:
+    """タイトルが株式分割・併合の「新規決定・発表」を主題にしているか判定する。
+
+    「株式分割及び定款の一部変更に関するお知らせ」のように、STOCK_SPLIT_KEYWORDS
+    がSTOCK_SPLIT_FOLLOWUP_CONNECTORSに支配されず独立して出現する場合は、新規
+    発表（後ろに定款変更・配当予想修正等が続いていてもまとめて発表された扱い）
+    と判断する。「株式分割に伴う配当予想の修正に関するお知らせ」のように、常に
+    接続表現の直後にしか出現しない場合は後日談の開示とみなし、除外する。
+    戻り値: (新規発表とみなすか, 判定理由)
+    """
+    matched_keyword = next((k for k in STOCK_SPLIT_KEYWORDS if k in title), None)
+    if matched_keyword is None:
+        return False, ""
+
+    for keyword in STOCK_SPLIT_KEYWORDS:
+        pos = 0
+        while (idx := title.find(keyword, pos)) != -1:
+            after = title[idx + len(keyword):]
+            if not any(after.startswith(c) for c in STOCK_SPLIT_FOLLOWUP_CONNECTORS):
+                return True, f"「{keyword}」が新規決定の主題として単独で出現"
+            pos = idx + len(keyword)
+
+    followup_topic = next((t for t in STOCK_SPLIT_FOLLOWUP_TOPIC_KEYWORDS if t in title), None)
+    if followup_topic is not None:
+        return False, f"「{matched_keyword}に伴う」等の形でのみ出現し、「{followup_topic}」のみを主題とする後日談の開示と判断"
+    return False, f"「{matched_keyword}に伴う」等の形でのみ出現しており新規決定の発表ではないと判断"
+
+
 def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
-    """TDnet開示タイトルから株式分割・併合の「発表」を検出する。
+    """TDnet開示タイトルから株式分割・併合の「新規の決定・発表」を検出する。
 
     AdjFactor(株価調整係数)の変化を見る方法は、分割が実際に効力を持つ日（株価
     調整に反映される日）しか検知できず、発表からかなり遅れる（発表時点では
     株価がまだ反応していないため、好材料として先取りするには使えない）。
     株式分割は発表時点で好材料として反応することが多いため、価格が変動する前に
-    検知できるよう、TDnetの開示タイトルから発表日ベースで検出する（タイトルの
-    キーワード一致のため、内容は必ずリンク先で確認する）。
+    検知できるよう、TDnetの開示タイトルから発表日ベースで検出する。
+
+    タイトルに「株式分割」「株式併合」を含むだけでは判定しない。配当予想の修正・
+    株主優待制度の変更・新株予約権の調整・発行済株式数の変更等、分割・併合の
+    決定そのものではなく後日談・事務的な知らせだけの開示（例:「株式分割に伴う
+    配当予想の修正に関するお知らせ」）は誤検出として除外する
+    （_classify_stock_split_title参照。誤検出の可能性が完全に無くなる保証は
+    ないため、内容は必ずリンク先で確認する）。
     """
     required = {"company_code", "title", "pubdate"}
     if disclosures_df.empty or not required.issubset(disclosures_df.columns):
@@ -97,15 +144,23 @@ def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
 
     df = disclosures_df.copy()
     titles = df["title"].fillna("")
-    mask = titles.apply(lambda t: any(k in t for k in STOCK_SPLIT_KEYWORDS))
-    hit = df.loc[mask, ["company_code", "pubdate", "title"]].copy()
+    classified = titles.apply(_classify_stock_split_title)
+    is_new = classified.apply(lambda c: c[0])
+    hit = df.loc[is_new, ["company_code", "pubdate", "title"]].copy()
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
     hit["rule"] = "stock_split"
     hit["detail"] = "開示タイトル: " + hit["title"]
     hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
-    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
+    hit["event_type"] = "stock_split"
+    hit["event_date"] = hit["Date"]
+    hit["source_title"] = hit["title"]
+    hit["source_url"] = df.loc[is_new, "document_url"] if "document_url" in df.columns else None
+    hit["match_reason"] = classified.loc[is_new].apply(lambda c: c[1])
+    return hit[
+        ["company_code", "Date", "rule", "detail", "event_type", "event_date", "source_title", "source_url", "match_reason"]
+    ].rename(columns={"company_code": "Code"})
 
 
 def detect_large_order(disclosures_df: pd.DataFrame) -> pd.DataFrame:
