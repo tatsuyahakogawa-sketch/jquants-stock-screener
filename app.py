@@ -47,7 +47,7 @@ load_dotenv()
 # ため、ここでst.secretsの値をos.environに橋渡しする（ローカル実行で
 # secrets.tomlが無い場合はStreamlitSecretNotFoundErrorになるので何もしない）。
 try:
-    for _key in ("JQUANTS_API_KEY", "EDINET_API_KEY"):
+    for _key in ("JQUANTS_API_KEY", "EDINET_API_KEY", "SUPABASE_URL", "SUPABASE_KEY"):
         if _key in st.secrets:
             os.environ[_key] = st.secrets[_key]
 except Exception:

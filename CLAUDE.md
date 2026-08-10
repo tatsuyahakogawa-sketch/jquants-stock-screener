@@ -90,6 +90,7 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `app.py`: Streamlit UI（絞り込み条件選択 → スクリーニング実行 → 銘柄集計テーブル/CSV）
 - `src/jquants_client.py`: J-Quants認証・レート制限（429時は65秒待って自動リトライ）・ページネーション
 - `src/endpoints.py`: 日付単位バルク取得 + ローカルキャッシュ（`data/cache/`, parquet）
+- `src/cache.py`: 上記ローカルキャッシュの実体。`SUPABASE_URL`/`SUPABASE_KEY`設定時はSupabase（PostgREST）にも保存し、Streamlit Cloudの再デプロイでローカルキャッシュが消えても再利用できるようにする（任意設定、未設定でも動作、README参照）
 - `src/tdnet_client.py`: TDnet開示情報の非公式ミラーAPIクライアント（新工場・新店舗、東証移籍検出、実行表の「最近のトピック」欄用）
 - `src/edinet_client.py`: EDINET(金融庁)から有価証券報告書の事業概要・大株主・潜在株式・事業等のリスク・経営方針をテキストブロック単位で取得（`EDINET_API_KEY`必須、README参照）。要約はせず開示テキストをそのまま使う
 - `src/rules.py`: 各条件の判定ロジック（J-Quants数値データ、市場区分履歴、TDnetタイトル検出）
@@ -125,7 +126,8 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 
 利用者向けのアプリ自体はStreamlit Community Cloudにデプロイ済み
 （GitHubのmainブランチにプッシュすると自動再デプロイされる）。アプリ設定の
-「Secrets」に`app_password`・`JQUANTS_API_KEY`・`EDINET_API_KEY`を設定し、
+「Secrets」に`app_password`・`JQUANTS_API_KEY`・`EDINET_API_KEY`
+（・任意で`SUPABASE_URL`・`SUPABASE_KEY`、README参照）を設定し、
 「Sharing」を「このアプリは公開されており、検索可能です」にしておくことで、
 URLとアプリ内のパスワードさえ分かればどのPC・ブラウザからでも同じ最新版に
 アクセスできる（Streamlit Cloud自体の非公開設定と、アプリ内のパスワード認証は

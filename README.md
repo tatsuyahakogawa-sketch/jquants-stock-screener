@@ -109,6 +109,8 @@ python scripts/inspect_schema.py
 
 初回実行時は対象期間の日数分だけAPI呼び出しが発生するため、レート制限により時間がかかる（例: 30日分なら日次データ取得だけで数分程度、さらに合致銘柄ごとの追加取得が加わる）。一度取得したデータは `data/cache/` にキャッシュされ、以降の再実行（同日中）では再取得しない。
 
+売上高の大幅/爆発的増加・四半期決算2期連続増収増益・経常利益4年倍増の4条件（画面上は紫色のボタン、`pipeline.YOY_LOOKBACK_RULES`）は前年同期比較のため決算データを数年分遡って取得する必要があり、特に時間がかかる。これらを選択しない場合は選択期間分のみの取得になり高速。
+
 ## 個別銘柄のExcel出力（企業詳細・実行表）
 
 画面下部の「個別銘柄のExcel出力」から、銘柄コードを入力して以下2種類のExcelを自動生成できる（`src/excel_export.py`）。ETF・REIT・ETN等（`equities/master`の`ProdCat`が`011`＝内国株式の普通株式以外）は事業概要・決算等の対象外のため、生成前に警告を表示してブロックする。
@@ -128,6 +130,33 @@ https://api.edinet-fsa.go.jp/api/auth/index.aspx?mode=1 ）を発行し、`.env`
 - EDINETの書類一覧APIは日付単位でしか検索できないため、決算期末から提出期限（通常3ヶ月以内）付近の期間を走査して該当書類を探す。古い書類を含めた全期間走査はしていない
 
 いずれも生成後、ボタンからExcelファイルとしてダウンロードする。
+
+### Supabase連携（キャッシュ永続化、任意設定）
+
+`data/cache/` のキャッシュはStreamlit Community Cloud上ではデプロイ毎にコンテナが
+作り直されて消えてしまい、次回アクセス時にまた最初から取得し直しになる。
+SUPABASE_URL・SUPABASE_KEYを設定すると、同じキャッシュデータをSupabase
+（無料枠のPostgres、REST API経由）にも保存し、ローカルキャッシュが無いときは
+そちらから読み直す（`src/cache.py`）。未設定でもアプリは動作する（ローカル
+キャッシュのみになり、デプロイ毎にまた取得し直しになるだけ）。
+
+設定手順:
+1. https://supabase.com で無料アカウント・プロジェクトを作成
+2. SQL Editorで以下を実行してテーブルを作成する
+   ```sql
+   create table jquants_cache (
+       endpoint text not null,
+       cache_key text not null,
+       data text not null,
+       updated_at timestamptz not null default now(),
+       primary key (endpoint, cache_key)
+   );
+   ```
+3. プロジェクトの「Settings > API」からProject URL・API Key（`service_role`推奨。
+   RLSを有効にした場合は`anon`キーだと書き込みがブロックされる点に注意）を取得
+4. ローカルは`.env`に、Streamlit Cloudは「Settings > Secrets」に
+   `SUPABASE_URL`・`SUPABASE_KEY`を設定する（`.env.example`/
+   `.streamlit/secrets.toml.example`参照）
 
 ### 会社公式サイトからの追記（Claude Codeとの対話で行う運用）
 
