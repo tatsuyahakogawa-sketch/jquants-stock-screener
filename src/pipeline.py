@@ -359,6 +359,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
             latest_price_date = price_history["Date"].iloc[-1]
 
     feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
+    feps_date = bps_date = div_ann_date = annualized_eps_date = None
     roe = operating_margin = None
     if not fins.empty and "DiscDate" in fins.columns:
         fins = fins.copy()
@@ -387,8 +388,12 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
                 annualized_eps = annualized_eps * _split_adjustment_since(price_history, annualized_eps_date)
 
     market_cap = per = pbr = dividend_yield = None
+    per_eps_date = None
     if latest_close is not None and pd.notna(latest_close):
-        per_eps = feps if feps and pd.notna(feps) and feps > 0 else annualized_eps
+        if feps and pd.notna(feps) and feps > 0:
+            per_eps, per_eps_date = feps, feps_date
+        else:
+            per_eps, per_eps_date = annualized_eps, annualized_eps_date
         if per_eps and pd.notna(per_eps) and per_eps > 0:
             per = latest_close / per_eps
         if bps is not None and pd.notna(bps) and bps > 0:
@@ -410,6 +415,16 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         "shares_out": shares_out,
         "roe": roe,
         "operating_margin": operating_margin,
+        # 画面には出さないデバッグ用の基準日。per/pbr/dividend_yieldはいずれも
+        # latest_close（=latest_price_date時点の終値）を分母/分子に使うため、
+        # 分子側（EPS・BPS・配当）の開示日がlatest_price_dateとどれだけ
+        # 離れているかを見れば、値がどの時点のデータの組み合わせかを追える。
+        "metrics_as_of": {
+            "latest_price_date": latest_price_date,
+            "per_eps_date": per_eps_date,
+            "bps_date": bps_date,
+            "dividend_source_date": div_ann_date,
+        },
     }
 
 
