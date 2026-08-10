@@ -57,13 +57,29 @@ NEGATIVE_RULES = ["downward_revision"]
 ATTRIBUTE_RULES = ["pbr_low", "equity_ratio_high"]
 EVENT_RULES = [r for r in POSITIVE_RULES if r not in ATTRIBUTE_RULES]
 
+# 前年同期（〜PROFIT_DOUBLING_YEARS年前）との比較が必要なため、決算データを
+# 数年分遡って取得しないと判定できないルール。選択されていない場合は取得期間を
+# start〜endだけに絞って高速化する（run_screeningのselected_rules引数を参照）。
+YOY_LOOKBACK_RULES = [
+    "sales_growth_major",
+    "sales_growth_explosive",
+    "two_quarter_growth",
+    "profit_doubling",
+]
+
 
 def run_screening(
     client: JQuantsClient,
     start: dt.date,
     end: dt.date,
+    selected_rules: list[str] | None = None,
 ) -> pd.DataFrame:
     """start〜end の期間で全ルールを適用し、イベント単位の結果をまとめて返す。
+
+    selected_rules: 画面上で選択中のルール名一覧。Noneの場合は従来通り常に
+    数年分の決算データを遡って取得する（後方互換のデフォルト）。指定された
+    場合、YOY_LOOKBACK_RULESが1つも含まれていなければ決算データの取得期間を
+    start〜endに限定し、遡り取得を省略して高速化する。
 
     戻り値の列: Code, CompanyName, Rule, RuleLabel, Date, Detail
     """
@@ -94,8 +110,14 @@ def run_screening(
     # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
     # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
     # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
-    comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
-    statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
+    # start〜endのみに絞って取得を高速化する。
+    needs_lookback = selected_rules is None or any(r in YOY_LOOKBACK_RULES for r in selected_rules)
+    if needs_lookback:
+        comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    else:
+        statements_fetch_start = start
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [

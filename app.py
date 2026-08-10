@@ -24,6 +24,7 @@ from src.pipeline import (
     EVENT_RULES,
     ATTRIBUTE_RULES,
     TDNET_TITLE_BASED_RULES,
+    YOY_LOOKBACK_RULES,
     run_screening,
     build_summary,
     enrich_with_market_data,
@@ -116,6 +117,15 @@ st.markdown(
         text-overflow: unset !important;
         max-width: none !important;
     }
+    /* 前年同期比較が必要で検索が遅くなる項目のpillsだけ、選択時に紫色にする
+       （st.container(key="slow_performance_pills")でこのCSSの適用範囲を
+       スコープしている。data-variant="pills"・aria-pressedはst.pillsが
+       付与する属性で、実機のDOMで確認済みの安定したフック）。 */
+    .st-key-slow_performance_pills [data-variant="pills"][aria-pressed="true"] {
+        background-color: rgba(147, 51, 234, 0.2) !important;
+        color: rgb(147, 51, 234) !important;
+        border-color: rgb(147, 51, 234) !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -175,18 +185,33 @@ with st.container(border=True):
     )
     st.caption(f"{len(material_events)}件選択中")
 
+_FAST_PERFORMANCE_RULES = [r for r in _PERFORMANCE_EVENT_RULES if r not in YOY_LOOKBACK_RULES]
+_SLOW_PERFORMANCE_RULES = [r for r in _PERFORMANCE_EVENT_RULES if r in YOY_LOOKBACK_RULES]
+
 with st.container(border=True):
     st.markdown("### 📈 業績")
-    performance_events = st.pills(
+    fast_performance_events = st.pills(
         "対象にする業績条件",
-        options=_PERFORMANCE_EVENT_RULES,
+        options=_FAST_PERFORMANCE_RULES,
         format_func=lambda k: RULE_LABELS[k],
         selection_mode="multi",
         default=[],
-        key="performance_events_pills",
+        key="fast_performance_events_pills",
         label_visibility="collapsed",
     )
+    with st.container(key="slow_performance_pills"):
+        slow_performance_events = st.pills(
+            "対象にする業績条件（前年同期比較のため時間がかかるもの）",
+            options=_SLOW_PERFORMANCE_RULES,
+            format_func=lambda k: RULE_LABELS[k],
+            selection_mode="multi",
+            default=[],
+            key="slow_performance_events_pills",
+            label_visibility="collapsed",
+        )
+    st.caption("🟣紫色のボタンは決算データを数年分遡って取得するため、検索に時間がかかります。")
     st.caption("黒字転換（今後追加予定）")
+    performance_events = list(fast_performance_events) + list(slow_performance_events)
     st.caption(f"{len(performance_events)}件選択中")
 
 # st.pillsは複数ウィジェットを同じ変数名にできないため、2カードの選択結果をここで結合する
@@ -213,7 +238,10 @@ if st.button("スクリーニング実行", type="primary"):
         with st.spinner("J-Quants からデータを取得し、条件判定しています…"):
             try:
                 client = JQuantsClient()
-                hits = run_screening(client, start_date, end_date)
+                hits = run_screening(
+                    client, start_date, end_date,
+                    selected_rules=selected_events + selected_attributes,
+                )
                 summary = build_summary(hits)
                 if not summary.empty:
                     with st.spinner(f"合致した{len(summary)}銘柄の時価総額・PER・PBR・配当利回りを取得しています…"):
