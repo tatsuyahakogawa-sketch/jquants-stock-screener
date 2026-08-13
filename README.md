@@ -54,6 +54,13 @@ streamlit run app.py
 
 `src/`以下のコードを更新した場合、Streamlitのホットリロードはapp.py本体は再実行するがサブモジュール（`pipeline.py`, `excel_export.py`等）の変更を反映しないことがあるため、コード修正後はプロセスを完全に再起動（Ctrl+Cで停止して`streamlit run app.py`を再実行）すること。
 
+### テストの実行
+
+```bash
+pip install pytest
+pytest
+```
+
 ### 複数PCでの利用・クラウドデプロイ
 
 複数のPCで作業する場合、各PCでローカルにStreamlitを起動する方式は「pull忘れ」「プロセス再起動忘れ」「PCごとのキャッシュのズレ」で結果が食い違いやすい。代わりにStreamlit Community Cloud（無料）にデプロイし、GitHubリポジトリに接続しておけば、どのPCからプッシュしてもクラウド側が自動的に再デプロイされ、常に同じ1つのアプリを見ることになる。
