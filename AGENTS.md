@@ -115,7 +115,7 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 **Codexレビューの自動化（2026-08-13に構成）**: ユーザーがChatGPT側でGitHub連携を設定済み（`tatsuyahakogawa-sketch/jquants-stock-screener`へのアクセスを許可、PR作成時にCodexが自動レビューする設定）。これにより、Claude Codeは以下を自分で完結できる:
 
 1. まとまった変更（新機能・ロジック変更等）は`develop`からfeatureブランチを切って実装・テストする
-2. `gh pr create`でPRを作成する（GitHub CLIはこの環境で認証済み）
+2. `gh pr create --base develop`でdevelop向けにPRを作成する（`--base`を省略するとリポジトリの既定ブランチ=`main`向けのPRになってしまうため必須。GitHub CLIはこの環境で認証済み）
 3. Codexの自動レビューを待つ（有効化されていない場合はPRに`@codex review`とコメントして起動する）
 4. `gh api repos/tatsuyahakogawa-sketch/jquants-stock-screener/pulls/<PR番号>/comments`や`gh pr view <PR番号> --comments`でレビュー内容を取得する（ユーザーがコピペで貼り直す必要はない）
 5. 各指摘を上記「Codexの指摘は無条件採用しない」の基準で判断し、必要な修正のみ実装してpush
@@ -142,8 +142,8 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 代わりにGitHub（private repo: `tatsuyahakogawa-sketch/jquants-stock-screener`）
 を経由する。各PCでの作業ルール:
 
-- 作業を始める前に必ず `git pull origin main`
-- 作業が終わったら `git add` → `git commit` → `git push origin main`
+- `main`で直接作業する場合は、始める前に必ず `git pull origin main`、終わったら `git add` → `git commit` → `git push origin main`
+- `develop`やfeatureブランチで作業する場合、上記の`main`固定コマンドはそのブランチの変更を同期しない（`git pull origin main`は現在のブランチにmainの更新を取り込むだけ、`git push origin main`はローカルのmainブランチを送るだけで、今の作業ブランチはpushされない）。今のブランチ名を明示して `git pull origin <ブランチ名>` / `git push -u origin <ブランチ名>` を使うこと
 - `src/`以下のコードを変更した後、ローカルでStreamlitを動かして確認する場合は
   プロセスを完全に再起動すること（`streamlit run app.py`のホットリロードは
   app.py本体は再実行するが、`pipeline.py`や`excel_export.py`等のサブモジュールの
