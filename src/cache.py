@@ -109,10 +109,15 @@ def _supabase_load(endpoint: str, date: str) -> pd.DataFrame | None:
         return None
 
 
-def _supabase_save(endpoint: str, date: str, storable: pd.DataFrame) -> None:
+def _supabase_save(endpoint: str, date: str, storable: pd.DataFrame) -> bool:
+    """Supabaseへの保存を試みる。Supabase未設定の場合は「ローカル保存のみで
+    十分」という既存の意図的な仕様なのでTrueを返す。設定済みなのに保存に
+    失敗した場合だけFalseを返す（呼び出し側がウォーターマーク等の「保存済み」
+    扱いの前提にできるように、成功/失敗を区別できるようにする）。
+    """
     config = _supabase_config()
     if config is None:
-        return
+        return True
     url, key = config
     try:
         headers = _supabase_headers(key)
@@ -124,8 +129,10 @@ def _supabase_save(endpoint: str, date: str, storable: pd.DataFrame) -> None:
             timeout=_SUPABASE_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
+        return True
     except Exception as exc:  # noqa: BLE001 -- Supabase障害時はローカルキャッシュのみで継続する意図的なフォールバック
         logger.warning("[%s/%s] Supabaseへのキャッシュ保存に失敗しました: %s", endpoint, date, exc)
+        return False
 
 
 def load(endpoint: str, date: str) -> pd.DataFrame | None:
@@ -139,7 +146,12 @@ def load(endpoint: str, date: str) -> pd.DataFrame | None:
     return remote
 
 
-def save(endpoint: str, date: str, df: pd.DataFrame) -> None:
+def save(endpoint: str, date: str, df: pd.DataFrame) -> bool:
+    """保存する。戻り値は「Supabaseが設定されている場合、そちらへの保存も
+    成功したか」（ローカル保存は基本的に失敗しないため含めない）。
+    Supabase未設定の場合は常にTrue。呼び出し側で「確実に永続化された」
+    ことを前提にした処理（ウォーターマークの更新等）をする場合に使う。
+    """
     storable = _to_storable(df)
     _local_save(_cache_path(endpoint, date), storable)
-    _supabase_save(endpoint, date, storable)
+    return _supabase_save(endpoint, date, storable)

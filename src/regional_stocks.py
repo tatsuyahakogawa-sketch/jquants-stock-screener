@@ -58,6 +58,7 @@ MAJOR_EVENT_KEYWORDS = [
 ]
 
 _LISTING_KEYWORD = "上場"
+_DELISTING_KEYWORD = "上場廃止"
 _APPLICATION_KEYWORDS = ["申請"]
 _APPROVAL_KEYWORDS = ["承認"]
 _TOKYO_KEYWORDS = ["東京証券取引所", "東証"]
@@ -71,7 +72,7 @@ _MAJOR_EVENTS_COLUMNS = [
     "id", "Code", "CompanyName", "Date", "MarketsString", "Title", "Url", "MatchedKeyword",
 ]
 _COMPANY_STATUS_COLUMNS = [
-    "Code", "CompanyName", "MarketsString", "LastSeenDate", "MarketCap", "MarketCapNote",
+    "Code", "CompanyName", "MarketsString", "LastSeenDate", "CurrentPrice", "CurrentPriceNote",
 ]
 
 _REQUIRED_DISCLOSURE_COLUMNS = {
@@ -79,16 +80,21 @@ _REQUIRED_DISCLOSURE_COLUMNS = {
 }
 
 
-def is_regional_only(markets_string: str | None) -> bool:
-    """開示時点でのmarkets_stringが「東証を含まない」=地方単独上場かどうか。"""
-    if not markets_string:
+def is_regional_only(markets_string) -> bool:
+    """開示時点でのmarkets_stringが「東証を含まない」=地方単独上場かどうか。
+
+    markets_string列が欠損している開示ではpandasがNaN(float)を入れてくる
+    ことがあり、`bool(NaN)`はTrueのため`not markets_string`では弾けず、
+    後続の`in`演算がTypeErrorになる。isinstance(str)を明示的に確認する。
+    """
+    if not isinstance(markets_string, str) or not markets_string:
         return False
     return TOKYO_MARKET_CHAR not in markets_string
 
 
-def regional_markets_in(markets_string: str | None) -> list[str]:
+def regional_markets_in(markets_string) -> list[str]:
     """markets_stringに含まれる地方取引所名（表示用）を出現順に返す。"""
-    if not markets_string:
+    if not isinstance(markets_string, str) or not markets_string:
         return []
     return [label for char, label in REGIONAL_MARKET_LABELS.items() if char in markets_string]
 
@@ -107,7 +113,12 @@ def _legacy_ticker(code: str) -> str:
 def _classify_listing_stage(title: str) -> str | None:
     """上場関連の開示タイトルから段階（申請/承認/上場）を判定する。
     上場に無関係なタイトルはNoneを返す。
+
+    「上場廃止申請」のように"上場"と"申請"を含むが実際は上場廃止（＝新規上場
+    の逆方向）の開示は、誤って新規上場の「申請」段階と判定しないよう先に除外する。
     """
+    if _DELISTING_KEYWORD in title:
+        return None
     if _LISTING_KEYWORD not in title:
         return None
     if any(k in title for k in _APPLICATION_KEYWORDS):
@@ -126,13 +137,32 @@ def _filter_regional_only(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[df["markets_string"].apply(is_regional_only)]
 
 
-def detect_regional_listing_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+def detect_regional_listing_events(
+    disclosures_df: pd.DataFrame, known_regional_codes: set[str] | None = None
+) -> pd.DataFrame:
     """地方単独上場企業の新規上場・重複上場・市場変更関連の開示を検出する。
 
     東京証券取引所への上場申請・承認・上場に関するものはIsTokyoRelated=True
     として区別する（②の「最重要イベント」向け）。
+
+    東証への上場が実際に完了した開示は、その時点でmarkets_stringにもう
+    「東」が含まれてしまう（=その開示自体は地方単独上場ではない）ため、
+    markets_stringだけで絞り込むと肝心の「上場完了」の開示を取り逃す。
+    known_regional_codesに（直前まで）地方単独上場だったと分かっている
+    銘柄コードを渡すことで、そのようなmarkets_string変化後の開示も対象にする。
     """
-    regional = _filter_regional_only(disclosures_df)
+    known_regional_codes = known_regional_codes or set()
+    if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=_LISTING_EVENTS_COLUMNS)
+
+    df = disclosures_df.copy()
+    is_currently_regional = df["markets_string"].apply(is_regional_only)
+    titles_for_scope = df["title"].fillna("")
+    is_tokyo_titled = titles_for_scope.apply(lambda t: any(k in t for k in _TOKYO_KEYWORDS))
+    was_known_regional = df["company_code"].astype(str).isin(known_regional_codes)
+    in_scope = is_currently_regional | (is_tokyo_titled & was_known_regional)
+
+    regional = df.loc[in_scope]
     if regional.empty:
         return pd.DataFrame(columns=_LISTING_EVENTS_COLUMNS)
 
@@ -185,9 +215,24 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
-def _latest_company_status(disclosures_df: pd.DataFrame) -> pd.DataFrame:
-    """地方単独上場の開示から、銘柄ごとの最新のmarkets_string・会社名・最終確認日を集計する。"""
-    regional = _filter_regional_only(disclosures_df)
+def _latest_company_status(
+    disclosures_df: pd.DataFrame, known_regional_codes: set[str] | None = None
+) -> pd.DataFrame:
+    """銘柄ごとの最新のmarkets_string・会社名・最終確認日を集計する。
+
+    地方単独上場の開示に加え、known_regional_codes（直前まで地方単独上場
+    だった銘柄）が東証を含む市場に移った開示も対象にする。そうしないと、
+    東証移籍後もmarkets_stringが移籍前のまま更新されず、既に地方単独上場
+    ではなくなった銘柄が地方株一覧に残り続けてしまう。
+    """
+    known_regional_codes = known_regional_codes or set()
+    if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+
+    df = disclosures_df.copy()
+    is_currently_regional = df["markets_string"].apply(is_regional_only)
+    was_known_regional = df["company_code"].astype(str).isin(known_regional_codes)
+    regional = df.loc[is_currently_regional | was_known_regional]
     if regional.empty:
         return pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
 
@@ -203,12 +248,13 @@ def _latest_company_status(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     })[["Code", "CompanyName", "MarketsString", "LastSeenDate"]].reset_index(drop=True)
 
 
-def fetch_regional_market_cap(code: str, markets_string: str) -> tuple[float | None, str]:
-    """地方単独上場企業の時価総額(近似: 現在値のみ、株数は別途J-Quants等が必要)を試みる。
+def fetch_regional_share_price(code: str, markets_string: str) -> tuple[float | None, str]:
+    """地方単独上場企業の現在の株価を試みる（時価総額ではない）。
 
-    株数(発行済株式数)を取得できる手段が無いため、実際には「現在値が取得できるか」
-    までしか分からない。ここでは現在値をそのままMarketCapの代用値として返す
-    （呼び出し側で「時価総額(現在値のみ)」であることを明示する前提）。
+    発行済株式数を取得できる手段が無いため、時価総額(株価×株式数)は計算
+    できない。株価だけを時価総額として見せると誤った金額として読まれる
+    リスクがあるため、この関数は明確に「株価」だけを返す
+    （呼び出し側でも時価総額としては表示しないこと）。
     取得できない場合はNoneと理由文字列を返す（誤った推測値を出さない）。
     """
     suffix = next((s for char, s in _YFINANCE_SUFFIX_BY_MARKET.items() if char in (markets_string or "")), None)
@@ -241,8 +287,15 @@ def _save_watermark(date: dt.date) -> None:
 
 
 def _load_table(key: str, columns: list[str]) -> pd.DataFrame:
+    """保存済みテーブルを読む。0件で保存された場合、cache.load()は列情報の
+    無い空のDataFrameを返す（cache.pyが空フレームを列無しのマーカー形式で
+    保存する仕様のため）。列名を前提にした後続処理がKeyErrorにならないよう、
+    その場合も含めてcolumnsを再構成する。
+    """
     df = cache.load(_STORE_ENDPOINT, key)
-    return df if df is not None else pd.DataFrame(columns=columns)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+    return df
 
 
 def load_regional_store() -> dict[str, pd.DataFrame]:
@@ -271,11 +324,13 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     if start > today:
         return stores
 
+    known_regional_codes = set(stores["company_status"]["Code"])
+
     new_disclosures = tdnet_client.get_disclosures_range(start, today)
 
-    new_listing = detect_regional_listing_events(new_disclosures)
+    new_listing = detect_regional_listing_events(new_disclosures, known_regional_codes)
     new_major = detect_regional_major_events(new_disclosures)
-    new_status = _latest_company_status(new_disclosures)
+    new_status = _latest_company_status(new_disclosures, known_regional_codes)
 
     listing_events = (
         pd.concat([stores["listing_events"], new_listing], ignore_index=True)
@@ -296,20 +351,27 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         .reset_index(drop=True)
     )
 
-    # 現在も地方単独上場のままの銘柄だけ、時価総額(現在値)を更新する
+    # 現在も地方単独上場のままの銘柄だけ、株価(現在値)を更新する
     # （東証を含む市場に移った銘柄は対象外。既存値のまま保持する）。
     still_regional = company_status["MarketsString"].apply(is_regional_only)
     for idx in company_status.loc[still_regional].index:
         code = company_status.at[idx, "Code"]
         markets_string = company_status.at[idx, "MarketsString"]
-        price, note = fetch_regional_market_cap(code, markets_string)
-        company_status.at[idx, "MarketCap"] = price
-        company_status.at[idx, "MarketCapNote"] = note
+        price, note = fetch_regional_share_price(code, markets_string)
+        company_status.at[idx, "CurrentPrice"] = price
+        company_status.at[idx, "CurrentPriceNote"] = note
 
-    cache.save(_STORE_ENDPOINT, _LISTING_EVENTS_KEY, listing_events)
-    cache.save(_STORE_ENDPOINT, _MAJOR_EVENTS_KEY, major_events)
-    cache.save(_STORE_ENDPOINT, _COMPANY_STATUS_KEY, company_status)
-    _save_watermark(today)
+    saved = [
+        cache.save(_STORE_ENDPOINT, _LISTING_EVENTS_KEY, listing_events),
+        cache.save(_STORE_ENDPOINT, _MAJOR_EVENTS_KEY, major_events),
+        cache.save(_STORE_ENDPOINT, _COMPANY_STATUS_KEY, company_status),
+    ]
+    if all(saved):
+        # todayその日のTDnet開示はまだ全件公開されていない可能性がある
+        # （更新ボタンは取引時間中にも押される）。ウォーターマークをtoday
+        # まで進めてしまうと、その日の後刻に追加された開示を二度と取得
+        # できなくなるため、前日までしか「スキャン済み」にしない。
+        _save_watermark(today - dt.timedelta(days=1))
 
     return {
         "company_status": company_status,
