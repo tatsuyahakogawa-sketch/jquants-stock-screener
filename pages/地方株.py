@@ -73,8 +73,17 @@ def _listing_date(code: str) -> pd.Timestamp | None:
     return listing_date_by_code.loc[code]
 
 
-def _market_display(markets_string: str) -> str:
-    return "・".join(regional_stocks.regional_markets_in(markets_string)) or str(markets_string)
+markets_string_by_code = (
+    company_status.set_index("Code")["MarketsString"] if not company_status.empty else pd.Series(dtype="object")
+)
+
+
+def _market_display(code: str, fallback_markets_string: str) -> str:
+    # 個々のイベント発生時点のmarkets_stringではなく、company_statusが持つ
+    # 直近の値を優先する。東証移籍が完了した銘柄の古いイベント行が、
+    # 移籍前の地方単独上場の市場のまま表示され続けないようにするため。
+    markets_string = markets_string_by_code.get(code, fallback_markets_string)
+    return "・".join(regional_stocks.all_markets_in(markets_string)) or str(markets_string)
 
 
 # --- ①②③を1つの「イベント」テーブルにまとめる（④: id基準で重複排除） ---
@@ -85,7 +94,7 @@ for _, r in listing_events.iterrows():
         "id": r["id"],
         "コード": r["Code"],
         "会社名": r["CompanyName"],
-        "市場": _market_display(r["MarketsString"]),
+        "市場": _market_display(r["Code"], r["MarketsString"]),
         "上場日": _listing_date(r["Code"]),
         "現在値": _current_price_display(r["Code"]),
         "重要イベント": label,
@@ -99,7 +108,7 @@ for _, r in major_events.iterrows():
         "id": r["id"],
         "コード": r["Code"],
         "会社名": r["CompanyName"],
-        "市場": _market_display(r["MarketsString"]),
+        "市場": _market_display(r["Code"], r["MarketsString"]),
         "上場日": _listing_date(r["Code"]),
         "現在値": _current_price_display(r["Code"]),
         "重要イベント": f"大型イベント: {r['MatchedKeyword']}",
@@ -114,7 +123,9 @@ for _, r in major_events.iterrows():
 # 一覧からまるごと漏れてしまうため）。
 codes_with_event = {r["コード"] for r in rows}
 if not company_status.empty:
-    still_regional = company_status.loc[company_status["MarketsString"].apply(regional_stocks.is_regional_only)]
+    is_regional = company_status["MarketsString"].apply(regional_stocks.is_regional_only)
+    is_delisted = company_status["IsDelisted"].fillna(False).astype(bool)
+    still_regional = company_status.loc[is_regional & ~is_delisted]
     for _, r in still_regional.iterrows():
         if r["Code"] in codes_with_event:
             continue
@@ -122,7 +133,7 @@ if not company_status.empty:
             "id": f"status-{r['Code']}",
             "コード": r["Code"],
             "会社名": r["CompanyName"],
-            "市場": _market_display(r["MarketsString"]),
+            "市場": _market_display(r["Code"], r["MarketsString"]),
             "上場日": _listing_date(r["Code"]),
             "現在値": _current_price_display(r["Code"]),
             "重要イベント": "―",

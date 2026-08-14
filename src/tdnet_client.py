@@ -31,11 +31,12 @@ _REQUEST_LIMIT = 10000
 _MAX_DAYS_PER_REQUEST = 20
 
 
-def _fetch_raw(start: dt.date, end: dt.date) -> list[dict]:
+def _fetch_raw(start: dt.date, end: dt.date, force_refresh: bool = False) -> list[dict]:
     date_str = f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
-    cached = cache.load("tdnet_disclosures", date_str)
-    if cached is not None:
-        return cached.to_dict("records")
+    if not force_refresh:
+        cached = cache.load("tdnet_disclosures", date_str)
+        if cached is not None:
+            return cached.to_dict("records")
     resp = requests.get(
         f"{TDNET_MIRROR_BASE_URL}/{date_str}.json",
         params={"limit": _REQUEST_LIMIT},
@@ -51,12 +52,12 @@ def _fetch_raw(start: dt.date, end: dt.date) -> list[dict]:
     return items
 
 
-def _get_disclosures_chunk(start: dt.date, end: dt.date) -> list[dict]:
+def _get_disclosures_chunk(start: dt.date, end: dt.date, force_refresh: bool = False) -> list[dict]:
     """start〜endの開示を取得する。件数が上限に達した場合は決算集中期などで
     件数が多すぎる可能性があるため、期間を半分に分割して再取得する
     （欠落したデータを黙って返さないようにするため）。
     """
-    items = _fetch_raw(start, end)
+    items = _fetch_raw(start, end, force_refresh=force_refresh)
     if len(items) < _REQUEST_LIMIT:
         return items
     if start >= end:
@@ -67,22 +68,30 @@ def _get_disclosures_chunk(start: dt.date, end: dt.date) -> list[dict]:
         return items
 
     mid = start + (end - start) // 2
-    return _get_disclosures_chunk(start, mid) + _get_disclosures_chunk(mid + dt.timedelta(days=1), end)
+    return (
+        _get_disclosures_chunk(start, mid, force_refresh=force_refresh)
+        + _get_disclosures_chunk(mid + dt.timedelta(days=1), end, force_refresh=force_refresh)
+    )
 
 
-def get_disclosures_range(start: dt.date, end: dt.date) -> pd.DataFrame:
+def get_disclosures_range(start: dt.date, end: dt.date, force_refresh: bool = False) -> pd.DataFrame:
     """指定期間に開示された適時開示情報の一覧（タイトル・企業コード・日時等）を取得する。
 
     列: id, pubdate, company_code, company_name, title, document_url, markets_string 等
 
     件数上限による欠落を避けるため、期間を _MAX_DAYS_PER_REQUEST 日ごとの
     チャンクに分割して取得し、結合して返す。
+
+    force_refresh=Trueの場合、その期間分のキャッシュ有無に関わらず必ずAPIへ
+    再取得する（キャッシュへの保存自体は従来通り行う）。当日分はまだ全件
+    公開されていない可能性があり、一度キャッシュされると同じ期間指定では
+    その不完全な結果を返し続けてしまうため、当日を含む取得だけ使う。
     """
     all_items: list[dict] = []
     chunk_start = start
     while chunk_start <= end:
         chunk_end = min(chunk_start + dt.timedelta(days=_MAX_DAYS_PER_REQUEST - 1), end)
-        all_items.extend(_get_disclosures_chunk(chunk_start, chunk_end))
+        all_items.extend(_get_disclosures_chunk(chunk_start, chunk_end, force_refresh=force_refresh))
         chunk_start = chunk_end + dt.timedelta(days=1)
 
     if not all_items:

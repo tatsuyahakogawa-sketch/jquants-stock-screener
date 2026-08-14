@@ -75,6 +75,17 @@ class TestRegionalMarketsIn(unittest.TestCase):
         self.assertEqual(regional_stocks.regional_markets_in(float("nan")), [])
 
 
+class TestAllMarketsIn(unittest.TestCase):
+    def test_includes_tokyo(self):
+        self.assertEqual(regional_stocks.all_markets_in("東福"), ["東証", "福証"])
+
+    def test_regional_only(self):
+        self.assertEqual(regional_stocks.all_markets_in("札福"), ["福証", "札証"])
+
+    def test_nan_does_not_raise(self):
+        self.assertEqual(regional_stocks.all_markets_in(float("nan")), [])
+
+
 class TestLegacyTicker(unittest.TestCase):
     def test_strips_only_trailing_suffix_digit(self):
         # 実コード自体が0で終わる場合にrstrip("0")で削り過ぎないことを確認
@@ -229,6 +240,36 @@ class TestDetectRegionalMajorEvents(unittest.TestCase):
         self.assertTrue(result.empty)
 
 
+class TestLatestCompanyStatus(unittest.TestCase):
+    def test_marks_delisting_notice_as_delisted(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        result = regional_stocks._latest_company_status(df)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result.iloc[0]["IsDelisted"])
+
+    def test_ordinary_disclosure_is_not_delisted(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        result = regional_stocks._latest_company_status(df)
+        self.assertFalse(result.iloc[0]["IsDelisted"])
+
+    def test_uses_only_the_latest_disclosure_per_company(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-10 08:00:00", "福"),
+        ])
+        result = regional_stocks._latest_company_status(df)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result.iloc[0]["IsDelisted"])
+
+
 class TestFetchRegionalSharePrice(unittest.TestCase):
     def test_fukuoka_only_uses_yfinance_f_suffix(self):
         mock_yf = MagicMock()
@@ -292,9 +333,14 @@ class TestUpdateRegionalStore(unittest.TestCase):
             today = dt.date(2026, 8, 13)
             result = regional_stocks.update_regional_store(today=today)
 
-        call_start, call_end = mock_get.call_args[0]
-        self.assertEqual(call_end, today)
-        self.assertLess(call_start, today - dt.timedelta(days=365))  # 3年遡る初回ブートストラップ
+        # 前日までの安定した期間と、当日分(force_refresh)の2回に分けて呼ぶ
+        self.assertEqual(len(mock_get.call_args_list), 2)
+        stable_start, stable_end = mock_get.call_args_list[0].args
+        self.assertEqual(stable_end, today - dt.timedelta(days=1))
+        self.assertLess(stable_start, today - dt.timedelta(days=365))  # 3年遡る初回ブートストラップ
+        today_start, today_end = mock_get.call_args_list[1].args
+        self.assertEqual((today_start, today_end), (today, today))
+        self.assertTrue(mock_get.call_args_list[1].kwargs.get("force_refresh"))
         self.assertEqual(len(result["listing_events"]), 1)
         self.assertEqual(result["company_status"].iloc[0]["Code"], "93880")
 
@@ -318,13 +364,36 @@ class TestUpdateRegionalStore(unittest.TestCase):
                 patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")):
             result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 14))
 
-        call_start, _call_end = mock_get.call_args[0]
         # 前回のwatermark=8/12(=today-1)の翌日=8/13から再取得する（8/13を再スキャン）
-        self.assertEqual(call_start, dt.date(2026, 8, 13))
+        stable_start, stable_end = mock_get.call_args_list[0].args
+        self.assertEqual((stable_start, stable_end), (dt.date(2026, 8, 13), dt.date(2026, 8, 13)))
+        today_start, today_end = mock_get.call_args_list[1].args
+        self.assertEqual((today_start, today_end), (dt.date(2026, 8, 14), dt.date(2026, 8, 14)))
         # 1回目の検出結果が消えずに残っていること（増分マージの確認）
         self.assertEqual(len(result["listing_events"]), 1)
         self.assertEqual(len(result["major_events"]), 1)
         self.assertEqual(set(result["company_status"]["Code"]), {"93880", "48340"})
+
+    def test_same_batch_regional_to_tokyo_transition_is_captured(self):
+        # 初回ブートストラップのように複数年分を一度に取得すると、同じバッチ
+        # の中で「地方単独上場」→「東証上場完了」まで進んでいる銘柄がある
+        # 場合がある。known_regional_codesはストア（更新前なので空）だけでは
+        # なく、このバッチ内での発見も反映する必要があることを確認する。
+        combined_batch = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ",
+                        "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2023-01-10 08:00:00", "福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
+                        "2026-08-01 08:00:00", "東福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", side_effect=[combined_batch, pd.DataFrame()]), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")):
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        stages = set(result["listing_events"]["Stage"])
+        self.assertEqual(stages, {"上場"})
+        self.assertTrue(result["listing_events"]["IsTokyoRelated"].any())
+        self.assertEqual(result["company_status"].iloc[0]["MarketsString"], "東福")
 
     def test_load_regional_store_without_update_reads_persisted_data(self):
         disclosures = pd.DataFrame([
@@ -375,6 +444,21 @@ class TestUpdateRegionalStore(unittest.TestCase):
         mock_fetch.assert_not_called()
         status_row = result["company_status"].set_index("Code").loc["93880"]
         self.assertEqual(status_row["MarketsString"], "東福")
+
+    def test_delisted_company_is_excluded_from_share_price_refresh(self):
+        # 上場廃止の開示が来た銘柄は、markets_stringがまだその取引所名を
+        # 含んでいても「現在も地方単独上場中」として株価取得を試みない
+        # ことを確認する（IsDelisted=Trueで除外）。
+        disclosures = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=disclosures), \
+                patch(f"{_MOD}.fetch_regional_share_price") as mock_fetch:
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        mock_fetch.assert_not_called()
+        self.assertTrue(bool(result["company_status"].iloc[0]["IsDelisted"]))
 
     def test_watermark_not_advanced_when_a_table_save_fails(self):
         # Supabase設定済みの環境で一部テーブルの保存だけ失敗すると、次回

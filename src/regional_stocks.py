@@ -72,7 +72,7 @@ _MAJOR_EVENTS_COLUMNS = [
     "id", "Code", "CompanyName", "Date", "MarketsString", "Title", "Url", "MatchedKeyword",
 ]
 _COMPANY_STATUS_COLUMNS = [
-    "Code", "CompanyName", "MarketsString", "LastSeenDate", "CurrentPrice", "CurrentPriceNote",
+    "Code", "CompanyName", "MarketsString", "LastSeenDate", "IsDelisted", "CurrentPrice", "CurrentPriceNote",
 ]
 
 _REQUIRED_DISCLOSURE_COLUMNS = {
@@ -97,6 +97,22 @@ def regional_markets_in(markets_string) -> list[str]:
     if not isinstance(markets_string, str) or not markets_string:
         return []
     return [label for char, label in REGIONAL_MARKET_LABELS.items() if char in markets_string]
+
+
+_ALL_MARKET_LABELS = {TOKYO_MARKET_CHAR: "東証", **REGIONAL_MARKET_LABELS}
+
+
+def all_markets_in(markets_string) -> list[str]:
+    """markets_stringに含まれる取引所名（東証も含む、表示用）を出現順に返す。
+
+    地方単独上場から東証への移籍が完了した開示は、その時点でmarkets_string
+    に"東"も含まれる（例:"東福"）。regional_markets_in()は地方取引所名しか
+    返さないため、この関数を使わないと表示上「まだ東証には上場していない」
+    ように誤って見えてしまう。
+    """
+    if not isinstance(markets_string, str) or not markets_string:
+        return []
+    return [label for char, label in _ALL_MARKET_LABELS.items() if char in markets_string]
 
 
 def _legacy_ticker(code: str) -> str:
@@ -215,37 +231,45 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
+_STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate", "IsDelisted"]
+
+
 def _latest_company_status(
     disclosures_df: pd.DataFrame, known_regional_codes: set[str] | None = None
 ) -> pd.DataFrame:
-    """銘柄ごとの最新のmarkets_string・会社名・最終確認日を集計する。
+    """銘柄ごとの最新のmarkets_string・会社名・最終確認日・上場廃止有無を集計する。
 
     地方単独上場の開示に加え、known_regional_codes（直前まで地方単独上場
     だった銘柄）が東証を含む市場に移った開示も対象にする。そうしないと、
     東証移籍後もmarkets_stringが移籍前のまま更新されず、既に地方単独上場
     ではなくなった銘柄が地方株一覧に残り続けてしまう。
+
+    最新の開示が「上場廃止」に関するものであればIsDelisted=Trueとする
+    （上場廃止時点のmarkets_stringはまだその取引所名を含むことがあるため、
+    markets_stringだけでは「今も地方単独上場中」と誤認してしまう）。
     """
     known_regional_codes = known_regional_codes or set()
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
-        return pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        return pd.DataFrame(columns=_STATUS_COLUMNS)
 
     df = disclosures_df.copy()
     is_currently_regional = df["markets_string"].apply(is_regional_only)
     was_known_regional = df["company_code"].astype(str).isin(known_regional_codes)
     regional = df.loc[is_currently_regional | was_known_regional]
     if regional.empty:
-        return pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        return pd.DataFrame(columns=_STATUS_COLUMNS)
 
     df = regional.copy()
     df["Date"] = pd.to_datetime(df["pubdate"], errors="coerce")
     df = df.sort_values("Date")
-    latest = df.groupby("company_code").tail(1)
+    latest = df.groupby("company_code").tail(1).copy()
+    latest["IsDelisted"] = latest["title"].fillna("").str.contains(_DELISTING_KEYWORD)
     return latest.rename(columns={
         "company_code": "Code",
         "company_name": "CompanyName",
         "markets_string": "MarketsString",
         "Date": "LastSeenDate",
-    })[["Code", "CompanyName", "MarketsString", "LastSeenDate"]].reset_index(drop=True)
+    })[_STATUS_COLUMNS].reset_index(drop=True)
 
 
 def fetch_regional_share_price(code: str, markets_string: str) -> tuple[float | None, str]:
@@ -324,9 +348,25 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     if start > today:
         return stores
 
-    known_regional_codes = set(stores["company_status"]["Code"])
+    # 当日分のTDnet開示はまだ全件公開されていない可能性がある。tdnet_client
+    # は期間指定をそのままキャッシュキーにするため、当日を含む期間を一度
+    # キャッシュしてしまうと同じボタンをその日のうちに何度押しても同じ
+    # 不完全な結果を返し続けてしまう。前日までとは別に、当日分だけ
+    # force_refresh=Trueで毎回取り直す。
+    yesterday = today - dt.timedelta(days=1)
+    stable_disclosures = tdnet_client.get_disclosures_range(start, yesterday)
+    todays_disclosures = tdnet_client.get_disclosures_range(today, today, force_refresh=True)
+    new_disclosures = pd.concat([stable_disclosures, todays_disclosures], ignore_index=True)
 
-    new_disclosures = tdnet_client.get_disclosures_range(start, today)
+    # known_regional_codesは「これまでに保存済みの地方単独上場銘柄」に加え、
+    # 今回まとめて取得した分（特に初回の複数年ブートストラップ）の中で地方
+    # 単独上場と分かった銘柄も含める。そうしないと、同じバッチ内で地方単独
+    # 上場→東証移籍完了まで進んだ銘柄の完了開示を取り逃す
+    # （ストアはバッチ処理前の状態のままのため）。
+    known_regional_codes = set(stores["company_status"]["Code"])
+    if not new_disclosures.empty and "markets_string" in new_disclosures.columns:
+        newly_seen_regional = new_disclosures.loc[new_disclosures["markets_string"].apply(is_regional_only)]
+        known_regional_codes |= set(newly_seen_regional["company_code"].astype(str))
 
     new_listing = detect_regional_listing_events(new_disclosures, known_regional_codes)
     new_major = detect_regional_major_events(new_disclosures)
@@ -352,8 +392,10 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     )
 
     # 現在も地方単独上場のままの銘柄だけ、株価(現在値)を更新する
-    # （東証を含む市場に移った銘柄は対象外。既存値のまま保持する）。
-    still_regional = company_status["MarketsString"].apply(is_regional_only)
+    # （東証を含む市場に移った銘柄、および上場廃止済みの銘柄は対象外。
+    # 既存値のまま保持する）。
+    is_delisted = company_status["IsDelisted"].fillna(False).astype(bool)
+    still_regional = company_status["MarketsString"].apply(is_regional_only) & ~is_delisted
     for idx in company_status.loc[still_regional].index:
         code = company_status.at[idx, "Code"]
         markets_string = company_status.at[idx, "MarketsString"]
