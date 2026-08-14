@@ -53,12 +53,16 @@ class TestForceRefresh(unittest.TestCase):
             tdnet_client.get_disclosures_range(dt.date(2026, 8, 13), dt.date(2026, 8, 13), force_refresh=True)
         self.assertEqual(mock_get.call_count, 2)
 
-    def test_force_refresh_still_writes_to_cache_for_later_non_forced_reads(self):
+    def test_force_refresh_does_not_write_to_cache(self):
+        # force_refreshで取得した結果はキャッシュに保存しない。「まだ全件
+        # 公開されていない可能性がある」と分かって敢えて取りに来た結果を
+        # キャッシュしてしまうと、翌日以降の通常(非force_refresh)取得が
+        # その不完全な結果を返し続けてしまうため。
         item = {"id": "1", "company_code": "12340", "pubdate": "2026-08-13 10:00:00"}
         with patch("src.tdnet_client.requests.get", return_value=self._mock_response([item])) as mock_get:
             tdnet_client.get_disclosures_range(dt.date(2026, 8, 13), dt.date(2026, 8, 13), force_refresh=True)
             tdnet_client.get_disclosures_range(dt.date(2026, 8, 13), dt.date(2026, 8, 13))
-        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(mock_get.call_count, 2)
 
     def test_default_result_matches_force_refresh_result(self):
         item = {"id": "1", "company_code": "12340", "pubdate": "2026-08-13 10:00:00"}

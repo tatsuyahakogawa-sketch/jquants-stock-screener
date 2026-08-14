@@ -45,9 +45,14 @@ def _fetch_raw(start: dt.date, end: dt.date, force_refresh: bool = False) -> lis
     resp.raise_for_status()
     data = resp.json()
     items = [item["Tdnet"] for item in data.get("items", [])]
-    if len(items) < _REQUEST_LIMIT:
+    if len(items) < _REQUEST_LIMIT and not force_refresh:
         # 上限に達した場合は呼び出し側が分割して再取得するので、ここでは
         # キャッシュしない（切り捨てられた不完全な結果を保存してしまうため）。
+        # force_refresh=Trueの結果もキャッシュしない。呼び出し側が
+        # 「まだ全件公開されていない可能性がある」と判断して敢えて
+        # キャッシュを無視して取りに来た結果のため、キャッシュしてしまうと
+        # 翌日以降の通常(非force_refresh)の取得がこの不完全な結果を
+        # そのまま返してしまい、後から追加された開示を永久に取り逃す。
         cache.save("tdnet_disclosures", date_str, pd.DataFrame.from_records(items))
     return items
 

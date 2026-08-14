@@ -14,7 +14,9 @@ import pandas as pd
 import streamlit as st
 
 from src import regional_stocks
-from src.auth import check_password
+from src.auth import bridge_env_secrets, check_password
+
+bridge_env_secrets()
 
 st.set_page_config(page_title="地方株", layout="wide")
 
@@ -64,7 +66,8 @@ def _current_price_display(code: str) -> str:
     row = current_price_by_code.loc[code]
     if pd.notna(row["CurrentPrice"]):
         return f"{row['CurrentPrice']:,.0f}円"
-    return str(row["CurrentPriceNote"]) if row["CurrentPriceNote"] else "取得不可"
+    note = row["CurrentPriceNote"]
+    return str(note) if pd.notna(note) and note else "取得不可"
 
 
 def _listing_date(code: str) -> pd.Timestamp | None:

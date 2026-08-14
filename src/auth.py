@@ -1,14 +1,34 @@
-"""Streamlitマルチページ間で共有するパスワード認証。
+"""Streamlitマルチページ間で共有するパスワード認証・環境変数の初期化。
 
 app.pyの元々の実装をそのまま切り出したもの（挙動は変更していない）。
 Streamlitのpages/以下は個別にスクリプトが実行されるため、app.pyだけで
-認証していると、pages/以下のURLへ直接アクセスされた場合に認証をバイパス
-できてしまう。そのためapp.pyと各pages/*.pyの両方の先頭でcheck_password()
-を呼ぶ。
+認証・環境変数の橋渡しをしていると、pages/以下のURLへ直接アクセスされた
+場合（Streamlit Cloudの再デプロイ後に「地方株」ページのURLを直接開く等）
+に認証をバイパスできてしまったり、SUPABASE_URL等が未設定のまま動作して
+しまう。そのためapp.pyと各pages/*.pyの両方の先頭でbridge_env_secrets()・
+check_password()を呼ぶ。
 """
 from __future__ import annotations
 
+import os
+
 import streamlit as st
+from dotenv import load_dotenv
+
+
+def bridge_env_secrets() -> None:
+    """.env（ローカル実行）とst.secrets（Streamlit Cloud）の値をos.environに
+    橋渡しする。jquants_client.py/edinet_client.py/cache.pyはos.environから
+    読む設計のため。st.secretsが未設定（ローカルでsecrets.tomlが無い等）の
+    場合はStreamlitSecretNotFoundErrorになるので何もしない。
+    """
+    load_dotenv()
+    try:
+        for key in ("JQUANTS_API_KEY", "EDINET_API_KEY", "SUPABASE_URL", "SUPABASE_KEY"):
+            if key in st.secrets:
+                os.environ[key] = st.secrets[key]
+    except Exception:  # noqa: BLE001, S110 -- st.secrets未設定時の想定内フォールバック
+        pass
 
 
 def check_password() -> bool:

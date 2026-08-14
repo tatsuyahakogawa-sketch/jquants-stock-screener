@@ -153,8 +153,34 @@ def _filter_regional_only(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[df["markets_string"].apply(is_regional_only)]
 
 
+def compute_was_known_regional(disclosures_df: pd.DataFrame, base_known_codes: set[str] | None = None) -> pd.Series:
+    """各開示の時点で、その開示より前の情報から「地方単独上場と判明している」
+    銘柄かどうかを表すbool列(disclosures_dfと同じindex)を返す。
+
+    disclosures_df全体から単純に「地方単独上場の行が1件でもあるコード」を
+    集めるだけでは、時系列を無視してしまう（例:同じバッチ内で後の方に
+    地方単独上場の開示がある銘柄について、それより前にある無関係な東証の
+    開示まで誤って「地方単独上場からの移籍」と判定してしまう）。日付の
+    昇順で1件ずつ走査し、その時点までに分かっている集合だけを使う。
+    """
+    if disclosures_df.empty:
+        return pd.Series(dtype=bool)
+    base_known_codes = base_known_codes or set()
+    dates = pd.to_datetime(disclosures_df["pubdate"], errors="coerce")
+    order = dates.sort_values(kind="stable").index
+    is_regional_row = disclosures_df["markets_string"].apply(is_regional_only)
+    known = set(base_known_codes)
+    result = pd.Series(False, index=disclosures_df.index)
+    for idx in order:
+        code = str(disclosures_df.at[idx, "company_code"])
+        result.at[idx] = code in known
+        if is_regional_row.at[idx]:
+            known.add(code)
+    return result
+
+
 def detect_regional_listing_events(
-    disclosures_df: pd.DataFrame, known_regional_codes: set[str] | None = None
+    disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None = None
 ) -> pd.DataFrame:
     """地方単独上場企業の新規上場・重複上場・市場変更関連の開示を検出する。
 
@@ -164,10 +190,11 @@ def detect_regional_listing_events(
     東証への上場が実際に完了した開示は、その時点でmarkets_stringにもう
     「東」が含まれてしまう（=その開示自体は地方単独上場ではない）ため、
     markets_stringだけで絞り込むと肝心の「上場完了」の開示を取り逃す。
-    known_regional_codesに（直前まで）地方単独上場だったと分かっている
-    銘柄コードを渡すことで、そのようなmarkets_string変化後の開示も対象にする。
+    was_known_regional（compute_was_known_regional()の戻り値。disclosures_df
+    と同じindexを持つbool列）で、その開示より前の時点で地方単独上場と
+    分かっていた銘柄かどうかを渡すことで、そのようなmarkets_string変化後の
+    開示も対象にする。
     """
-    known_regional_codes = known_regional_codes or set()
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=_LISTING_EVENTS_COLUMNS)
 
@@ -175,7 +202,11 @@ def detect_regional_listing_events(
     is_currently_regional = df["markets_string"].apply(is_regional_only)
     titles_for_scope = df["title"].fillna("")
     is_tokyo_titled = titles_for_scope.apply(lambda t: any(k in t for k in _TOKYO_KEYWORDS))
-    was_known_regional = df["company_code"].astype(str).isin(known_regional_codes)
+    was_known_regional = (
+        was_known_regional.reindex(df.index, fill_value=False)
+        if was_known_regional is not None
+        else pd.Series(False, index=df.index)
+    )
     in_scope = is_currently_regional | (is_tokyo_titled & was_known_regional)
 
     regional = df.loc[in_scope]
@@ -235,35 +266,49 @@ _STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate", "IsDe
 
 
 def _latest_company_status(
-    disclosures_df: pd.DataFrame, known_regional_codes: set[str] | None = None
+    disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None = None
 ) -> pd.DataFrame:
     """銘柄ごとの最新のmarkets_string・会社名・最終確認日・上場廃止有無を集計する。
 
-    地方単独上場の開示に加え、known_regional_codes（直前まで地方単独上場
-    だった銘柄）が東証を含む市場に移った開示も対象にする。そうしないと、
-    東証移籍後もmarkets_stringが移籍前のまま更新されず、既に地方単独上場
-    ではなくなった銘柄が地方株一覧に残り続けてしまう。
+    地方単独上場の開示に加え、was_known_regional（compute_was_known_regional()
+    の戻り値。直前まで地方単独上場だった銘柄）が東証を含む市場に移った開示も
+    対象にする。そうしないと、東証移籍後もmarkets_stringが移籍前のまま
+    更新されず、既に地方単独上場ではなくなった銘柄が地方株一覧に残り続ける。
+
+    markets_stringが欠損している開示（会社コードは分かるがこの項目だけ
+    空の回）は、有効な現在値を上書きしてしまわないよう対象から除外する
+    （latestの選定に使わない。その回自体は無視され、直前の有効な値が
+    そのまま保持される）。
 
     最新の開示が「上場廃止」に関するものであればIsDelisted=Trueとする
     （上場廃止時点のmarkets_stringはまだその取引所名を含むことがあるため、
     markets_stringだけでは「今も地方単独上場中」と誤認してしまう）。
     """
-    known_regional_codes = known_regional_codes or set()
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=_STATUS_COLUMNS)
 
     df = disclosures_df.copy()
+    has_valid_markets = df["markets_string"].apply(lambda m: isinstance(m, str) and bool(m))
     is_currently_regional = df["markets_string"].apply(is_regional_only)
-    was_known_regional = df["company_code"].astype(str).isin(known_regional_codes)
-    regional = df.loc[is_currently_regional | was_known_regional]
+    was_known_regional = (
+        was_known_regional.reindex(df.index, fill_value=False)
+        if was_known_regional is not None
+        else pd.Series(False, index=df.index)
+    )
+    regional = df.loc[has_valid_markets & (is_currently_regional | was_known_regional)]
     if regional.empty:
         return pd.DataFrame(columns=_STATUS_COLUMNS)
 
     df = regional.copy()
     df["Date"] = pd.to_datetime(df["pubdate"], errors="coerce")
     df = df.sort_values("Date")
+    # 上場廃止は終端的な状態として扱う。このバッチの中に1件でも上場廃止の
+    # 開示があれば、最新の開示がそれより後の通常開示であってもIsDelisted=True
+    # のままにする（そうしないと「最新の開示だけ」を見た場合にFalseへ戻る）。
+    is_delisting_title = df["title"].fillna("").str.contains(_DELISTING_KEYWORD)
+    ever_delisted_in_batch = is_delisting_title.groupby(df["company_code"]).transform("any")
     latest = df.groupby("company_code").tail(1).copy()
-    latest["IsDelisted"] = latest["title"].fillna("").str.contains(_DELISTING_KEYWORD)
+    latest["IsDelisted"] = ever_delisted_in_batch.loc[latest.index]
     return latest.rename(columns={
         "company_code": "Code",
         "company_name": "CompanyName",
@@ -358,19 +403,18 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     todays_disclosures = tdnet_client.get_disclosures_range(today, today, force_refresh=True)
     new_disclosures = pd.concat([stable_disclosures, todays_disclosures], ignore_index=True)
 
-    # known_regional_codesは「これまでに保存済みの地方単独上場銘柄」に加え、
-    # 今回まとめて取得した分（特に初回の複数年ブートストラップ）の中で地方
-    # 単独上場と分かった銘柄も含める。そうしないと、同じバッチ内で地方単独
-    # 上場→東証移籍完了まで進んだ銘柄の完了開示を取り逃す
+    # was_known_regionalは「これまでに保存済みの地方単独上場銘柄」に加え、
+    # 今回まとめて取得した分（特に初回の複数年ブートストラップ）の中で
+    # それより前の日付に地方単独上場と分かった銘柄も反映する（日付の昇順で
+    # 判定するため、バッチ内で後から分かった分をそれより前の行に誤って
+    # 適用することはない）。そうしないと、同じバッチ内で地方単独上場→
+    # 東証移籍完了まで進んだ銘柄の完了開示を取り逃す
     # （ストアはバッチ処理前の状態のままのため）。
-    known_regional_codes = set(stores["company_status"]["Code"])
-    if not new_disclosures.empty and "markets_string" in new_disclosures.columns:
-        newly_seen_regional = new_disclosures.loc[new_disclosures["markets_string"].apply(is_regional_only)]
-        known_regional_codes |= set(newly_seen_regional["company_code"].astype(str))
+    was_known_regional = compute_was_known_regional(new_disclosures, set(stores["company_status"]["Code"]))
 
-    new_listing = detect_regional_listing_events(new_disclosures, known_regional_codes)
+    new_listing = detect_regional_listing_events(new_disclosures, was_known_regional)
     new_major = detect_regional_major_events(new_disclosures)
-    new_status = _latest_company_status(new_disclosures, known_regional_codes)
+    new_status = _latest_company_status(new_disclosures, was_known_regional)
 
     listing_events = (
         pd.concat([stores["listing_events"], new_listing], ignore_index=True)
@@ -384,12 +428,19 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         .sort_values("Date")
         .reset_index(drop=True)
     )
+    all_status = pd.concat([stores["company_status"], new_status], ignore_index=True)
+    # 上場廃止は終端的な状態として扱う。上場廃止の開示より後に何らかの
+    # 通常開示（バッチ内の順序や、稀に廃止前後の事務的な開示等）があると
+    # 「直近の開示」だけを見た場合にIsDelisted=Falseへ戻ってしまうため、
+    # 一度でも上場廃止と判定された銘柄はTrueのまま保持する。
+    ever_delisted = all_status["IsDelisted"].fillna(False).astype(bool).groupby(all_status["Code"]).any()
     company_status = (
-        pd.concat([stores["company_status"], new_status], ignore_index=True)
+        all_status
         .sort_values("LastSeenDate")
         .drop_duplicates(subset=["Code"], keep="last")
         .reset_index(drop=True)
     )
+    company_status["IsDelisted"] = company_status["Code"].map(ever_delisted).fillna(False)
 
     # 現在も地方単独上場のままの銘柄だけ、株価(現在値)を更新する
     # （東証を含む市場に移った銘柄、および上場廃止済みの銘柄は対象外。

@@ -186,10 +186,10 @@ class TestDetectRegionalListingEvents(unittest.TestCase):
         result = regional_stocks.detect_regional_listing_events(df)
         self.assertTrue(result.empty)
 
-    def test_completed_tokyo_listing_is_caught_via_known_regional_codes(self):
+    def test_completed_tokyo_listing_is_caught_via_was_known_regional(self):
         # 東証上場が完了した開示は、その時点でmarkets_stringに既に"東"が
         # 含まれる（例:"東福"）。markets_stringだけで絞り込むと取り逃すため、
-        # known_regional_codesに直前まで地方単独上場だったコードを渡すことで
+        # was_known_regionalに直前まで地方単独上場だったことを渡すことで
         # 検出できることを確認する。
         df = pd.DataFrame([
             _disclosure("1", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
@@ -198,20 +198,60 @@ class TestDetectRegionalListingEvents(unittest.TestCase):
         without_context = regional_stocks.detect_regional_listing_events(df)
         self.assertTrue(without_context.empty)
 
-        with_context = regional_stocks.detect_regional_listing_events(df, known_regional_codes={"93880"})
+        with_context = regional_stocks.detect_regional_listing_events(df, pd.Series([True], index=df.index))
         self.assertEqual(len(with_context), 1)
         self.assertEqual(with_context.iloc[0]["Stage"], "上場")
         self.assertTrue(with_context.iloc[0]["IsTokyoRelated"])
 
-    def test_unrelated_company_not_in_known_codes_with_tokyo_word_is_still_excluded(self):
-        # markets_stringが地方単独でもなく、known_regional_codesにも
-        # 含まれない銘柄は対象外のままであること（無関係な東証銘柄まで
-        # 拾ってしまわないことの確認）。
+    def test_unrelated_company_not_known_regional_with_tokyo_word_is_still_excluded(self):
+        # markets_stringが地方単独でもなく、was_known_regionalもFalseの
+        # 銘柄は対象外のままであること（無関係な東証銘柄まで拾ってしまわ
+        # ないことの確認）。
         df = pd.DataFrame([
             _disclosure("1", "72030", "トヨタ", "東京証券取引所プライム市場への上場に関するお知らせ",
                         "2026-09-01 08:00:00", "東"),
         ])
-        result = regional_stocks.detect_regional_listing_events(df, known_regional_codes={"93880"})
+        result = regional_stocks.detect_regional_listing_events(df, pd.Series([False], index=df.index))
+        self.assertTrue(result.empty)
+
+
+class TestComputeWasKnownRegional(unittest.TestCase):
+    def test_regional_evidence_applies_to_later_rows_only(self):
+        # 地方単独上場の開示(1/10)より後の東証開示(8/1)だけがTrueになり、
+        # それより前の行には適用されない（時系列を守る）。
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-01-10 08:00:00", "福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
+                        "2026-08-01 08:00:00", "東福"),
+        ])
+        result = regional_stocks.compute_was_known_regional(df)
+        self.assertFalse(result.loc[0])  # 1/10時点ではまだ地方単独上場と分かっていない
+        self.assertTrue(result.loc[1])   # 8/1時点では1/10の開示から分かっている
+
+    def test_does_not_apply_regional_evidence_retroactively(self):
+        # 東証開示(1/10)の方が地方単独上場の開示(8/1)より前にある場合、
+        # 東証開示の時点ではまだ地方単独上場と分かっていないため、
+        # バッチ全体を見ればコードが一致していても遡って適用しない。
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
+                        "2026-01-10 08:00:00", "東福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        result = regional_stocks.compute_was_known_regional(df)
+        self.assertFalse(result.loc[0])
+
+    def test_base_known_codes_apply_from_the_start(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
+                        "2026-08-01 08:00:00", "東福"),
+        ])
+        result = regional_stocks.compute_was_known_regional(df, base_known_codes={"93880"})
+        self.assertTrue(result.loc[0])
+
+    def test_empty_input_returns_empty_series(self):
+        result = regional_stocks.compute_was_known_regional(pd.DataFrame())
         self.assertTrue(result.empty)
 
 
@@ -257,6 +297,20 @@ class TestLatestCompanyStatus(unittest.TestCase):
         ])
         result = regional_stocks._latest_company_status(df)
         self.assertFalse(result.iloc[0]["IsDelisted"])
+
+    def test_missing_markets_string_does_not_overwrite_valid_status(self):
+        # 最新(日付順)の開示のmarkets_stringが欠損している場合、それを
+        # そのまま採用してしまうと有効な市場情報がNaNで上書きされてしまう。
+        # そのような回は無視し、直前の有効な回が採用されることを確認する。
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-10 08:00:00", float("nan")),
+        ])
+        result = regional_stocks._latest_company_status(df)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["MarketsString"], "福")
 
     def test_uses_only_the_latest_disclosure_per_company(self):
         df = pd.DataFrame([
@@ -377,7 +431,7 @@ class TestUpdateRegionalStore(unittest.TestCase):
     def test_same_batch_regional_to_tokyo_transition_is_captured(self):
         # 初回ブートストラップのように複数年分を一度に取得すると、同じバッチ
         # の中で「地方単独上場」→「東証上場完了」まで進んでいる銘柄がある
-        # 場合がある。known_regional_codesはストア（更新前なので空）だけでは
+        # 場合がある。was_known_regionalはストア（更新前なので空）だけでは
         # なく、このバッチ内での発見も反映する必要があることを確認する。
         combined_batch = pd.DataFrame([
             _disclosure("1", "93880", "Ｑ－パパネッツ",
@@ -459,6 +513,43 @@ class TestUpdateRegionalStore(unittest.TestCase):
 
         mock_fetch.assert_not_called()
         self.assertTrue(bool(result["company_status"].iloc[0]["IsDelisted"]))
+
+    def test_is_delisted_stays_true_even_if_a_later_disclosure_looks_ordinary(self):
+        # 上場廃止と判定された後、同じバッチ内(または別の更新)で通常開示の
+        # 方が日付として最新になった場合でも、IsDelistedはFalseに戻らない
+        # ことを確認する（上場廃止は終端的な状態として扱う）。
+        disclosures = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-05 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=disclosures), \
+                patch(f"{_MOD}.fetch_regional_share_price") as mock_fetch:
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        mock_fetch.assert_not_called()
+        self.assertTrue(bool(result["company_status"].iloc[0]["IsDelisted"]))
+
+    def test_tokyo_disclosure_before_any_regional_evidence_is_not_misclassified(self):
+        # 同じバッチ内で、東証関連の開示の方が地方単独上場の開示より前の
+        # 日付にある場合、その東証開示の時点ではまだ地方単独上場だったと
+        # 分かっていないため「地方→東証移籍」としては検出されないことを
+        # 確認する（時系列を無視した誤分類の防止）。
+        disclosures = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "東京証券取引所への上場のお知らせ",
+                        "2026-01-10 08:00:00", "東福"),
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=disclosures), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")):
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        # 1/10の東証開示はwas_known_regional=Falseなので検出されず、
+        # 8/1の重複上場開示だけがヒットする。
+        self.assertEqual(len(result["listing_events"]), 1)
+        self.assertEqual(result["listing_events"].iloc[0]["Date"], pd.Timestamp("2026-08-01 08:00:00"))
 
     def test_watermark_not_advanced_when_a_table_save_fails(self):
         # Supabase設定済みの環境で一部テーブルの保存だけ失敗すると、次回
