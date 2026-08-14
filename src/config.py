@@ -49,3 +49,7 @@ JQUANTS_FREE_PLAN_DELAY_WEEKS = 0  # Lightプランは遅延なし
 
 # ローカルキャッシュ保存先
 CACHE_DIR = "data/cache"
+
+# 「地方株」ページ: 初回実行時にTDnet開示をどこまで遡ってスキャンするか
+# （2回目以降は前回のスキャン済み日付までを記録し、その翌日からだけ追加取得する）。
+REGIONAL_LISTING_LOOKBACK_YEARS = 3
