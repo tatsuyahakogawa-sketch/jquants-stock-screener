@@ -298,23 +298,6 @@ class TestDetectRegionalMajorEvents(unittest.TestCase):
 
 
 class TestLatestCompanyStatus(unittest.TestCase):
-    def test_marks_delisting_notice_date(self):
-        df = pd.DataFrame([
-            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
-                        "2026-08-01 08:00:00", "福"),
-        ])
-        result = regional_stocks._latest_company_status(df)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result.iloc[0]["LastDelistingDate"], pd.Timestamp("2026-08-01 08:00:00"))
-
-    def test_ordinary_disclosure_has_no_delisting_date(self):
-        df = pd.DataFrame([
-            _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
-                        "2026-08-01 08:00:00", "福"),
-        ])
-        result = regional_stocks._latest_company_status(df)
-        self.assertTrue(pd.isna(result.iloc[0]["LastDelistingDate"]))
-
     def test_missing_markets_string_does_not_overwrite_valid_status(self):
         # 最新(日付順)の開示のmarkets_stringが欠損している場合、それを
         # そのまま採用してしまうと有効な市場情報がNaNで上書きされてしまう。
@@ -329,17 +312,51 @@ class TestLatestCompanyStatus(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["MarketsString"], "福")
 
-    def test_uses_only_the_latest_disclosure_per_company_for_other_fields(self):
+    def test_uses_only_the_latest_disclosure_per_company(self):
         df = pd.DataFrame([
             _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
                         "2026-08-01 08:00:00", "福"),
-            _disclosure("2", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "臨時報告書の提出に関するお知らせ",
                         "2026-08-10 08:00:00", "福"),
         ])
         result = regional_stocks._latest_company_status(df)
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["LastSeenDate"], pd.Timestamp("2026-08-10 08:00:00"))
-        self.assertEqual(result.iloc[0]["LastDelistingDate"], pd.Timestamp("2026-08-10 08:00:00"))
+
+
+class TestDelistingDatesByCode(unittest.TestCase):
+    def test_marks_delisting_notice_date(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        result = regional_stocks._delisting_dates_by_code(df)
+        self.assertEqual(result["93880"], pd.Timestamp("2026-08-01 08:00:00"))
+
+    def test_ordinary_disclosure_has_no_delisting_date(self):
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "自己株式の取得結果に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        result = regional_stocks._delisting_dates_by_code(df)
+        self.assertNotIn("93880", result)
+
+    def test_delisting_date_captured_even_when_markets_string_missing(self):
+        # 上場廃止の開示自体でmarkets_stringが欠損していても、
+        # was_known_regionalで既知の銘柄と分かれば取り逃さないことを確認する
+        # （_latest_company_status()はこのケースをmarkets_string不明として除外する）。
+        df = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-08-01 08:00:00", float("nan")),
+        ])
+        without_context = regional_stocks._delisting_dates_by_code(df)
+        self.assertNotIn("93880", without_context)
+
+        with_context = regional_stocks._delisting_dates_by_code(df, pd.Series([True], index=df.index))
+        self.assertEqual(with_context["93880"], pd.Timestamp("2026-08-01 08:00:00"))
+
+    def test_empty_input_returns_empty_dict(self):
+        self.assertEqual(regional_stocks._delisting_dates_by_code(pd.DataFrame()), {})
 
 
 class TestFetchRegionalSharePrice(unittest.TestCase):
@@ -572,6 +589,29 @@ class TestUpdateRegionalStore(unittest.TestCase):
 
         self.assertFalse(bool(result["company_status"].iloc[0]["IsDelisted"]))
         self.assertEqual(result["company_status"].iloc[0]["CurrentPrice"], 1234.0)
+
+    def test_delisting_with_missing_markets_string_still_marks_known_company(self):
+        # 既知の(=以前から地方単独上場として認識済みの)銘柄について、上場廃止
+        # 開示自体にmarkets_stringが欠損していても、IsDelistedが正しくTrueに
+        # なり株価取得の対象から外れることを確認する。
+        first_batch = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=first_batch), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(1824.0, "")):
+            regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        second_batch = pd.DataFrame([
+            _disclosure("2", "93880", "Ｑ－パパネッツ", "福岡証券取引所への上場廃止に関するお知らせ",
+                        "2026-09-01 08:00:00", float("nan")),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=second_batch), \
+                patch(f"{_MOD}.fetch_regional_share_price") as mock_fetch:
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 9, 1))
+
+        mock_fetch.assert_not_called()
+        self.assertTrue(bool(result["company_status"].iloc[0]["IsDelisted"]))
 
     def test_tokyo_disclosure_before_any_regional_evidence_is_not_misclassified(self):
         # 同じバッチ内で、東証関連の開示の方が地方単独上場の開示より前の

@@ -275,14 +275,49 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
-_STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate", "LastDelistingDate"]
+_STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate"]
+
+
+def _in_scope_mask(disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None) -> pd.Series:
+    """地方単独上場の開示、またはwas_known_regional（直前まで地方単独上場
+    だった銘柄）の開示かどうかを返す（markets_stringの有無は問わない）。
+    """
+    if disclosures_df.empty:
+        return pd.Series(dtype=bool)
+    is_currently_regional = disclosures_df["markets_string"].apply(is_regional_only)
+    was_known_regional = (
+        was_known_regional.reindex(disclosures_df.index, fill_value=False)
+        if was_known_regional is not None
+        else pd.Series(False, index=disclosures_df.index)
+    )
+    return is_currently_regional | was_known_regional
+
+
+def _delisting_dates_by_code(disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None = None) -> dict:
+    """地方単独上場（またはwas_known_regionalで分かる直前まで地方単独上場
+    だった）銘柄について、上場廃止関連開示の最終日をコードごとに返す。
+
+    markets_stringの有無は問わない。上場廃止の開示自体でmarkets_stringが
+    欠損していても上場廃止の事実を取り逃さないようにするため
+    （_latest_company_status()のhas_valid_markets要件とは意図的に独立させている）。
+    """
+    if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
+        return {}
+    in_scope = disclosures_df.loc[_in_scope_mask(disclosures_df, was_known_regional)]
+    if in_scope.empty:
+        return {}
+    dates = pd.to_datetime(in_scope["pubdate"], errors="coerce")
+    is_delisting_title = in_scope["title"].fillna("").str.contains(_DELISTING_KEYWORD)
+    delisting_dates = dates.where(is_delisting_title).dropna()
+    if delisting_dates.empty:
+        return {}
+    return delisting_dates.groupby(in_scope["company_code"].astype(str)).max().to_dict()
 
 
 def _latest_company_status(
     disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None = None
 ) -> pd.DataFrame:
-    """銘柄ごとの最新のmarkets_string・会社名・最終確認日・上場廃止関連開示の
-    最終日を集計する。
+    """銘柄ごとの最新のmarkets_string・会社名・最終確認日を集計する。
 
     地方単独上場の開示に加え、was_known_regional（compute_was_known_regional()
     の戻り値。直前まで地方単独上場だった銘柄）が東証を含む市場に移った開示も
@@ -292,37 +327,22 @@ def _latest_company_status(
     markets_stringが欠損している開示（会社コードは分かるがこの項目だけ
     空の回）は、有効な現在値を上書きしてしまわないよう対象から除外する
     （latestの選定に使わない。その回自体は無視され、直前の有効な値が
-    そのまま保持される）。
-
-    LastDelistingDateは「上場廃止」関連開示の最終日（無ければNaT）。
-    上場廃止時点のmarkets_stringはまだその取引所名を含むことがあるため、
-    markets_stringだけでは「今も地方単独上場中」と誤認してしまう。実際の
-    IsDelisted判定（後から再上場すれば解除される）はupdate_regional_store側で、
-    このLastDelistingDateとlisting_eventsの「上場」段階の最終日を比較して行う。
+    そのまま保持される）。上場廃止関連開示の最終日は_delisting_dates_by_code()
+    が別途、markets_stringの有無に関わらず集計する（上場廃止時点の開示に
+    markets_stringが欠損していてもLastDelistingDateを取り逃さないため）。
     """
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=_STATUS_COLUMNS)
 
-    df = disclosures_df.copy()
-    has_valid_markets = df["markets_string"].apply(lambda m: isinstance(m, str) and bool(m))
-    is_currently_regional = df["markets_string"].apply(is_regional_only)
-    was_known_regional = (
-        was_known_regional.reindex(df.index, fill_value=False)
-        if was_known_regional is not None
-        else pd.Series(False, index=df.index)
-    )
-    regional = df.loc[has_valid_markets & (is_currently_regional | was_known_regional)]
+    has_valid_markets = disclosures_df["markets_string"].apply(lambda m: isinstance(m, str) and bool(m))
+    regional = disclosures_df.loc[has_valid_markets & _in_scope_mask(disclosures_df, was_known_regional)]
     if regional.empty:
         return pd.DataFrame(columns=_STATUS_COLUMNS)
 
     df = regional.copy()
     df["Date"] = pd.to_datetime(df["pubdate"], errors="coerce")
     df = df.sort_values("Date")
-    is_delisting_title = df["title"].fillna("").str.contains(_DELISTING_KEYWORD)
-    delisting_dates = df["Date"].where(is_delisting_title)
-    last_delisting_by_code = delisting_dates.groupby(df["company_code"]).max()
     latest = df.groupby("company_code").tail(1).copy()
-    latest["LastDelistingDate"] = latest["company_code"].map(last_delisting_by_code)
     return latest.rename(columns={
         "company_code": "Code",
         "company_name": "CompanyName",
@@ -429,6 +449,10 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     new_listing = detect_regional_listing_events(new_disclosures, was_known_regional)
     new_major = detect_regional_major_events(new_disclosures)
     new_status = _latest_company_status(new_disclosures, was_known_regional)
+    # _latest_company_status()はmarkets_stringが有効な回だけを対象にするため、
+    # 上場廃止の開示自体でmarkets_stringが欠損しているケースを取り逃す。
+    # 上場廃止関連開示の最終日はmarkets_stringの有無に関わらず別途集計する。
+    new_delisting_dates = _delisting_dates_by_code(new_disclosures, was_known_regional)
 
     listing_events = (
         pd.concat([stores["listing_events"], new_listing], ignore_index=True)
@@ -456,11 +480,16 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     else:
         # 上場廃止関連開示の最終日を銘柄ごとに集約する（古い保存済み分も含めて
         # 最大値を取る。「直近の開示だけ」を見ると、上場廃止の後の何らかの
-        # 通常開示でLastDelistingDateがNaTに戻ってしまうため）。
+        # 通常開示でLastDelistingDateがNaTに戻ってしまうため）。new_delisting_dates
+        # （markets_string欠損のため上のconcatに乗っていない分）も合わせる。
         # Series.map()に空/datetime64のSeriesをそのまま渡すと内部の型変換で
         # 例外になることがあるためdictを介し、比較の前にto_datetimeで
         # datetime64に統一する。
         last_delisting_by_code = all_status.groupby("Code")["LastDelistingDate"].max().to_dict()
+        for code, date in new_delisting_dates.items():
+            existing = last_delisting_by_code.get(code)
+            if existing is None or pd.isna(existing) or date > existing:
+                last_delisting_by_code[code] = date
         company_status["LastDelistingDate"] = pd.to_datetime(company_status["Code"].map(last_delisting_by_code))
 
         # IsDelistedは「上場廃止関連開示の最終日」と「新規/重複上場が完了
