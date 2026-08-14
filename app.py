@@ -18,6 +18,7 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from src import excel_export
+from src.auth import check_password
 from src.jquants_client import JQuantsAuthError, JQuantsClient
 from src.pipeline import (
     RULE_LABELS,
@@ -56,30 +57,7 @@ except Exception:
 st.set_page_config(page_title="日本株スクリーニング", layout="wide")
 
 
-def _check_password() -> bool:
-    """クラウド公開時、無関係な人に開かれてAPIキー（レート制限）を消費されるのを
-    防ぐための簡易パスワード認証。secrets.tomlにapp_passwordが設定されていない
-    場合（ローカル実行等）は認証をスキップする。
-    """
-    try:
-        correct = st.secrets["app_password"]
-    except (KeyError, FileNotFoundError):
-        return True
-    if st.session_state.get("authenticated"):
-        return True
-
-    st.title("日本株スクリーニング")
-    password = st.text_input("パスワード", type="password")
-    if password:
-        if password == correct:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("パスワードが違います")
-    return False
-
-
-if not _check_password():
+if not check_password():
     st.stop()
 
 # 印刷時は入力欄・ボタン・サイドバー等を隠し、結果テーブルだけを表示する。
