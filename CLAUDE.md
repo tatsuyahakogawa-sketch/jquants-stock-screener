@@ -59,6 +59,13 @@ J-QuantsはJPX（東証グループ）提供のため、カバー範囲は**東�
 移籍後はJ-Quants側で完全に空欄になったが、実際は現役で取引されている
 （yfinanceでは`9388.T`ではなく`9388.F`サフィックスで現在値が取得できることを確認）。
 
+2026-08-13に判明: TDnet開示には`markets_string`列（東/福/名/札）があり、
+J-Quantsのマスタとは無関係に地方単独上場企業を特定できる。これを使って
+地方単独上場企業の新規上場・東証関連イベント・大型イベントを検出する
+「地方株」ページを`src/regional_stocks.py`として実装済み（README参照）。
+時価総額算出は上記の福証`.F`サフィックスのみで可能、名証・札証は
+yfinanceでも実機確認の上取得不可だった。
+
 ### 利用開始手順
 1. J-Quantsサイトでアカウント作成・サインイン
 2. ダッシュボードの「設定 > APIキー」からAPIキーを発行
@@ -97,6 +104,9 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `src/pipeline.py`: 取得〜判定〜銘柄単位集計(build_summary)〜市場データ付与(enrich_with_market_data)のオーケストレーション。時価総額/PER/PBR/配当利回り計算(compute_market_metrics)と上場日近似(estimate_listing_date)はexcel_export.pyと共用
 - `src/excel_export.py`: 銘柄コード→Excel自動生成。企業詳細・実行表とも、元のExcel（個人情報・実データを除いた汎用テンプレート化: `templates/company_detail_template.xlsx`, `templates/execution_table_template.xlsx`）のレイアウト・書式・数式をそのまま使い値だけを埋める方式。定性コメント欄はtdnet_client/edinet_clientの実データで埋め、市況解釈が必要な項目（価格が上下した理由）は空欄のまま
 - `scripts/inspect_schema.py`: J-QuantsレスポンスのカラムをAPI実物で確認する検証用スクリプト
+- `src/regional_stocks.py`: 「地方株」ページ用。地方取引所（札幌・福岡・名古屋）単独上場企業をTDnet開示の`markets_string`列（東/福/名/札）で特定し、新規上場・東証関連イベント・M&A等大型イベントを検出する。J-Quantsは地方取引所単独上場企業を対象としないため使用しない。時価総額は福証単独上場企業のみyfinanceの`.F`サフィックスで取得可（名証・札証・新規英数字コード銘柄は取得不可）。前回スキャン済み日付をキャッシュに保存し、次回はその翌日からだけ追加取得する
+- `src/auth.py`: Streamlitマルチページ間で共有するパスワード認証（元はapp.py内にあったものを切り出し）
+- `pages/地方株.py`: 上記のStreamlit UI
 
 ## 開発体制（Claude Code + Codexレビュー）
 
