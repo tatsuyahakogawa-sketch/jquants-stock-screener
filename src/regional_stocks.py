@@ -53,7 +53,7 @@ _YFINANCE_SUFFIX_BY_MARKET = {"福": "F"}
 # タイトルのキーワード一致による検出のため、実際の内容はUrl先で必ず確認すること
 # （既存のTDNET_TITLE_BASED_RULESと同じ注意点）。
 MAJOR_EVENT_KEYWORDS = [
-    "M&A", "買収", "子会社化", "TOB", "MBO", "資本業務提携", "出資",
+    "M&A", "買収", "子会社化", "TOB", "公開買付け", "公開買付", "MBO", "資本業務提携", "出資",
     "大型受注", "大型契約",
 ]
 
@@ -72,12 +72,22 @@ _MAJOR_EVENTS_COLUMNS = [
     "id", "Code", "CompanyName", "Date", "MarketsString", "Title", "Url", "MatchedKeyword",
 ]
 _COMPANY_STATUS_COLUMNS = [
-    "Code", "CompanyName", "MarketsString", "LastSeenDate", "IsDelisted", "CurrentPrice", "CurrentPriceNote",
+    "Code", "CompanyName", "MarketsString", "LastSeenDate", "LastDelistingDate",
+    "IsDelisted", "CurrentPrice", "CurrentPriceNote",
 ]
 
 _REQUIRED_DISCLOSURE_COLUMNS = {
     "id", "company_code", "company_name", "title", "pubdate", "markets_string", "document_url",
 }
+
+# TDnet・日本の取引所は日本時間基準のため、date.today()（サーバーのローカル時刻）
+# ではなく明示的にJSTで「今日」を求める。Streamlit CloudはUTCで動くことが多く、
+# 深夜0時〜朝9時(JST)の間はUTC基準のdate.today()が前日のままになってしまう。
+_JST = dt.timezone(dt.timedelta(hours=9))
+
+
+def _today_jst() -> dt.date:
+    return dt.datetime.now(_JST).date()
 
 
 def is_regional_only(markets_string) -> bool:
@@ -137,10 +147,13 @@ def _classify_listing_stage(title: str) -> str | None:
         return None
     if _LISTING_KEYWORD not in title:
         return None
-    if any(k in title for k in _APPLICATION_KEYWORDS):
-        return "申請"
+    # 承認を先に判定する。「上場申請の承認に関するお知らせ」のように、
+    # 承認の対象として"申請"という語が埋め込まれているタイトルがあり、
+    # 申請を先に判定すると承認済みの開示を格下げしてしまうため。
     if any(k in title for k in _APPROVAL_KEYWORDS):
         return "承認"
+    if any(k in title for k in _APPLICATION_KEYWORDS):
+        return "申請"
     if "上場のお知らせ" in title or "上場に関するお知らせ" in title or "上場について" in title:
         return "上場"
     return None
@@ -262,13 +275,14 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
-_STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate", "IsDelisted"]
+_STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate", "LastDelistingDate"]
 
 
 def _latest_company_status(
     disclosures_df: pd.DataFrame, was_known_regional: pd.Series | None = None
 ) -> pd.DataFrame:
-    """銘柄ごとの最新のmarkets_string・会社名・最終確認日・上場廃止有無を集計する。
+    """銘柄ごとの最新のmarkets_string・会社名・最終確認日・上場廃止関連開示の
+    最終日を集計する。
 
     地方単独上場の開示に加え、was_known_regional（compute_was_known_regional()
     の戻り値。直前まで地方単独上場だった銘柄）が東証を含む市場に移った開示も
@@ -280,9 +294,11 @@ def _latest_company_status(
     （latestの選定に使わない。その回自体は無視され、直前の有効な値が
     そのまま保持される）。
 
-    最新の開示が「上場廃止」に関するものであればIsDelisted=Trueとする
-    （上場廃止時点のmarkets_stringはまだその取引所名を含むことがあるため、
-    markets_stringだけでは「今も地方単独上場中」と誤認してしまう）。
+    LastDelistingDateは「上場廃止」関連開示の最終日（無ければNaT）。
+    上場廃止時点のmarkets_stringはまだその取引所名を含むことがあるため、
+    markets_stringだけでは「今も地方単独上場中」と誤認してしまう。実際の
+    IsDelisted判定（後から再上場すれば解除される）はupdate_regional_store側で、
+    このLastDelistingDateとlisting_eventsの「上場」段階の最終日を比較して行う。
     """
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=_STATUS_COLUMNS)
@@ -302,13 +318,11 @@ def _latest_company_status(
     df = regional.copy()
     df["Date"] = pd.to_datetime(df["pubdate"], errors="coerce")
     df = df.sort_values("Date")
-    # 上場廃止は終端的な状態として扱う。このバッチの中に1件でも上場廃止の
-    # 開示があれば、最新の開示がそれより後の通常開示であってもIsDelisted=True
-    # のままにする（そうしないと「最新の開示だけ」を見た場合にFalseへ戻る）。
     is_delisting_title = df["title"].fillna("").str.contains(_DELISTING_KEYWORD)
-    ever_delisted_in_batch = is_delisting_title.groupby(df["company_code"]).transform("any")
+    delisting_dates = df["Date"].where(is_delisting_title)
+    last_delisting_by_code = delisting_dates.groupby(df["company_code"]).max()
     latest = df.groupby("company_code").tail(1).copy()
-    latest["IsDelisted"] = ever_delisted_in_batch.loc[latest.index]
+    latest["LastDelistingDate"] = latest["company_code"].map(last_delisting_by_code)
     return latest.rename(columns={
         "company_code": "Code",
         "company_name": "CompanyName",
@@ -381,7 +395,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     地方単独上場企業の状況・上場イベント・大型イベントの保存済みデータに
     追記して返す（初回はREGIONAL_LISTING_LOOKBACK_YEARS年分を遡って取得）。
     """
-    today = today or dt.date.today()
+    today = today or _today_jst()
     watermark = _load_watermark()
     start = (
         watermark + dt.timedelta(days=1)
@@ -429,18 +443,35 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         .reset_index(drop=True)
     )
     all_status = pd.concat([stores["company_status"], new_status], ignore_index=True)
-    # 上場廃止は終端的な状態として扱う。上場廃止の開示より後に何らかの
-    # 通常開示（バッチ内の順序や、稀に廃止前後の事務的な開示等）があると
-    # 「直近の開示」だけを見た場合にIsDelisted=Falseへ戻ってしまうため、
-    # 一度でも上場廃止と判定された銘柄はTrueのまま保持する。
-    ever_delisted = all_status["IsDelisted"].fillna(False).astype(bool).groupby(all_status["Code"]).any()
     company_status = (
         all_status
         .sort_values("LastSeenDate")
         .drop_duplicates(subset=["Code"], keep="last")
         .reset_index(drop=True)
     )
-    company_status["IsDelisted"] = company_status["Code"].map(ever_delisted).fillna(False)
+
+    if company_status.empty:
+        company_status["LastDelistingDate"] = pd.Series(dtype="datetime64[ns]")
+        company_status["IsDelisted"] = pd.Series(dtype=bool)
+    else:
+        # 上場廃止関連開示の最終日を銘柄ごとに集約する（古い保存済み分も含めて
+        # 最大値を取る。「直近の開示だけ」を見ると、上場廃止の後の何らかの
+        # 通常開示でLastDelistingDateがNaTに戻ってしまうため）。
+        # Series.map()に空/datetime64のSeriesをそのまま渡すと内部の型変換で
+        # 例外になることがあるためdictを介し、比較の前にto_datetimeで
+        # datetime64に統一する。
+        last_delisting_by_code = all_status.groupby("Code")["LastDelistingDate"].max().to_dict()
+        company_status["LastDelistingDate"] = pd.to_datetime(company_status["Code"].map(last_delisting_by_code))
+
+        # IsDelistedは「上場廃止関連開示の最終日」と「新規/重複上場が完了
+        # した最終日」を比較して決める（後から再上場すれば解除される、
+        # 常にTrueに固定されるわけではない）。
+        listed_only = listing_events.loc[listing_events["Stage"] == "上場"] if not listing_events.empty else listing_events
+        last_relisting_by_code = listed_only.groupby("Code")["Date"].max().to_dict() if not listed_only.empty else {}
+        relisted_at = pd.to_datetime(company_status["Code"].map(last_relisting_by_code))
+        company_status["IsDelisted"] = company_status["LastDelistingDate"].notna() & (
+            relisted_at.isna() | (company_status["LastDelistingDate"] > relisted_at)
+        )
 
     # 現在も地方単独上場のままの銘柄だけ、株価(現在値)を更新する
     # （東証を含む市場に移った銘柄、および上場廃止済みの銘柄は対象外。
