@@ -86,10 +86,15 @@ def get_edinet_code(stock_code: str) -> str | None:
 
 
 def _get_documents_for_date(date: dt.date, key: str) -> list[dict]:
+    # 当日分はまだ提出が続いている途中の可能性があるため、キャッシュの
+    # 読み書き両方をスキップして毎回取り直す（キャッシュしてしまうと、
+    # その日の後で提出された書類を翌日まで拾えなくなる）。
+    is_today = date == today_jst()
     date_str = date.strftime("%Y%m%d")
-    cached = cache.load("edinet_documents", date_str)
-    if cached is not None:
-        return cached.to_dict("records")
+    if not is_today:
+        cached = cache.load("edinet_documents", date_str)
+        if cached is not None:
+            return cached.to_dict("records")
 
     resp = requests.get(
         f"{BASE_URL}/documents.json",
@@ -100,8 +105,9 @@ def _get_documents_for_date(date: dt.date, key: str) -> list[dict]:
         raise EdinetAuthError(f"EDINET認証に失敗しました（APIキーを確認してください）: {resp.text}")
     resp.raise_for_status()
     results = resp.json().get("results") or []
-    df = pd.DataFrame(results) if results else pd.DataFrame()
-    cache.save("edinet_documents", date_str, df)
+    if not is_today:
+        df = pd.DataFrame(results) if results else pd.DataFrame()
+        cache.save("edinet_documents", date_str, df)
     return results
 
 

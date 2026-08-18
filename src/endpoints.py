@@ -14,7 +14,21 @@ import pandas as pd
 from src import cache
 from src.config import LISTING_LOOKBACK_YEARS
 from src.jquants_client import JQuantsClient
-from src.jst import today_jst
+from src.jst import JST, today_jst
+
+
+def _financials_cache_date() -> dt.date:
+    """決算情報(/fins/summary)は18:00と24:30(=翌0:30)に更新されるため
+    (CLAUDE.md参照)、0:00〜0:29 JSTの間はまだその日の更新前とみなし、
+    キャッシュキーの日付を前日のままにする。today_jst()をそのまま使うと、
+    その30分間に取得した回だけ更新前のデータが「当日分」としてキャッシュ
+    されてしまい、24:30の更新後にリクエストしても同じ日のキャッシュキー
+    のせいで更新前のデータを引き続き返してしまう。
+    """
+    now = dt.datetime.now(JST)
+    if now.time() < dt.time(0, 30):
+        return (now - dt.timedelta(days=1)).date()
+    return now.date()
 
 
 def _daterange(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -79,7 +93,7 @@ def get_financials_by_code(client: JQuantsClient, code: str) -> pd.DataFrame:
     """指定銘柄の決算開示履歴(/v2/fins/summary?code=)を全件取得する（当日分をキャッシュ）。
     PER/PBR/配当利回り計算用の最新EPS・BPS・配当予想等を得るために使う。
     """
-    today_str = today_jst().strftime("%Y%m%d")
+    today_str = _financials_cache_date().strftime("%Y%m%d")
     cache_key = f"{code}_{today_str}"
     cached = cache.load("fins_by_code", cache_key)
     if cached is not None:
@@ -97,9 +111,10 @@ def get_price_history_by_code(client: JQuantsClient, code: str, lookback_years: 
     データ開始日（最も古い取得日）の両方をこの1回の取得結果から求める。
     当日分をキャッシュする。
     """
-    end = today_jst() - dt.timedelta(days=1)
+    today = today_jst()
+    end = today - dt.timedelta(days=1)
     start = end - dt.timedelta(days=365 * lookback_years)
-    today_str = today_jst().strftime("%Y%m%d")
+    today_str = today.strftime("%Y%m%d")
     cache_key = f"{code}_{lookback_years}y_{today_str}"
     cached = cache.load("price_history_by_code", cache_key)
     if cached is not None:
