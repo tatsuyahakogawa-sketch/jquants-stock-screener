@@ -379,14 +379,26 @@ def _latest_operating_margin(fins: pd.DataFrame) -> float | None:
     return float(row["OP"] / row["Sales"] * 100)
 
 
-def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> dict:
+def compute_market_metrics(
+    fins: pd.DataFrame,
+    price_history: pd.DataFrame,
+    fallback_price: float | None = None,
+    fallback_price_date: dt.date | None = None,
+) -> dict:
     """財務履歴と株価履歴から、時価総額・PER・PBR・配当利回り・最新終値等を計算する。
 
     enrich_with_market_data（銘柄集計テーブル用）とexcel_export（Excel出力用）の
     両方から呼ばれる共通ロジック。
+
+    地方単独上場企業等、J-Quantsに株価データが無い(price_historyが空の)銘柄
+    向けに、呼び出し側でyfinance等から取得した参考価格をfallback_priceとして
+    渡せる。その場合、EPS/BPS/発行済株式数はJ-Quants由来のまま、株価だけを
+    fallback_priceで補ってPER/PBR/配当利回り/時価総額を計算する
+    （price_sourceが"yfinance"になり、J-Quants実データとの区別ができる）。
     """
     latest_close = None
     latest_price_date = None
+    price_source = None
     if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
         price_history = price_history.copy()
         price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
@@ -394,6 +406,12 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         if not price_history.empty:
             latest_close = _to_numeric(price_history["C"]).iloc[-1]
             latest_price_date = price_history["Date"].iloc[-1]
+            price_source = "jquants"
+
+    if (latest_close is None or pd.isna(latest_close)) and fallback_price is not None and pd.notna(fallback_price):
+        latest_close = float(fallback_price)
+        latest_price_date = pd.Timestamp(fallback_price_date) if fallback_price_date is not None else None
+        price_source = "yfinance"
 
     feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
     feps_date = bps_date = div_ann_date = annualized_eps_date = None
@@ -457,6 +475,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
     return {
         "latest_close": latest_close,
         "latest_price_date": latest_price_date,
+        "price_source": price_source,
         "market_cap": market_cap,
         "per": per,
         "pbr": pbr,

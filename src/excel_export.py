@@ -15,8 +15,10 @@ from pathlib import Path
 
 import openpyxl
 import pandas as pd
+from openpyxl.comments import Comment
 
-from src import edinet_client, endpoints, pipeline
+from src import edinet_client, endpoints, pipeline, regional_stocks, tdnet_client
+from src.config import REGIONAL_LISTING_LOOKBACK_YEARS
 from src.jquants_client import JQuantsClient
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,54 @@ def _get_master_row(client: JQuantsClient, code: str) -> dict:
         candidates.add(code_str + "0")
     row = listed.loc[listed["Code"].astype(str).isin(candidates)]
     return row.iloc[0].to_dict() if not row.empty else {}
+
+
+def _regional_fallback_info(code: str) -> tuple[str, str | None]:
+    """equities/masterに載っていない銘柄（地方取引所単独上場等）向けに、
+    TDnet開示から会社名と直近の上場市場情報(markets_string)を補う。
+
+    地方単独上場企業の検出に使っているものと同じTDnetデータ（キャッシュ済み
+    分は再利用、無ければ取得）を使う。見つからない場合は("", None)を返す
+    （誤った推測値を出さない。README「地方株」セクション参照）。
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=365 * REGIONAL_LISTING_LOOKBACK_YEARS)
+    try:
+        disclosures = tdnet_client.get_disclosures_range(start, end)
+    except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
+        logger.info("[%s] TDnetからの会社名/市場情報の取得に失敗しました: %s", code, exc)
+        return "", None
+    if disclosures.empty or "company_code" not in disclosures.columns:
+        return "", None
+    # TDnetのcompany_codeもequities/masterと同じ5桁表記（4桁コードは英数字を
+    # 問わず末尾に"0"が付く。例: "231A"→"231A0"）で来ることがあるため、
+    # _get_master_rowと同じ候補突き合わせをする。
+    code_str = str(code)
+    candidates = {code_str}
+    if len(code_str) == 4:
+        candidates.add(code_str + "0")
+    rows = disclosures.loc[disclosures["company_code"].astype(str).isin(candidates)]
+    if rows.empty:
+        return "", None
+    rows = rows.copy()
+    rows["pubdate"] = pd.to_datetime(rows["pubdate"], errors="coerce")
+    latest = rows.sort_values("pubdate").iloc[-1]
+    name = latest.get("company_name") or ""
+    markets_string = latest.get("markets_string")
+    return str(name), (str(markets_string) if pd.notna(markets_string) else None)
+
+
+def _regional_fallback_price(code: str, markets_string: str | None) -> tuple[float | None, dt.date | None]:
+    """地方単独上場企業向けのyfinance株価フォールバック（現在値のみ、実機確認済み
+    な福証銘柄のみ成功しうる。src/regional_stocks.pyのfetch_regional_share_priceと
+    同じロジックを再利用する）。取得できない場合は(None, None)を返す。
+    """
+    if not markets_string:
+        return None, None
+    price, _note = regional_stocks.fetch_regional_share_price(code, markets_string)
+    if price is None:
+        return None, None
+    return price, dt.date.today()
 
 
 def _ensure_common_stock(master_row: dict, code: str) -> None:
@@ -117,6 +167,18 @@ def _latest_actual_fy_end(fins: pd.DataFrame) -> dt.date | None:
     return f["CurFYEn"].max().date()
 
 
+_YFINANCE_ESTIMATE_NOTE = (
+    "この値はJ-Quantsに株価データが無い銘柄（地方取引所単独上場等）向けに、"
+    "yfinance（非公式データ源）の現在値を使って計算した参考値です。"
+    "J-Quantsで検証された実績値ではありません。"
+)
+
+
+def _add_yfinance_note(ws, *cell_refs: str) -> None:
+    for ref in cell_refs:
+        ws[ref].comment = Comment(_YFINANCE_ESTIMATE_NOTE, "excel_export.py")
+
+
 def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     """銘柄コードから「企業詳細」シートを埋めたExcel(bytes)を生成する。"""
     code = str(code)
@@ -124,14 +186,27 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     _ensure_common_stock(master_row, code)
     fins = endpoints.get_financials_by_code(client, code)
     prices = endpoints.get_price_history_by_code(client, code)
-    metrics = pipeline.compute_market_metrics(fins, prices)
+
+    company_name = master_row.get("CoName", "")
+    regional_markets_string = None
+    if not master_row:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
+        # 市場情報を補う（README「地方株」セクション参照）。
+        company_name, regional_markets_string = _regional_fallback_info(code)
+
+    fallback_price = fallback_price_date = None
+    if prices.empty and regional_markets_string:
+        fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
+
+    metrics = pipeline.compute_market_metrics(fins, prices, fallback_price, fallback_price_date)
     listing_date, _recently_listed = pipeline.estimate_listing_date(prices)
+    used_yfinance = metrics.get("price_source") == "yfinance"
 
     wb = openpyxl.load_workbook(COMPANY_DETAIL_TEMPLATE)
     ws = wb["原本"]
 
     ws["B1"] = code
-    ws["E1"] = master_row.get("CoName", "")
+    ws["E1"] = company_name
 
     latest_fy_end = _latest_actual_fy_end(fins)
     if latest_fy_end is not None:
@@ -155,6 +230,9 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     latest_close = metrics["latest_close"]
     if latest_close is not None and pd.notna(latest_close):
         ws["B3"] = round(latest_close)
+
+    if used_yfinance:
+        _add_yfinance_note(ws, "E2", "I2", "M2", "Q2", "B3")
 
     if listing_date is not None:
         ws["F3"] = listing_date
@@ -223,7 +301,20 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     _ensure_common_stock(master_row, code)
     fins = endpoints.get_financials_by_code(client, code)
     prices_raw = endpoints.get_price_history_by_code(client, code)
-    metrics = pipeline.compute_market_metrics(fins, prices_raw)
+
+    company_name = master_row.get("CoName", "")
+    regional_markets_string = None
+    if not master_row:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
+        # 市場情報を補う（README「地方株」セクション参照）。
+        company_name, regional_markets_string = _regional_fallback_info(code)
+
+    fallback_price = fallback_price_date = None
+    if prices_raw.empty and regional_markets_string:
+        fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
+
+    metrics = pipeline.compute_market_metrics(fins, prices_raw, fallback_price, fallback_price_date)
+    used_yfinance = metrics.get("price_source") == "yfinance"
 
     prices = prices_raw.copy()
     if not prices.empty:
@@ -234,7 +325,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     ws = wb["1"]
 
     ws["B1"] = code
-    ws["C1"] = master_row.get("CoName", "")
+    ws["C1"] = company_name
     latest_fy_end = _latest_actual_fy_end(fins)
     if latest_fy_end is not None:
         ws["M1"] = latest_fy_end.month
@@ -251,6 +342,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         ws["O2"] = math.trunc(metrics["dividend_yield"] * 1000) / 10
     if metrics["latest_close"] is not None and pd.notna(metrics["latest_close"]):
         ws["B3"] = round(metrics["latest_close"])
+
+    if used_yfinance:
+        _add_yfinance_note(ws, "B2", "F2", "J2", "O2", "B3")
 
     required = {"CurFYEn", "CurPerType", "DiscDate", "Sales", "OdP"}
     if fins.empty or not required.issubset(fins.columns):
@@ -386,7 +480,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             sales_cell.value = math.floor(sales / 1e8)
             sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 1)
+            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 2)
         close = _nearest_close(prices, row["CurPerEn"])
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
@@ -400,7 +494,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.value = math.floor(sales / 1e8)
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 1)
+            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 2)
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
@@ -426,7 +520,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             cell.value = math.floor(fsales / 1e8)
             cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 1)
+            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 2)
 
     logger.info(
         "[%s] 会社予想EPS=%s 会社予想年間配当=%s 最新株価=%s PER=%s 配当利回り=%s 列割当=%s",
