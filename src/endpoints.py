@@ -14,6 +14,7 @@ import pandas as pd
 from src import cache
 from src.config import LISTING_LOOKBACK_YEARS
 from src.jquants_client import JQuantsClient
+from src.jst import today_jst
 
 
 def _daterange(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -78,7 +79,7 @@ def get_financials_by_code(client: JQuantsClient, code: str) -> pd.DataFrame:
     """指定銘柄の決算開示履歴(/v2/fins/summary?code=)を全件取得する（当日分をキャッシュ）。
     PER/PBR/配当利回り計算用の最新EPS・BPS・配当予想等を得るために使う。
     """
-    today_str = dt.date.today().strftime("%Y%m%d")
+    today_str = today_jst().strftime("%Y%m%d")
     cache_key = f"{code}_{today_str}"
     cached = cache.load("fins_by_code", cache_key)
     if cached is not None:
@@ -96,9 +97,9 @@ def get_price_history_by_code(client: JQuantsClient, code: str, lookback_years: 
     データ開始日（最も古い取得日）の両方をこの1回の取得結果から求める。
     当日分をキャッシュする。
     """
-    end = dt.date.today() - dt.timedelta(days=1)
+    end = today_jst() - dt.timedelta(days=1)
     start = end - dt.timedelta(days=365 * lookback_years)
-    today_str = dt.date.today().strftime("%Y%m%d")
+    today_str = today_jst().strftime("%Y%m%d")
     cache_key = f"{code}_{lookback_years}y_{today_str}"
     cached = cache.load("price_history_by_code", cache_key)
     if cached is not None:
