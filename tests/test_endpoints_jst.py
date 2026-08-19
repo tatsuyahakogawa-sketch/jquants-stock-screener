@@ -58,29 +58,51 @@ class TestGetPriceHistoryByCodeDateRange(unittest.TestCase):
         self.assertEqual(mock_today.call_count, 1)
 
 
-class TestFinancialsCacheDate(unittest.TestCase):
-    def test_before_0030_jst_uses_previous_day(self):
-        # 決算情報は18:00と24:30(=翌0:30)に更新されるため、0:00〜0:29 JSTの
-        # 間はまだ更新前とみなし、前日の日付をキャッシュキーに使う。
+class TestFinancialsCachePeriod(unittest.TestCase):
+    """決算情報は18:00と24:30(=翌0:30)の1日2回更新されるため、日付だけでなく
+    どちらの更新を反映済みかもキャッシュキーに含める必要がある
+    （日付だけだと18:00更新の前後で同じキーになり、更新前のデータを
+    18:00以降も返し続けてしまう）。
+    """
+
+    def test_before_0030_jst_shares_previous_days_pm_bucket(self):
+        # 0:00〜0:29は前日24:30更新がまだ反映されておらず、前日18:00更新
+        # 時点と内容が同じなので、前日日付+"pm"を共有する。
         fixed_now = dt.datetime(2026, 8, 19, 0, 15, tzinfo=endpoints.JST)
         with patch(f"{_MOD}.dt.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
-            result = endpoints._financials_cache_date()
-        self.assertEqual(result, dt.date(2026, 8, 18))
+            result = endpoints._financials_cache_period()
+        self.assertEqual(result, "20260818_pm")
 
-    def test_after_0030_jst_uses_current_day(self):
+    def test_after_0030_before_1800_uses_am_bucket(self):
         fixed_now = dt.datetime(2026, 8, 19, 0, 45, tzinfo=endpoints.JST)
         with patch(f"{_MOD}.dt.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
-            result = endpoints._financials_cache_date()
-        self.assertEqual(result, dt.date(2026, 8, 19))
+            result = endpoints._financials_cache_period()
+        self.assertEqual(result, "20260819_am")
 
-    def test_daytime_uses_current_day(self):
+    def test_daytime_before_1800_uses_am_bucket(self):
         fixed_now = dt.datetime(2026, 8, 19, 15, 0, tzinfo=endpoints.JST)
         with patch(f"{_MOD}.dt.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
-            result = endpoints._financials_cache_date()
-        self.assertEqual(result, dt.date(2026, 8, 19))
+            result = endpoints._financials_cache_period()
+        self.assertEqual(result, "20260819_am")
+
+    def test_after_1800_uses_pm_bucket(self):
+        # 18:00更新の前後で異なるバケットになり、更新前のキャッシュを
+        # 使い回さないことを確認する（今回のレビュー指摘の回帰テスト）。
+        fixed_now = dt.datetime(2026, 8, 19, 18, 30, tzinfo=endpoints.JST)
+        with patch(f"{_MOD}.dt.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            result = endpoints._financials_cache_period()
+        self.assertEqual(result, "20260819_pm")
+
+    def test_late_night_uses_pm_bucket(self):
+        fixed_now = dt.datetime(2026, 8, 19, 23, 30, tzinfo=endpoints.JST)
+        with patch(f"{_MOD}.dt.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            result = endpoints._financials_cache_period()
+        self.assertEqual(result, "20260819_pm")
 
 
 if __name__ == "__main__":

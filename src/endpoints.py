@@ -17,18 +17,29 @@ from src.jquants_client import JQuantsClient
 from src.jst import JST, today_jst
 
 
-def _financials_cache_date() -> dt.date:
-    """決算情報(/fins/summary)は18:00と24:30(=翌0:30)に更新されるため
-    (CLAUDE.md参照)、0:00〜0:29 JSTの間はまだその日の更新前とみなし、
-    キャッシュキーの日付を前日のままにする。today_jst()をそのまま使うと、
-    その30分間に取得した回だけ更新前のデータが「当日分」としてキャッシュ
-    されてしまい、24:30の更新後にリクエストしても同じ日のキャッシュキー
-    のせいで更新前のデータを引き続き返してしまう。
+def _financials_cache_period() -> str:
+    """決算情報(/fins/summary)は18:00と24:30(=翌0:30)の1日2回更新されるため
+    (CLAUDE.md参照)、単純な日付だけでなく「直近のどちらの更新を反映済みか」
+    もキャッシュキーに含める。today_jst()の日付だけを使うと、同じ日の
+    18:00更新の前後で同じキーになってしまい、更新前に一度取得すると
+    18:00を過ぎてリクエストしても更新前のデータを返し続けてしまう。
+
+    - 0:00〜0:29: 前日24:30更新はまだ反映されていない＝前日18:00更新時点と
+      同じ内容なので、前日日付+"pm"として前日18:00〜23:59の回と共有する
+    - 0:30〜17:59: 当日0:30更新は反映済み・18:00更新はまだ＝当日日付+"am"
+    - 18:00〜23:59: 当日18:00更新も反映済み＝当日日付+"pm"
     """
     now = dt.datetime.now(JST)
     if now.time() < dt.time(0, 30):
-        return (now - dt.timedelta(days=1)).date()
-    return now.date()
+        date = (now - dt.timedelta(days=1)).date()
+        period = "pm"
+    elif now.time() < dt.time(18, 0):
+        date = now.date()
+        period = "am"
+    else:
+        date = now.date()
+        period = "pm"
+    return f"{date.strftime('%Y%m%d')}_{period}"
 
 
 def _daterange(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -93,8 +104,7 @@ def get_financials_by_code(client: JQuantsClient, code: str) -> pd.DataFrame:
     """指定銘柄の決算開示履歴(/v2/fins/summary?code=)を全件取得する（当日分をキャッシュ）。
     PER/PBR/配当利回り計算用の最新EPS・BPS・配当予想等を得るために使う。
     """
-    today_str = _financials_cache_date().strftime("%Y%m%d")
-    cache_key = f"{code}_{today_str}"
+    cache_key = f"{code}_{_financials_cache_period()}"
     cached = cache.load("fins_by_code", cache_key)
     if cached is not None:
         return cached
