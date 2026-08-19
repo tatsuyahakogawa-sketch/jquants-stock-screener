@@ -1,12 +1,6 @@
-"""Streamlitマルチページ間で共有するパスワード認証・環境変数の初期化。
+"""パスワード認証・環境変数の初期化。
 
 app.pyの元々の実装をそのまま切り出したもの（挙動は変更していない）。
-Streamlitのpages/以下は個別にスクリプトが実行されるため、app.pyだけで
-認証・環境変数の橋渡しをしていると、pages/以下のURLへ直接アクセスされた
-場合（Streamlit Cloudの再デプロイ後に「地方株」ページのURLを直接開く等）
-に認証をバイパスできてしまったり、SUPABASE_URL等が未設定のまま動作して
-しまう。そのためapp.pyと各pages/*.pyの両方の先頭でbridge_env_secrets()・
-check_password()を呼ぶ。
 """
 from __future__ import annotations
 
