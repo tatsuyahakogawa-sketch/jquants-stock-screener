@@ -19,6 +19,7 @@ from src.config import (
     PROFIT_DOUBLING_YEARS,
 )
 from src.jquants_client import JQuantsClient
+from src.jst import today_jst
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +499,7 @@ def estimate_listing_date(
     不明とする（戻り値は (None, False)）。取得可能期間の開始日より明確に
     後ろから始まっている場合は、新規上場の可能性が高いとみなす。
     """
-    window_start = dt.date.today() - dt.timedelta(days=1) - dt.timedelta(days=365 * lookback_years)
+    window_start = today_jst() - dt.timedelta(days=1) - dt.timedelta(days=365 * lookback_years)
     if price_history.empty or "Date" not in price_history.columns:
         return None, None
 

@@ -24,6 +24,7 @@ import requests
 from lxml import etree
 
 from src import cache
+from src.jst import today_jst
 
 BASE_URL = "https://api.edinet-fsa.go.jp/api/v2"
 CODE_LIST_URL = "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/Edinetcode.zip"
@@ -52,7 +53,7 @@ def _api_key() -> str:
 
 def _load_code_list() -> pd.DataFrame:
     """証券コード→EDINETコードの対応表を取得する（認証不要、日次更新なので1日キャッシュ）。"""
-    today_str = dt.date.today().strftime("%Y%m%d")
+    today_str = today_jst().strftime("%Y%m%d")
     cached = cache.load("edinet_code_list", today_str)
     if cached is not None:
         return cached
@@ -85,10 +86,15 @@ def get_edinet_code(stock_code: str) -> str | None:
 
 
 def _get_documents_for_date(date: dt.date, key: str) -> list[dict]:
+    # 当日分はまだ提出が続いている途中の可能性があるため、キャッシュの
+    # 読み書き両方をスキップして毎回取り直す（キャッシュしてしまうと、
+    # その日の後で提出された書類を翌日まで拾えなくなる）。
+    is_today = date == today_jst()
     date_str = date.strftime("%Y%m%d")
-    cached = cache.load("edinet_documents", date_str)
-    if cached is not None:
-        return cached.to_dict("records")
+    if not is_today:
+        cached = cache.load("edinet_documents", date_str)
+        if cached is not None:
+            return cached.to_dict("records")
 
     resp = requests.get(
         f"{BASE_URL}/documents.json",
@@ -99,8 +105,9 @@ def _get_documents_for_date(date: dt.date, key: str) -> list[dict]:
         raise EdinetAuthError(f"EDINET認証に失敗しました（APIキーを確認してください）: {resp.text}")
     resp.raise_for_status()
     results = resp.json().get("results") or []
-    df = pd.DataFrame(results) if results else pd.DataFrame()
-    cache.save("edinet_documents", date_str, df)
+    if not is_today:
+        df = pd.DataFrame(results) if results else pd.DataFrame()
+        cache.save("edinet_documents", date_str, df)
     return results
 
 
@@ -113,7 +120,7 @@ def find_latest_yuho(edinet_code: str, fiscal_year_end: dt.date | None = None) -
     かさむので事前にfiscal_year_endを渡すことを推奨）。
     """
     key = _api_key()
-    today = dt.date.today()
+    today = today_jst()
     if fiscal_year_end is not None:
         window_start = fiscal_year_end + dt.timedelta(days=1)
         window_end = min(fiscal_year_end + dt.timedelta(days=130), today)

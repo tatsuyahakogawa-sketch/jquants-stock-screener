@@ -32,6 +32,7 @@ import pandas as pd
 
 from src import cache, tdnet_client
 from src.config import REGIONAL_LISTING_LOOKBACK_YEARS
+from src.jst import today_jst
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +81,6 @@ _REQUIRED_DISCLOSURE_COLUMNS = {
     "id", "company_code", "company_name", "title", "pubdate", "markets_string", "document_url",
 }
 
-# TDnet・日本の取引所は日本時間基準のため、date.today()（サーバーのローカル時刻）
-# ではなく明示的にJSTで「今日」を求める。Streamlit CloudはUTCで動くことが多く、
-# 深夜0時〜朝9時(JST)の間はUTC基準のdate.today()が前日のままになってしまう。
-_JST = dt.timezone(dt.timedelta(hours=9))
-
-
-def _today_jst() -> dt.date:
-    return dt.datetime.now(_JST).date()
 
 
 def is_regional_only(markets_string) -> bool:
@@ -415,7 +408,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
     地方単独上場企業の状況・上場イベント・大型イベントの保存済みデータに
     追記して返す（初回はREGIONAL_LISTING_LOOKBACK_YEARS年分を遡って取得）。
     """
-    today = today or _today_jst()
+    today = today or today_jst()
     watermark = _load_watermark()
     start = (
         watermark + dt.timedelta(days=1)
