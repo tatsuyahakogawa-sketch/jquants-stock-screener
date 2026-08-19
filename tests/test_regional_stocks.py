@@ -25,7 +25,7 @@ from src import regional_stocks
 _MOD = "src.regional_stocks"
 
 
-def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://example.com/x.pdf"):
+def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://example.com/x.pdf", url_xbrl=None):
     return {
         "id": id_,
         "company_code": code,
@@ -34,6 +34,7 @@ def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://ex
         "pubdate": pubdate,
         "markets_string": markets_string,
         "document_url": url,
+        "url_xbrl": url_xbrl,
     }
 
 
@@ -394,6 +395,135 @@ class TestFetchRegionalSharePrice(unittest.TestCase):
             price, note = regional_stocks.fetch_regional_share_price("93880", "福")
         self.assertIsNone(price)
         self.assertIn("取得不可", note)
+
+
+class TestFetchRegionalStatements(unittest.TestCase):
+    def test_filters_to_regional_tanshin_with_xbrl_within_lookback(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "2026年6月期 第1四半期決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+            # 東証を含む(地方単独上場ではない)ため対象外
+            _disclosure("2", "10000", "東証銘柄", "2026年6月期 決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "東", url_xbrl="https://example.com/2.zip"),
+            # 決算短信ではないため対象外
+            _disclosure("3", "33460", "ヒロタグループHD", "新工場設置に関するお知らせ",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/3.zip"),
+            # XBRL添付が無いため対象外
+            _disclosure("4", "33460", "ヒロタグループHD", "2026年6月期 決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl=None),
+            # REGIONAL_STATEMENTS_LOOKBACK_DAYSより古いため対象外
+            _disclosure("5", "33460", "ヒロタグループHD", "2026年3月期 決算短信〔日本基準〕(連結)",
+                        "2025-01-01 15:30:00", "名", url_xbrl="https://example.com/5.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 8, 13), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": 16_000_000.0, "OdP": 14_000_000.0, "NP": 216_000_000.0,
+             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None},
+        ]
+        with patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows) as mock_fetch:
+            result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+
+        mock_fetch.assert_called_once_with("https://example.com/1.zip", "33460", dt.date(2026, 8, 13))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["id"], "1_0")
+        self.assertEqual(result.iloc[0]["Code"], "33460")
+        self.assertListEqual(list(result.columns), regional_stocks._STATEMENTS_COLUMNS)
+
+    def test_missing_url_xbrl_column_returns_empty_without_error(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名"),
+        ]).drop(columns=["url_xbrl"])
+        result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertTrue(result.empty)
+        self.assertListEqual(list(result.columns), regional_stocks._STATEMENTS_COLUMNS)
+
+    def test_per_disclosure_fetch_failure_is_skipped_not_fatal(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+            _disclosure("2", "19990", "サイタHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-18 15:30:00", "福", url_xbrl="https://example.com/2.zip"),
+        ])
+        fake_row = [{
+            "Code": "19990", "DiscDate": dt.date(2026, 8, 18), "CurPerType": "FY",
+            "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+            "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None,
+            "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None,
+        }]
+        with patch(
+            f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows",
+            side_effect=[RuntimeError("boom"), fake_row],
+        ):
+            result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "19990")
+
+
+_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST = [
+    "id", "company_code", "company_name", "title", "pubdate", "markets_string", "document_url", "url_xbrl",
+]
+
+
+def _statement_row(code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None):
+    return {
+        "id": f"{code}_{per_end}", "Code": code, "DiscDate": disc_date, "CurPerType": per_type,
+        "CurPerEn": pd.Timestamp(per_end), "CurFYEn": pd.Timestamp(fy_end),
+        "Sales": sales, "OP": None, "OdP": None, "NP": None, "EqAR": eqar,
+        "FSales": None, "FOP": None, "FNP": None, "BPS": None,
+    }
+
+
+class TestScreenRegional(unittest.TestCase):
+    def test_selected_statement_rule_only(self):
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31", 378_000_000.0, eqar=0.34),
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2025-06-30", "2026-03-31", 100_000_000.0),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "33460", "CompanyName": "ヒロタグループHD", "MarketsString": "名",
+             "LastSeenDate": pd.Timestamp("2026-08-13")},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Code"], "33460")
+        self.assertEqual(hits.iloc[0]["CompanyName"], "ヒロタグループHD")
+        self.assertEqual(hits.iloc[0]["Rule"], "sales_growth_explosive")  # 278%増のため大幅ではなく爆発的側の閾値
+
+    def test_unselected_rule_is_not_evaluated(self):
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31", 378_000_000.0, eqar=0.99),
+        ])
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        self.assertTrue(hits.empty)  # equity_ratio_highを選んでいないため、EqAR=0.99でもヒットしない
+
+    def test_title_based_rule_uses_disclosures_df(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "Ｑ－ジオロケ", "新工場設置に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["new_facility_or_store"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Rule"], "new_facility_or_store")
+
+    def test_empty_selection_returns_empty_with_expected_columns(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, [])
+        self.assertTrue(hits.empty)
+        self.assertListEqual(
+            list(hits.columns), ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
+        )
 
 
 class TestUpdateRegionalStore(unittest.TestCase):

@@ -30,9 +30,24 @@ import logging
 
 import pandas as pd
 
-from src import cache, tdnet_client
-from src.config import REGIONAL_LISTING_LOOKBACK_YEARS
+from src import cache, rules, tdnet_client, tdnet_xbrl
+from src.config import (
+    REGIONAL_LISTING_LOOKBACK_YEARS,
+    REGIONAL_STATEMENTS_LOOKBACK_DAYS,
+)
 from src.jst import today_jst
+from src.pipeline import RULE_LABELS
+
+# 地方単独上場企業でも判定できる条件（株価が必要なストップ高・PBRは対象外。
+# 福証単独上場企業に限り別途対応予定）。財務諸表系はfetch_regional_statements()の
+# statements_df、TDnet開示タイトル系は通常のdisclosures_dfをそのまま使う。
+REGIONAL_STATEMENT_RULES = [
+    "sales_growth_major", "sales_growth_explosive", "equity_ratio_high",
+    "two_quarter_growth", "earnings_beat", "profit_doubling",
+]
+REGIONAL_TITLE_RULES = ["new_facility_or_store", "world_first", "large_order", "stock_split"]
+REGIONAL_NEGATIVE_RULE = "downward_revision"
+REGIONAL_APPLICABLE_RULES = REGIONAL_STATEMENT_RULES + REGIONAL_TITLE_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +58,7 @@ _STORE_ENDPOINT = "regional_stocks"
 _COMPANY_STATUS_KEY = "company_status"
 _LISTING_EVENTS_KEY = "listing_events"
 _MAJOR_EVENTS_KEY = "major_events"
+_STATEMENTS_KEY = "statements"
 _WATERMARK_KEY = "watermark"
 
 # yfinanceで現在値取得を実機確認済みのサフィックス（2026-08-13、9388で確認）。
@@ -76,6 +92,13 @@ _COMPANY_STATUS_COLUMNS = [
     "Code", "CompanyName", "MarketsString", "LastSeenDate", "LastDelistingDate",
     "IsDelisted", "CurrentPrice", "CurrentPriceNote",
 ]
+# src.rules内の各detect_*関数が前提とするJ-Quants由来の列名(STMT_*)と同じ形。
+# 財務条件(売上高増加・自己資本比率等)をrules.pyのロジックそのまま流用するため。
+_STATEMENTS_COLUMNS = [
+    "id", "Code", "DiscDate", "CurPerType", "CurPerEn", "CurFYEn",
+    "Sales", "OP", "OdP", "NP", "EqAR", "FSales", "FOP", "FNP", "BPS",
+]
+_DECISION_TANSHIN_TITLE_KEYWORD = "決算短信"
 
 _REQUIRED_DISCLOSURE_COLUMNS = {
     "id", "company_code", "company_name", "title", "pubdate", "markets_string", "document_url",
@@ -268,6 +291,109 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
+def fetch_regional_statements(disclosures_df: pd.DataFrame, today: dt.date | None = None) -> pd.DataFrame:
+    """地方単独上場企業の決算短信からXBRLサマリー情報を取得し、rules.pyの
+    各detect_*関数がそのまま使えるSTMT_*列のDataFrameを返す（当期行＋前年同期行。
+    src/tdnet_xbrl.py参照）。
+
+    TDnetの開示添付ファイルは公開から約1〜1.5ヶ月で取得できなくなるため
+    （src/tdnet_xbrl.py参照）、REGIONAL_STATEMENTS_LOOKBACK_DAYSより古い開示は
+    どうせ404になるだけなので、無駄なHTTPリクエストを避けるため最初から
+    対象外にする（新規上場・大型イベント検出用のREGIONAL_LISTING_LOOKBACK_YEARS
+    とは別軸の制約）。
+    """
+    if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=_STATEMENTS_COLUMNS)
+
+    today = today or today_jst()
+    cutoff = today - dt.timedelta(days=REGIONAL_STATEMENTS_LOOKBACK_DAYS)
+
+    df = disclosures_df.copy()
+    df["_pubdate_parsed"] = pd.to_datetime(df["pubdate"], errors="coerce")
+    is_regional = df["markets_string"].apply(is_regional_only)
+    is_tanshin = df["title"].fillna("").str.contains(_DECISION_TANSHIN_TITLE_KEYWORD)
+    has_xbrl = df["url_xbrl"].notna() if "url_xbrl" in df.columns else False
+    is_recent = df["_pubdate_parsed"].dt.date >= cutoff
+    target = df.loc[is_regional & is_tanshin & has_xbrl & is_recent]
+    if target.empty:
+        return pd.DataFrame(columns=_STATEMENTS_COLUMNS)
+
+    rows: list[dict] = []
+    for _, r in target.iterrows():
+        disclosed_date = r["_pubdate_parsed"].date() if pd.notna(r["_pubdate_parsed"]) else None
+        try:
+            fetched = tdnet_xbrl.fetch_tanshin_statement_rows(r["url_xbrl"], str(r["company_code"]), disclosed_date)
+        except Exception as exc:  # noqa: BLE001 -- 個別の決算短信1件のXBRL取得・パース失敗で全体を止めない
+            logger.info("[%s] 決算短信XBRLの取得に失敗しました: %s", r["company_code"], exc)
+            continue
+        for i, row in enumerate(fetched):
+            row["id"] = f"{r['id']}_{i}"
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=_STATEMENTS_COLUMNS)
+    return pd.DataFrame(rows)[_STATEMENTS_COLUMNS]
+
+
+def screen_regional(
+    disclosures_df: pd.DataFrame,
+    statements_df: pd.DataFrame,
+    company_status_df: pd.DataFrame,
+    selected_rules: list[str],
+) -> pd.DataFrame:
+    """地方単独上場企業について、REGIONAL_APPLICABLE_RULES(+除外用の
+    downward_revision)のうちselected_rulesに含まれる条件だけをsrc.rules.pyの
+    各detect_*関数でそのまま判定する。
+
+    戻り値はsrc.pipeline.run_screening()と同じ列形状(Code, CompanyName,
+    Sector, Rule, RuleLabel, Date, Detail)のため、pipeline.build_summary()に
+    そのまま渡せる（Sectorは業種データが無いため常に空文字）。
+
+    株価が必要な条件(ストップ高・PBR)は地方単独上場企業では判定できない
+    （福証単独上場企業のみ株価取得可能）ため対象外。
+    """
+    hits = []
+    if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive")):
+        hits.append(rules.detect_sales_growth(statements_df))
+    if "earnings_beat" in selected_rules:
+        hits.append(rules.detect_earnings_beat(statements_df))
+    if "equity_ratio_high" in selected_rules:
+        hits.append(rules.detect_equity_ratio(statements_df))
+    if "profit_doubling" in selected_rules:
+        hits.append(rules.detect_profit_doubling(statements_df))
+    if "two_quarter_growth" in selected_rules:
+        hits.append(rules.detect_two_quarter_growth(statements_df))
+    if REGIONAL_NEGATIVE_RULE in selected_rules:
+        hits.append(rules.detect_downward_revision(statements_df))
+    if "new_facility_or_store" in selected_rules:
+        hits.append(rules.detect_new_facility_or_store(disclosures_df))
+    if "world_first" in selected_rules:
+        hits.append(rules.detect_world_first(disclosures_df))
+    if "large_order" in selected_rules:
+        hits.append(rules.detect_large_order(disclosures_df))
+    if "stock_split" in selected_rules:
+        hits.append(rules.detect_stock_split(disclosures_df))
+
+    columns = ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
+    hits = [h for h in hits if not h.empty]
+    if not hits:
+        return pd.DataFrame(columns=columns)
+
+    result = pd.concat(hits, ignore_index=True)
+    result = result.rename(columns={"rule": "Rule", "detail": "Detail"})
+    result["Code"] = result["Code"].astype(str)
+
+    name_map: dict[str, str] = {}
+    if not company_status_df.empty:
+        name_map = dict(zip(company_status_df["Code"], company_status_df["CompanyName"]))
+    result["CompanyName"] = result["Code"].map(name_map).fillna("")
+    result["Sector"] = ""
+    result["RuleLabel"] = result["Rule"].map(RULE_LABELS).fillna(result["Rule"])
+    result["Date"] = pd.to_datetime(result["Date"])
+    result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
+    return result[columns]
+
+
 _STATUS_COLUMNS = ["Code", "CompanyName", "MarketsString", "LastSeenDate"]
 
 
@@ -400,6 +526,7 @@ def load_regional_store() -> dict[str, pd.DataFrame]:
         "company_status": _load_table(_COMPANY_STATUS_KEY, _COMPANY_STATUS_COLUMNS),
         "listing_events": _load_table(_LISTING_EVENTS_KEY, _LISTING_EVENTS_COLUMNS),
         "major_events": _load_table(_MAJOR_EVENTS_KEY, _MAJOR_EVENTS_COLUMNS),
+        "statements": _load_table(_STATEMENTS_KEY, _STATEMENTS_COLUMNS),
     }
 
 
@@ -441,6 +568,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
 
     new_listing = detect_regional_listing_events(new_disclosures, was_known_regional)
     new_major = detect_regional_major_events(new_disclosures)
+    new_statements = fetch_regional_statements(new_disclosures, today)
     new_status = _latest_company_status(new_disclosures, was_known_regional)
     # _latest_company_status()はmarkets_stringが有効な回だけを対象にするため、
     # 上場廃止の開示自体でmarkets_stringが欠損しているケースを取り逃す。
@@ -457,6 +585,12 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         pd.concat([stores["major_events"], new_major], ignore_index=True)
         .drop_duplicates(subset=["id"])
         .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    statements = (
+        pd.concat([stores["statements"], new_statements], ignore_index=True)
+        .drop_duplicates(subset=["id"])
+        .sort_values("DiscDate")
         .reset_index(drop=True)
     )
     all_status = pd.concat([stores["company_status"], new_status], ignore_index=True)
@@ -511,6 +645,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         cache.save(_STORE_ENDPOINT, _LISTING_EVENTS_KEY, listing_events),
         cache.save(_STORE_ENDPOINT, _MAJOR_EVENTS_KEY, major_events),
         cache.save(_STORE_ENDPOINT, _COMPANY_STATUS_KEY, company_status),
+        cache.save(_STORE_ENDPOINT, _STATEMENTS_KEY, statements),
     ]
     if all(saved):
         # todayその日のTDnet開示はまだ全件公開されていない可能性がある
@@ -523,4 +658,5 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         "company_status": company_status,
         "listing_events": listing_events,
         "major_events": major_events,
+        "statements": statements,
     }
