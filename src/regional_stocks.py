@@ -94,9 +94,12 @@ _COMPANY_STATUS_COLUMNS = [
 ]
 # src.rules内の各detect_*関数が前提とするJ-Quants由来の列名(STMT_*)と同じ形。
 # 財務条件(売上高増加・自己資本比率等)をrules.pyのロジックそのまま流用するため。
+# IsPrimaryはJ-Quants側には無い、tdnet_xbrl.py固有の列（実際の開示行か、開示に
+# 埋め込まれた前年同期実績・翌期予想の合成行かの区別。tdnet_xbrl.pyのモジュール
+# docstring参照）。
 _STATEMENTS_COLUMNS = [
     "id", "Code", "DiscDate", "CurPerType", "CurPerEn", "CurFYEn",
-    "Sales", "OP", "OdP", "NP", "EqAR", "FSales", "FOP", "FNP", "BPS",
+    "Sales", "OP", "OdP", "NP", "EqAR", "FSales", "FOP", "FNP", "BPS", "IsPrimary",
 ]
 _DECISION_TANSHIN_TITLE_KEYWORD = "決算短信"
 
@@ -291,7 +294,11 @@ def detect_regional_major_events(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     return result[_MAJOR_EVENTS_COLUMNS].reset_index(drop=True)
 
 
-def fetch_regional_statements(disclosures_df: pd.DataFrame, today: dt.date | None = None) -> pd.DataFrame:
+def fetch_regional_statements(
+    disclosures_df: pd.DataFrame,
+    today: dt.date | None = None,
+    was_known_regional: pd.Series | None = None,
+) -> pd.DataFrame:
     """地方単独上場企業の決算短信からXBRLサマリー情報を取得し、rules.pyの
     各detect_*関数がそのまま使えるSTMT_*列のDataFrameを返す（当期行＋前年同期行。
     src/tdnet_xbrl.py参照）。
@@ -301,6 +308,14 @@ def fetch_regional_statements(disclosures_df: pd.DataFrame, today: dt.date | Non
     どうせ404になるだけなので、無駄なHTTPリクエストを避けるため最初から
     対象外にする（新規上場・大型イベント検出用のREGIONAL_LISTING_LOOKBACK_YEARS
     とは別軸の制約）。
+
+    was_known_regional（compute_was_known_regional()の戻り値）を渡すと、
+    markets_stringが欠損している決算短信も、直前まで地方単独上場と分かって
+    いた銘柄であれば対象に含める。欠損時にそのまま除外すると、
+    update_regional_store()のウォーターマークが進んだ後は同じ開示が二度と
+    対象にならず、その四半期の財務データが永久に欠落する
+    （_latest_company_status()/_delisting_dates_by_code()で既に同種の欠損に
+    対応済みのパターンと同じ。2026-08-19のCodexレビューで指摘）。
     """
     if disclosures_df.empty or not _REQUIRED_DISCLOSURE_COLUMNS.issubset(disclosures_df.columns):
         return pd.DataFrame(columns=_STATEMENTS_COLUMNS)
@@ -311,6 +326,8 @@ def fetch_regional_statements(disclosures_df: pd.DataFrame, today: dt.date | Non
     df = disclosures_df.copy()
     df["_pubdate_parsed"] = pd.to_datetime(df["pubdate"], errors="coerce")
     is_regional = df["markets_string"].apply(is_regional_only)
+    if was_known_regional is not None:
+        is_regional = is_regional | was_known_regional.reindex(df.index, fill_value=False)
     is_tanshin = df["title"].fillna("").str.contains(_DECISION_TANSHIN_TITLE_KEYWORD)
     has_xbrl = df["url_xbrl"].notna() if "url_xbrl" in df.columns else False
     is_recent = df["_pubdate_parsed"].dt.date >= cutoff
@@ -335,6 +352,44 @@ def fetch_regional_statements(disclosures_df: pd.DataFrame, today: dt.date | Non
     return pd.DataFrame(rows)[_STATEMENTS_COLUMNS]
 
 
+def _latest_primary_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """銘柄ごとに最新の実際の開示行(IsPrimary=True。列が無ければ全行)だけを残す。
+
+    自己資本比率のような「現在の財務健全性」を見る判定に使う。開示に埋め込
+    まれた前年同期の実績や、過去の開示がたまたま閾値を満たしていても、
+    現在の状態としては扱わないようにするため（本決算のprior_rowも
+    EqAR/BPSを持つため、cur_rowが閾値未満でもprior_rowが閾値以上だと誤って
+    「現在も健全」と判定してしまうケースがあった。2026-08-19のCodexレビューで
+    指摘、実データで確認）。
+    """
+    if statements_df.empty:
+        return statements_df
+    df = statements_df
+    if "IsPrimary" in df.columns:
+        df = df.loc[df["IsPrimary"].fillna(True)]
+    if df.empty or "DiscDate" not in df.columns or "Code" not in df.columns:
+        return df
+    df = df.copy()
+    df["_disc_date_parsed"] = pd.to_datetime(df["DiscDate"], errors="coerce")
+    df = df.sort_values("_disc_date_parsed")
+    return df.groupby("Code", as_index=False, group_keys=False).tail(1).drop(columns=["_disc_date_parsed"])
+
+
+def _currently_regional_codes(company_status_df: pd.DataFrame) -> set[str] | None:
+    """company_status_dfから、現在も地方単独上場のまま（東証移籍済み・上場廃止
+    済みではない）銘柄コードの集合を返す。company_status_dfが空の場合は
+    絞り込まない(None、企業ステータス情報が無い状態で誤って全件除外しないため)。
+    """
+    if company_status_df.empty:
+        return None
+    if "IsDelisted" in company_status_df.columns:
+        is_delisted = company_status_df["IsDelisted"].fillna(False).astype(bool)
+    else:
+        is_delisted = pd.Series(False, index=company_status_df.index)
+    still_regional = company_status_df["MarketsString"].apply(is_regional_only) & ~is_delisted
+    return set(company_status_df.loc[still_regional, "Code"].astype(str))
+
+
 def screen_regional(
     disclosures_df: pd.DataFrame,
     statements_df: pd.DataFrame,
@@ -351,14 +406,23 @@ def screen_regional(
 
     株価が必要な条件(ストップ高・PBR)は地方単独上場企業では判定できない
     （福証単独上場企業のみ株価取得可能）ため対象外。
+
+    statements_dfは、東証移籍済み・上場廃止済みの銘柄の過去分も蓄積され続ける
+    ため、company_status_df上で現在も地方単独上場と分かる銘柄だけに絞り込んで
+    から判定する（そうしないと、既に東証に移籍した銘柄の古い財務データが
+    「地方単独上場企業のみ」の結果に紛れ込む。2026-08-19のCodexレビューで指摘）。
     """
+    eligible_codes = _currently_regional_codes(company_status_df)
+    if eligible_codes is not None and not statements_df.empty:
+        statements_df = statements_df.loc[statements_df["Code"].astype(str).isin(eligible_codes)]
+
     hits = []
     if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive")):
         hits.append(rules.detect_sales_growth(statements_df))
     if "earnings_beat" in selected_rules:
         hits.append(rules.detect_earnings_beat(statements_df))
     if "equity_ratio_high" in selected_rules:
-        hits.append(rules.detect_equity_ratio(statements_df))
+        hits.append(rules.detect_equity_ratio(_latest_primary_statements(statements_df)))
     if "profit_doubling" in selected_rules:
         hits.append(rules.detect_profit_doubling(statements_df))
     if "two_quarter_growth" in selected_rules:
@@ -530,6 +594,36 @@ def load_regional_store() -> dict[str, pd.DataFrame]:
     }
 
 
+def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """同一銘柄・同一決算期(CurPerType, CurPerEn)について実際の開示行
+    (IsPrimary=True)が複数ある場合、最新のDiscDateの行だけを残す（訂正決算短信
+    はTDnet開示としては別ID・別行になるため、id基準の重複排除だけでは元の
+    数値の行が残ってしまう。2026-08-19のCodexレビューで指摘、実データでの
+    訂正事例は未確認だが仕組み上起こりうるため対応）。
+
+    IsPrimary=False（開示に埋め込まれた前年同期実績・翌期予想の合成行）は対象外
+    にする。翌年の開示のprior_rowと今年の開示のcur_rowが同じCurPerEnを指す
+    正当なケースがあり、これらは別々の開示イベントとしてどちらも必要なため
+    （このケースをここで統合すると、開示日ベースの時系列比較が壊れる）。
+    """
+    if statements_df.empty or "IsPrimary" not in statements_df.columns:
+        return statements_df
+    is_primary = statements_df["IsPrimary"].fillna(True)
+    primary = statements_df.loc[is_primary].copy()
+    other = statements_df.loc[~is_primary]
+    if primary.empty:
+        return statements_df
+
+    primary["_disc_date_parsed"] = pd.to_datetime(primary["DiscDate"], errors="coerce")
+    primary = primary.sort_values("_disc_date_parsed")
+    primary = (
+        primary.groupby(["Code", "CurPerType", "CurPerEn"], as_index=False, group_keys=False, dropna=False)
+        .tail(1)
+        .drop(columns=["_disc_date_parsed"])
+    )
+    return pd.concat([primary, other], ignore_index=True)
+
+
 def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFrame]:
     """前回スキャン済み日付の翌日から今日までのTDnet開示だけを追加取得し、
     地方単独上場企業の状況・上場イベント・大型イベントの保存済みデータに
@@ -568,7 +662,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
 
     new_listing = detect_regional_listing_events(new_disclosures, was_known_regional)
     new_major = detect_regional_major_events(new_disclosures)
-    new_statements = fetch_regional_statements(new_disclosures, today)
+    new_statements = fetch_regional_statements(new_disclosures, today, was_known_regional)
     new_status = _latest_company_status(new_disclosures, was_known_regional)
     # _latest_company_status()はmarkets_stringが有効な回だけを対象にするため、
     # 上場廃止の開示自体でmarkets_stringが欠損しているケースを取り逃す。
@@ -593,6 +687,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         .sort_values("DiscDate")
         .reset_index(drop=True)
     )
+    statements = _dedupe_superseded_statements(statements).sort_values("DiscDate").reset_index(drop=True)
     all_status = pd.concat([stores["company_status"], new_status], ignore_index=True)
     company_status = (
         all_status

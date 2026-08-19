@@ -43,10 +43,37 @@ CurPerType, CurPerEn, CurFYEn, Sales, OP, OdP, NP, EqAR, FSales, FOP, FNP)と
     入れると異なる時点の数値を同一視してしまうため、四半期報告の前年同期行では
     EqAR/BPSを取得しない(本決算報告の前年同期行は文字通り1年前の期末を指すため
     問題なく含める)
+  - 当期行(cur_row)には`IsPrimary=True`、開示に埋め込まれた前年同期の実績
+    (prior_row)や本決算行に付随する来期予想行(guidance_row)には`IsPrimary=False`
+    を付与する。これらの埋め込み行は「今回の開示という1つのイベント」の一部で
+    あり、実際に別の日に行われた開示ではないため、rules.detect_two_quarter_growth
+    のような「直前の開示と比べる」ロジックにそのまま混ぜると、実在しない開示が
+    間に挟まったかのように誤動作する(2026-08-19のCodexレビューで指摘、実際に
+    2期連続判定が常に不成立になることを確認)。J-Quants由来のデータ(1開示=1行)
+    にはこの列が無いため、rules.py側は列が無い場合は全行をIsPrimary相当として
+    扱う後方互換を維持する
+  - 本決算(FY)の開示には来期の通期予想(`NextYearDuration...ForecastMember`)も
+    含まれる。当期行のCurFYEnに紐付けると期がずれるため取得しないことは既述の
+    通りだが、この予想値自体は「翌期の会社予想の基準値」として、翌年のFY開示が
+    来るまで下方修正検知(rules.detect_downward_revision)の唯一の比較対象になる。
+    取得せず捨てると、翌期の最初の四半期開示でこの予想が下方修正されても
+    比較対象が無く検知できない(2026-08-19のCodexレビューで指摘)。そのため
+    CurFYEnを翌期に設定した予想専用の行(guidance_row、実績値は全てNone)として
+    別途抽出する
+
+検出できないこと（既知の制約）:
+  - 売上高の取得は`NetSales`タグのみを見ており、IFRS採用企業や銀行・保険・
+    不動産業等が使う`OperatingRevenue`等の代替タグには対応していない
+    （2026-08-19のCodexレビューで指摘）。地方単独上場企業は現状すべて
+    `NetSales`タグの実データで確認できているため、確認が取れるまでは
+    未検証のタグ名を推測で追加しない（CLAUDE.md「データの正確性を最優先」
+    「誤った推測値を出さない」）。該当企業が現れた場合、その決算短信のXBRLを
+    実データで確認した上でタグ候補に追加すること
 """
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 
 import pandas as pd
@@ -54,6 +81,13 @@ import requests
 from lxml import etree
 
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
+# TDnetの保持期限切れ(404)は再試行しても無駄だが、一時的なタイムアウト・
+# 接続エラー・5xxはネットワークの瞬断で起こりうるため、これらだけ短い間隔で
+# 数回再試行する（再試行しないと、その決算短信の財務データが永久に欠落する
+# ため。regional_stocks.fetch_regional_statements()参照。2026-08-19のCodex
+# レビューで指摘）。
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY_SECONDS = 2
 
 
 class TdnetXbrlError(Exception):
@@ -61,9 +95,22 @@ class TdnetXbrlError(Exception):
 
 
 def _download(url: str) -> bytes:
-    resp = requests.get(url, timeout=60, headers=_REQUEST_HEADERS)
-    resp.raise_for_status()
-    return resp.content
+    last_exc: requests.exceptions.RequestException | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        if attempt > 0:
+            time.sleep(_RETRY_DELAY_SECONDS)
+        try:
+            resp = requests.get(url, timeout=60, headers=_REQUEST_HEADERS)
+            resp.raise_for_status()
+            return resp.content
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and status < 500:
+                raise  # 404等、再試行しても解決しない恒久的なエラーは即座に諦める
+            last_exc = exc
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def _find_summary_ixbrl_name(names: list[str]) -> str | None:
@@ -187,6 +234,7 @@ def _extract_row(
     *,
     include_balance_sheet: bool,
     forecast_prefix: str | None,
+    is_primary: bool,
 ) -> dict | None:
     sales_elem, sales_ctx = _find_fact(facts, ["NetSales"], actual_prefix, "ResultMember")
     if sales_elem is None:
@@ -230,13 +278,57 @@ def _extract_row(
         "FOP": _fact_number(fop_elem) if fop_elem is not None else None,
         "FNP": _fact_number(fnp_elem) if fnp_elem is not None else None,
         "BPS": _fact_number(bps_elem) if bps_elem is not None else None,
+        "IsPrimary": is_primary,
+    }
+
+
+def _extract_guidance_row(
+    facts: dict[tuple[str, str], object],
+    code: str,
+    disclosed_date,
+    next_fy_end,
+) -> dict | None:
+    """本決算(FY)開示に含まれる来期の通期会社予想(NextYearDuration...
+    ForecastMember)だけを抽出し、CurFYEnを翌期に設定した予想専用の行として返す
+    （実績値(Sales/OP/OdP/NP/EqAR/BPS)は全てNone）。予想値が1つも無ければNone。
+    IsPrimary=False（モジュールdocstring参照。実在の開示ではなく、当期の開示に
+    埋め込まれた翌期予想であるため）。
+    """
+    fsales_elem, _ = _find_fact(facts, ["NetSales"], "NextYearDuration", "ForecastMember")
+    fop_elem, _ = _find_fact(facts, ["OperatingIncome"], "NextYearDuration", "ForecastMember")
+    fnp_elem, _ = _find_fact(
+        facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], "NextYearDuration", "ForecastMember"
+    )
+    fsales = _fact_number(fsales_elem) if fsales_elem is not None else None
+    fop = _fact_number(fop_elem) if fop_elem is not None else None
+    fnp = _fact_number(fnp_elem) if fnp_elem is not None else None
+    if fsales is None and fop is None and fnp is None:
+        return None
+
+    return {
+        "Code": code,
+        "DiscDate": disclosed_date,
+        "CurPerType": "FY",
+        "CurPerEn": pd.NaT,
+        "CurFYEn": next_fy_end,
+        "Sales": None,
+        "OP": None,
+        "OdP": None,
+        "NP": None,
+        "EqAR": None,
+        "FSales": fsales,
+        "FOP": fop,
+        "FNP": fnp,
+        "BPS": None,
+        "IsPrimary": False,
     }
 
 
 def parse_tanshin_summary_rows(zip_bytes: bytes, code: str, disclosed_date) -> list[dict]:
     """決算短信サマリー情報XBRLのzipバイト列を、rules.pyのSTMT_*列と同じ形の
-    行のリストに変換する。当期分に加え、開示に埋め込まれている前年同期の
-    実績も1行として抽出するため、最大2行(当期→前年同期の順)を返す
+    行のリストに変換する。当期分(IsPrimary=True)に加え、開示に埋め込まれている
+    前年同期の実績(IsPrimary=False)、本決算の場合はさらに来期予想
+    (IsPrimary=False)も1行として抽出するため、最大3行を返す
     （モジュールdocstring参照。パースできない/必要なタグが無い場合は空リスト）。
     """
     try:
@@ -278,7 +370,7 @@ def parse_tanshin_summary_rows(zip_bytes: bytes, code: str, disclosed_date) -> l
 
     cur_row = _extract_row(
         facts, contexts, code, disclosed_date, cur_period_type, cur_prefix,
-        include_balance_sheet=True, forecast_prefix=forecast_prefix,
+        include_balance_sheet=True, forecast_prefix=forecast_prefix, is_primary=True,
     )
     if cur_row is None:
         return []
@@ -287,11 +379,16 @@ def parse_tanshin_summary_rows(zip_bytes: bytes, code: str, disclosed_date) -> l
 
     prior_row = _extract_row(
         facts, contexts, code, disclosed_date, cur_period_type, prior_prefix,
-        include_balance_sheet=not is_quarterly, forecast_prefix=None,
+        include_balance_sheet=not is_quarterly, forecast_prefix=None, is_primary=False,
     )
     if prior_row is not None:
         prior_row["CurFYEn"] = cur_fy_end - pd.DateOffset(years=1)
         rows.append(prior_row)
+
+    if not is_quarterly:
+        guidance_row = _extract_guidance_row(facts, code, disclosed_date, cur_fy_end + pd.DateOffset(years=1))
+        if guidance_row is not None:
+            rows.append(guidance_row)
 
     return rows
 

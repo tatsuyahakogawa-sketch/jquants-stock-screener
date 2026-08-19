@@ -419,7 +419,7 @@ class TestFetchRegionalStatements(unittest.TestCase):
             {"Code": "33460", "DiscDate": dt.date(2026, 8, 13), "CurPerType": "1Q",
              "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
              "Sales": 378_000_000.0, "OP": 16_000_000.0, "OdP": 14_000_000.0, "NP": 216_000_000.0,
-             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None},
+             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
         ]
         with patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows) as mock_fetch:
             result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
@@ -439,6 +439,32 @@ class TestFetchRegionalStatements(unittest.TestCase):
         self.assertTrue(result.empty)
         self.assertListEqual(list(result.columns), regional_stocks._STATEMENTS_COLUMNS)
 
+    def test_missing_markets_string_included_via_was_known_regional(self):
+        # markets_stringが欠損している決算短信でも、was_known_regionalで直前
+        # まで地方単独上場と分かっていれば対象に含める。含めないと、
+        # update_regional_store()のウォーターマークが進んだ後は同じ開示が
+        # 二度と対象にならず、その四半期の財務データが永久に欠落する
+        # （_latest_company_status/_delisting_dates_by_codeと同種の欠損対応）。
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", float("nan"), url_xbrl="https://example.com/1.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 8, 13), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": 16_000_000.0, "OdP": 14_000_000.0, "NP": 216_000_000.0,
+             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
+        ]
+        without_context = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertTrue(without_context.empty)
+
+        with patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows):
+            with_context = regional_stocks.fetch_regional_statements(
+                disclosures, today=dt.date(2026, 8, 19), was_known_regional=pd.Series([True], index=disclosures.index)
+            )
+        self.assertEqual(len(with_context), 1)
+        self.assertEqual(with_context.iloc[0]["Code"], "33460")
+
     def test_per_disclosure_fetch_failure_is_skipped_not_fatal(self):
         disclosures = pd.DataFrame([
             _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
@@ -450,7 +476,7 @@ class TestFetchRegionalStatements(unittest.TestCase):
             "Code": "19990", "DiscDate": dt.date(2026, 8, 18), "CurPerType": "FY",
             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
             "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None,
-            "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None,
+            "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
         }]
         with patch(
             f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows",
@@ -466,12 +492,12 @@ _REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST = [
 ]
 
 
-def _statement_row(code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None):
+def _statement_row(code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None, is_primary=True):
     return {
-        "id": f"{code}_{per_end}", "Code": code, "DiscDate": disc_date, "CurPerType": per_type,
+        "id": f"{code}_{per_end}_{disc_date}", "Code": code, "DiscDate": disc_date, "CurPerType": per_type,
         "CurPerEn": pd.Timestamp(per_end), "CurFYEn": pd.Timestamp(fy_end),
         "Sales": sales, "OP": None, "OdP": None, "NP": None, "EqAR": eqar,
-        "FSales": None, "FOP": None, "FNP": None, "BPS": None,
+        "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": is_primary,
     }
 
 
@@ -524,6 +550,115 @@ class TestScreenRegional(unittest.TestCase):
         self.assertListEqual(
             list(hits.columns), ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
         )
+
+    def test_equity_ratio_uses_latest_statement_only(self):
+        # 本決算のprior_row(前年同期)がEqARを持つケース。当期(最新)のEqARが
+        # 閾値未満でも、古いprior_rowが閾値以上だと誤ってヒットしていた回帰
+        # テスト（2026-08-19のCodexレビューで指摘、実データで確認）。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, eqar=0.50, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=False),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "19990", "CompanyName": "サイタHD", "MarketsString": "福",
+             "LastSeenDate": pd.Timestamp("2026-08-18")},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["equity_ratio_high"])
+        self.assertTrue(hits.empty)  # 最新(当期)は50%のため60%閾値に届かない
+
+    def test_excludes_companies_no_longer_regional(self):
+        # company_status上で既に東証移籍済み(MarketsStringに"東"を含む)の銘柄は、
+        # statements_dfに古い財務データが残っていても地方株の財務条件結果には
+        # 含めない（2026-08-19のCodexレビューで指摘、実データで確認）。
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31",
+                            378_000_000.0, eqar=0.34, is_primary=True),
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2025-06-30", "2026-03-31",
+                            100_000_000.0, is_primary=False),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "33460", "CompanyName": "ヒロタグループHD", "MarketsString": "東名",
+             "LastSeenDate": pd.Timestamp("2026-08-13"), "IsDelisted": False},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        self.assertTrue(hits.empty)
+
+
+class TestLatestPrimaryStatements(unittest.TestCase):
+    def test_keeps_only_latest_primary_row_per_company(self):
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, eqar=0.50, is_primary=True),
+            _statement_row("19990", dt.date(2025, 8, 20), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=False),
+        ])
+        result = regional_stocks._latest_primary_statements(statements)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result.iloc[0]["EqAR"], 0.50)
+
+    def test_empty_input_returns_empty(self):
+        result = regional_stocks._latest_primary_statements(pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS))
+        self.assertTrue(result.empty)
+
+
+class TestCurrentlyRegionalCodes(unittest.TestCase):
+    def test_excludes_tokyo_and_delisted(self):
+        company_status = pd.DataFrame([
+            {"Code": "1", "MarketsString": "福", "IsDelisted": False},
+            {"Code": "2", "MarketsString": "東福", "IsDelisted": False},
+            {"Code": "3", "MarketsString": "名", "IsDelisted": True},
+        ])
+        result = regional_stocks._currently_regional_codes(company_status)
+        self.assertEqual(result, {"1"})
+
+    def test_missing_is_delisted_column_treated_as_not_delisted(self):
+        company_status = pd.DataFrame([{"Code": "1", "MarketsString": "福"}])
+        result = regional_stocks._currently_regional_codes(company_status)
+        self.assertEqual(result, {"1"})
+
+    def test_empty_input_returns_none(self):
+        self.assertIsNone(regional_stocks._currently_regional_codes(pd.DataFrame()))
+
+
+class TestDedupeSupersededStatements(unittest.TestCase):
+    def test_keeps_latest_primary_row_for_same_period(self):
+        # 訂正決算短信で同じ期(CurPerType, CurPerEn)の実際の開示行(IsPrimary=True)
+        # が複数ある場合、最新のDiscDateだけを残す。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 25), "FY", "2026-06-30", "2026-06-30",
+                            7_050_000_000.0, is_primary=True),  # 訂正後の数値
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Sales"], 7_050_000_000.0)
+
+    def test_does_not_merge_synthetic_rows_from_different_disclosures(self):
+        # 今年の開示のprior_row(前年同期の合成行)と、去年の開示のcur_rowが
+        # 同じCurPerEnを指すのは正当なケースであり、統合してはいけない
+        # （開示日ベースの時系列比較が壊れるため）。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2025, 8, 20), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, is_primary=False),
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 2)
+
+    def test_missing_isprimary_column_returns_unchanged(self):
+        statements = pd.DataFrame([{"Code": "1", "CurPerType": "FY", "CurPerEn": pd.Timestamp("2026-06-30")}])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 1)
 
 
 class TestUpdateRegionalStore(unittest.TestCase):

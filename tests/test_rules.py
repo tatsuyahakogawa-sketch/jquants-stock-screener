@@ -1,0 +1,68 @@
+"""src/rules.py の単体テスト。
+
+実行方法:
+    python -m unittest discover tests
+"""
+from __future__ import annotations
+
+import unittest
+
+import pandas as pd
+
+from src import rules
+
+
+def _row(code, per_type, per_end, disc_date, sales, odp, is_primary=None):
+    row = {
+        "Code": code, "CurPerType": per_type, "CurPerEn": pd.Timestamp(per_end),
+        "DiscDate": pd.Timestamp(disc_date), "Sales": sales, "OdP": odp,
+    }
+    if is_primary is not None:
+        row["IsPrimary"] = is_primary
+    return row
+
+
+class TestDetectTwoQuarterGrowth(unittest.TestCase):
+    def test_hit_uses_only_primary_rows_for_the_disclosure_sequence(self):
+        # src/tdnet_xbrl.pyの合成行(IsPrimary=False。開示に埋め込まれた前年
+        # 同期実績)が「直前の開示」判定に混ざると、実在しない開示が間に
+        # 挟まったことになり2期連続判定が常に不成立になっていた回帰テスト
+        # （2026-08-19のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            # 1Q(今年)の開示: 当期行+開示に埋め込まれた前年同期の合成行
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 120, 12, is_primary=True),
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),
+            # 2Q(今年)の開示: 当期行+開示に埋め込まれた前年同期の合成行
+            _row("1234", "2Q", "2026-09-30", "2026-11-10", 250, 25, is_primary=True),
+            _row("1234", "2Q", "2025-09-30", "2026-11-10", 200, 20, is_primary=False),
+        ])
+        result = rules.detect_two_quarter_growth(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-11-10"))
+
+    def test_single_real_disclosure_is_not_two_in_a_row(self):
+        # 実際の開示が1回しか無い場合（合成行を含めても）、2期連続は成立しない。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 120, 12, is_primary=True),
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),
+        ])
+        result = rules.detect_two_quarter_growth(statements)
+        self.assertTrue(result.empty)
+
+    def test_without_isprimary_column_behaves_as_before(self):
+        # J-Quants由来のデータ(1開示=1行、IsPrimary列なし)では、全行を対象にした
+        # 従来通りの挙動が変わらないことを確認する（後方互換の回帰テスト）。
+        statements = pd.DataFrame([
+            _row("5678", "1Q", "2024-06-30", "2024-08-10", 90, 9),
+            _row("5678", "2Q", "2024-09-30", "2024-11-10", 180, 18),
+            _row("5678", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("5678", "2Q", "2025-09-30", "2025-11-10", 210, 21),
+        ])
+        result = rules.detect_two_quarter_growth(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2025-11-10"))
+
+
+if __name__ == "__main__":
+    unittest.main()

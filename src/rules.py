@@ -383,6 +383,15 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     （detect_sales_growthと同じ手法）。「2期連続」は、対象の開示とその銘柄の
     時系列上ひとつ前の開示（決算期タイプが変わってもよい。例: 1Q→2Q）の
     両方が増収増益であることを見る。
+
+    statements_dfに`IsPrimary`列がある場合（src/tdnet_xbrl.py経由の地方株データ。
+    実際の開示ではなく、開示に埋め込まれた前年同期実績・翌期予想の合成行を
+    IsPrimary=Falseで含む）、「直前の開示」の判定はIsPrimary=True（実際にその日
+    行われた開示）の行だけを対象にする。合成行を混ぜたまま時系列で1つ前を
+    見ると、実在しない開示が間に挟まったことになり2期連続判定が常に不成立に
+    なる（2026-08-19のCodexレビューで指摘、実データで確認）。J-Quants由来の
+    データ(1開示=1行、IsPrimary列なし)ではこの列が無いため全行を対象にする
+    既存動作のまま変わらない。
     """
     required = {
         STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_DISCLOSED_DATE,
@@ -412,11 +421,14 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 「2期連続」判定のため、銘柄内を時系列(開示日)順に並べ直して直前の開示と比較する
-    df = df.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
-    df["prev_grew_yoy"] = df.groupby(STMT_CODE)["grew_yoy"].shift(1)
-    two_in_a_row = df["grew_yoy"] & df["prev_grew_yoy"].fillna(False)
+    # （IsPrimary列がある場合は実際の開示行のみを対象にする。上のdocstring参照）
+    seq = df.loc[df["IsPrimary"].fillna(True)] if "IsPrimary" in df.columns else df
+    seq = seq.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
+    seq = seq.copy()
+    seq["prev_grew_yoy"] = seq.groupby(STMT_CODE)["grew_yoy"].shift(1)
+    two_in_a_row = seq["grew_yoy"] & seq["prev_grew_yoy"].fillna(False)
 
-    hit = df.loc[two_in_a_row].copy()
+    hit = seq.loc[two_in_a_row].copy()
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 

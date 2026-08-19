@@ -188,15 +188,23 @@ def render_regional_section() -> None:
         if not summary.empty:
             if exclude_downward_regional:
                 summary = summary[~summary["HasDownwardRevision"]]
-            summary = summary[summary["MatchedCount"] >= 1]
+            # MatchedCountはbuild_summary()が全ルールについて集計した値のため、
+            # ユーザーが選んでいない条件（例: sales_growth_majorのみ選択時に
+            # 実際は閾値50%以上でsales_growth_explosive側にラベル付けされた行）
+            # まで含んでしまう。選択した条件だけで数え直す（app.py内の通常
+            # スクリーニングのMatchedCountSelectedと同じ方式。2026-08-19の
+            # Codexレビューで指摘: これをしないと「合致した条件」欄が空欄の
+            # まま表示されることがあった）。
+            summary["MatchedCountSelected"] = summary[[f"{r}_matched" for r in selected_statement_rules]].sum(axis=1)
+            summary = summary[summary["MatchedCountSelected"] >= 1]
             summary["MatchedConditions"] = summary.apply(
                 lambda row: "、".join(RULE_LABELS[r] for r in selected_statement_rules if row[f"{r}_matched"]),
                 axis=1,
             )
 
         display = (
-            summary[["Code", "CompanyName", "MatchedCount", "MatchedConditions"]]
-            .rename(columns={"MatchedCount": "合致数", "MatchedConditions": "合致した条件"})
+            summary[["Code", "CompanyName", "MatchedCountSelected", "MatchedConditions"]]
+            .rename(columns={"MatchedCountSelected": "合致数", "MatchedConditions": "合致した条件"})
             .sort_values("合致数", ascending=False)
             if not summary.empty else summary
         )

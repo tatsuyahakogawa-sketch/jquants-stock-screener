@@ -15,6 +15,9 @@ import sys
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -128,7 +131,7 @@ def _q1_fixture() -> bytes:
     return _make_zip(fragments)
 
 
-def _fy_fixture() -> bytes:
+def _fy_fixture(*, include_guidance: bool = True) -> bytes:
     fragments = [
         _nonnumeric("tse-ed-t:FiscalYearEnd", "CurrentYearInstant", "2026-06-30"),
         _nonfraction(
@@ -159,10 +162,6 @@ def _fy_fixture() -> bytes:
             "tse-ed-t:CapitalAdequacyRatio", "PriorYearInstant_ConsolidatedMember_ResultMember", "62.1",
             scale="-2",
         ),
-        # 来期予想(CurFYEnとは別の期を指すため、パース結果には含まれないはず)
-        _nonfraction(
-            "tse-ed-t:NetSales", "NextYearDuration_ConsolidatedMember_ForecastMember", "6800", scale="6"
-        ),
         _context("CurrentYearInstant", instant="2026-06-30"),
         _context(
             "CurrentYearDuration_ConsolidatedMember_ResultMember", start="2025-07-01", end="2026-06-30",
@@ -173,7 +172,26 @@ def _fy_fixture() -> bytes:
         ),
         _context("PriorYearInstant_ConsolidatedMember_ResultMember", instant="2025-06-30"),
     ]
+    if include_guidance:
+        # 来期予想(当期行のCurFYEnとは別の期を指すため当期行には含まれないが、
+        # 翌期予想専用の合成行(guidance_row)としては抽出されるはず)
+        fragments += [
+            _nonfraction(
+                "tse-ed-t:NetSales", "NextYearDuration_ConsolidatedMember_ForecastMember", "6800", scale="6"
+            ),
+            _nonfraction(
+                "tse-ed-t:OperatingIncome", "NextYearDuration_ConsolidatedMember_ForecastMember", "550", scale="6"
+            ),
+            _nonfraction(
+                "tse-ed-t:ProfitAttributableToOwnersOfParent",
+                "NextYearDuration_ConsolidatedMember_ForecastMember", "450", scale="6",
+            ),
+        ]
     return _make_zip(fragments)
+
+
+def _fy_fixture_without_guidance() -> bytes:
+    return _fy_fixture(include_guidance=False)
 
 
 class TestParseTanshinSummaryRowsQuarterly(unittest.TestCase):
@@ -203,6 +221,10 @@ class TestParseTanshinSummaryRowsQuarterly(unittest.TestCase):
 
     def test_current_row_bps_absent_is_none_not_fabricated(self):
         self.assertIsNone(self.rows[0]["BPS"])
+
+    def test_current_and_prior_rows_are_primary_and_synthetic_respectively(self):
+        self.assertTrue(self.rows[0]["IsPrimary"])
+        self.assertFalse(self.rows[1]["IsPrimary"])
 
     def test_prior_row_sign_attribute_applied_as_loss(self):
         prior = self.rows[1]
@@ -234,8 +256,9 @@ class TestParseTanshinSummaryRowsFiscalYear(unittest.TestCase):
     def setUp(self):
         self.rows = tdnet_xbrl.parse_tanshin_summary_rows(_fy_fixture(), "19990", dt.date(2026, 8, 18))
 
-    def test_returns_current_and_prior_rows(self):
-        self.assertEqual(len(self.rows), 2)
+    def test_returns_current_prior_and_guidance_rows(self):
+        # 当期行・前年同期行に加え、来期予想専用の合成行(guidance_row)の3行。
+        self.assertEqual(len(self.rows), 3)
 
     def test_current_row_period_type_is_fy(self):
         self.assertEqual(self.rows[0]["CurPerType"], "FY")
@@ -253,12 +276,34 @@ class TestParseTanshinSummaryRowsFiscalYear(unittest.TestCase):
         self.assertIsNone(cur["FOP"])
         self.assertIsNone(cur["FNP"])
 
+    def test_current_and_prior_rows_are_primary_and_synthetic_respectively(self):
+        self.assertTrue(self.rows[0]["IsPrimary"])
+        self.assertFalse(self.rows[1]["IsPrimary"])
+
     def test_prior_row_fy_includes_balance_sheet_figures(self):
         # 本決算の前年同期行は文字通り1年前の期末を指すため、EqAR等を含めてよい。
         prior = self.rows[1]
         self.assertEqual(prior["Sales"], 7_841_000_000.0)
         self.assertAlmostEqual(prior["EqAR"], 0.621)
         self.assertEqual(prior["CurFYEn"].date(), dt.date(2025, 6, 30))
+
+    def test_guidance_row_captures_next_year_forecast(self):
+        # 来期予想は当期行(CurFYEn=2026-06-30)には含まれず、CurFYEnを
+        # 翌期(2027-06-30)に設定した予想専用行として抽出される
+        # （rules.detect_downward_revision等の下方修正検知の基準値になる）。
+        guidance = self.rows[2]
+        self.assertFalse(guidance["IsPrimary"])
+        self.assertEqual(guidance["CurFYEn"].date(), dt.date(2027, 6, 30))
+        self.assertEqual(guidance["FSales"], 6_800_000_000.0)
+        self.assertEqual(guidance["FOP"], 550_000_000.0)
+        self.assertEqual(guidance["FNP"], 450_000_000.0)
+        self.assertIsNone(guidance["Sales"])
+        self.assertIsNone(guidance["NP"])
+
+    def test_guidance_row_absent_when_no_next_year_forecast_present(self):
+        # 来期予想のタグが全く無い決算短信では、guidance_rowを追加しない。
+        rows = tdnet_xbrl.parse_tanshin_summary_rows(_fy_fixture_without_guidance(), "19990", dt.date(2026, 8, 18))
+        self.assertEqual(len(rows), 2)
 
 
 class TestParseTanshinSummaryRowsGracefulFailure(unittest.TestCase):
@@ -278,6 +323,62 @@ class TestParseTanshinSummaryRowsGracefulFailure(unittest.TestCase):
         self.assertEqual(
             tdnet_xbrl.parse_tanshin_summary_rows(_make_zip(fragments), "00000", dt.date(2026, 1, 1)), []
         )
+
+
+class TestDownloadRetry(unittest.TestCase):
+    """一時的なネットワーク障害（タイムアウト・接続エラー・5xx）の再試行と、
+    恒久的なエラー（404等のTDnet保持期限切れ）を即座に諦める挙動を検証する
+    （2026-08-19のCodexレビューで指摘: 再試行が無いと、たまたま一時的な障害に
+    当たった決算短信の財務データが永久に欠落していた）。
+    """
+
+    def test_retries_on_connection_error_then_succeeds(self):
+        ok_resp = MagicMock()
+        ok_resp.content = b"data"
+        ok_resp.raise_for_status = MagicMock()
+        with patch(
+            "src.tdnet_xbrl.requests.get",
+            side_effect=[requests.exceptions.ConnectionError("boom"), ok_resp],
+        ) as mock_get, patch("src.tdnet_xbrl.time.sleep"):
+            result = tdnet_xbrl._download("https://example.com/x.zip")
+        self.assertEqual(result, b"data")
+        self.assertEqual(mock_get.call_count, 2)
+
+    def test_gives_up_after_max_attempts(self):
+        with (
+            patch("src.tdnet_xbrl.requests.get", side_effect=requests.exceptions.ConnectionError("boom")) as mock_get,
+            patch("src.tdnet_xbrl.time.sleep"),
+            self.assertRaises(requests.exceptions.ConnectionError),
+        ):
+            tdnet_xbrl._download("https://example.com/x.zip")
+        self.assertEqual(mock_get.call_count, tdnet_xbrl._MAX_ATTEMPTS)
+
+    def test_404_is_not_retried(self):
+        resp = MagicMock()
+        resp.status_code = 404
+        bad_resp = MagicMock()
+        bad_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        with (
+            patch("src.tdnet_xbrl.requests.get", return_value=bad_resp) as mock_get,
+            patch("src.tdnet_xbrl.time.sleep") as mock_sleep,
+            self.assertRaises(requests.exceptions.HTTPError),
+        ):
+            tdnet_xbrl._download("https://example.com/x.zip")
+        self.assertEqual(mock_get.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_500_is_retried(self):
+        resp = MagicMock()
+        resp.status_code = 500
+        bad_resp = MagicMock()
+        bad_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        with (
+            patch("src.tdnet_xbrl.requests.get", return_value=bad_resp) as mock_get,
+            patch("src.tdnet_xbrl.time.sleep"),
+            self.assertRaises(requests.exceptions.HTTPError),
+        ):
+            tdnet_xbrl._download("https://example.com/x.zip")
+        self.assertEqual(mock_get.call_count, tdnet_xbrl._MAX_ATTEMPTS)
 
 
 if __name__ == "__main__":
