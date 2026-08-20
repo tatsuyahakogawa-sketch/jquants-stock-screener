@@ -186,6 +186,9 @@ def _fy_fixture(*, include_guidance: bool = True) -> bytes:
                 "tse-ed-t:ProfitAttributableToOwnersOfParent",
                 "NextYearDuration_ConsolidatedMember_ForecastMember", "450", scale="6",
             ),
+            _context(
+                "NextYearDuration_ConsolidatedMember_ForecastMember", start="2026-07-01", end="2027-06-30",
+            ),
         ]
     return _make_zip(fragments)
 
@@ -304,6 +307,59 @@ class TestParseTanshinSummaryRowsFiscalYear(unittest.TestCase):
         # 来期予想のタグが全く無い決算短信では、guidance_rowを追加しない。
         rows = tdnet_xbrl.parse_tanshin_summary_rows(_fy_fixture_without_guidance(), "19990", dt.date(2026, 8, 18))
         self.assertEqual(len(rows), 2)
+
+    def test_guidance_row_omitted_when_forecast_context_end_date_unresolvable(self):
+        # CurFYEnは予想ファクト自身のcontextRefから取得する。対応するcontext
+        # 定義が無く期末日を特定できない場合、当期のCurFYEnに+1年した決め打ち
+        # 値は使わず、guidance_row自体を追加しない（2026-08-19のCodexレビューで
+        # 指摘: 決算期変更で来期が12ヶ月ちょうどでない場合、+1年の決め打ちは
+        # 実際の予想対象期間とずれるため）。
+        fragments = [
+            _nonnumeric("tse-ed-t:FiscalYearEnd", "CurrentYearInstant", "2026-06-30"),
+            _nonfraction(
+                "tse-ed-t:NetSales", "CurrentYearDuration_ConsolidatedMember_ResultMember", "7035", scale="6"
+            ),
+            _nonfraction(
+                "tse-ed-t:NetSales", "NextYearDuration_ConsolidatedMember_ForecastMember", "6800", scale="6"
+            ),
+            _context("CurrentYearInstant", instant="2026-06-30"),
+            _context(
+                "CurrentYearDuration_ConsolidatedMember_ResultMember", start="2025-07-01", end="2026-06-30",
+            ),
+            # NextYearDuration_ConsolidatedMember_ForecastMemberのcontext定義を
+            # 意図的に置かない。
+        ]
+        rows = tdnet_xbrl.parse_tanshin_summary_rows(_make_zip(fragments), "19990", dt.date(2026, 8, 18))
+        self.assertEqual(len(rows), 1)  # 当期行のみ、guidance_rowは追加されない
+
+
+class TestParseTanshinSummaryRowsConsolidationScope(unittest.TestCase):
+    def test_does_not_mix_consolidated_sales_with_nonconsolidated_operating_income(self):
+        # 売上高が連結で見つかった場合、営業利益は同じ連結スコープの値だけを
+        # 対象にする。単体側にしか営業利益が無くても、それを連結の売上高と
+        # 混在させて1行にまとめない（2026-08-19のCodexレビューで指摘:
+        # スコープが異なる数値を1行に混在させると、増収率等の比較が
+        # 会計上意味を持たない数値の組み合わせになってしまう）。
+        fragments = [
+            _nonnumeric("tse-ed-t:FiscalYearEnd", "CurrentYearInstant", "2026-06-30"),
+            _nonfraction(
+                "tse-ed-t:NetSales", "CurrentYearDuration_ConsolidatedMember_ResultMember", "7035", scale="6"
+            ),
+            # 営業利益は単体(NonConsolidated)側にしか無い(連結側は欠損)という
+            # 通常起こりにくいが起こりうる想定のケース
+            _nonfraction(
+                "tse-ed-t:OperatingIncome", "CurrentYearDuration_NonConsolidatedMember_ResultMember", "999",
+                scale="6",
+            ),
+            _context("CurrentYearInstant", instant="2026-06-30"),
+            _context(
+                "CurrentYearDuration_ConsolidatedMember_ResultMember", start="2025-07-01", end="2026-06-30",
+            ),
+        ]
+        rows = tdnet_xbrl.parse_tanshin_summary_rows(_make_zip(fragments), "19990", dt.date(2026, 8, 18))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Sales"], 7_035_000_000.0)
+        self.assertIsNone(rows[0]["OP"])  # 連結側の営業利益が無いため、単体側を混ぜて埋めない
 
 
 class TestParseTanshinSummaryRowsGracefulFailure(unittest.TestCase):

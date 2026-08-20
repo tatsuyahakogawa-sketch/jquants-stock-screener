@@ -215,6 +215,14 @@ def detect_world_first(disclosures_df: pd.DataFrame) -> pd.DataFrame:
 def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一の決算期タイプ(TypeOfCurrentPeriod)の前年同期と比べ、売上高が
     大幅(+20%以上) または 爆発的(+50%以上) に増えた開示の一覧。
+
+    +50%以上の増収は「大幅(+20%以上)」の条件も数値としては満たしているため、
+    両方のruleタグ(sales_growth_major, sales_growth_explosive)を持つ行として
+    それぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。以前は
+    growth_rateに応じて片方のタグだけを選んでいたため、"sales_growth_major"
+    （ラベル表記は「+20%以上」）だけを選択したユーザーの絞り込みから、実際には
+    +20%以上でもある60%成長の銘柄が漏れていた（2026-08-19のCodexレビューで
+    指摘、実データで確認）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_NET_SALES, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
@@ -236,12 +244,14 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
 
     growth = (df[STMT_NET_SALES] - df["prev_net_sales"]) / df["prev_net_sales"]
     df["growth_rate"] = growth
+    df["detail"] = "前年同期比 売上高 " + (df["growth_rate"] * 100).round(1).astype(str) + "% 増"
 
-    hit = df.loc[valid & (growth >= SALES_GROWTH_MAJOR_THRESHOLD)].copy()
-    hit["rule"] = hit["growth_rate"].apply(
-        lambda g: "sales_growth_explosive" if g >= SALES_GROWTH_EXPLOSIVE_THRESHOLD else "sales_growth_major"
-    )
-    hit["detail"] = "前年同期比 売上高 " + (hit["growth_rate"] * 100).round(1).astype(str) + "% 増"
+    hit_major = df.loc[valid & (growth >= SALES_GROWTH_MAJOR_THRESHOLD)].copy()
+    hit_major["rule"] = "sales_growth_major"
+    hit_explosive = df.loc[valid & (growth >= SALES_GROWTH_EXPLOSIVE_THRESHOLD)].copy()
+    hit_explosive["rule"] = "sales_growth_explosive"
+
+    hit = pd.concat([hit_major, hit_explosive], ignore_index=True)
     result = hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
         columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
     )

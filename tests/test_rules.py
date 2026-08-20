@@ -64,5 +64,32 @@ class TestDetectTwoQuarterGrowth(unittest.TestCase):
         self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2025-11-10"))
 
 
+class TestDetectSalesGrowth(unittest.TestCase):
+    def test_explosive_growth_also_tagged_as_major(self):
+        # sales_growth_major(ラベル表記「+20%以上」)は数値としては
+        # sales_growth_explosive(+50%以上)を包含するため、+50%以上の成長は
+        # 両方のruleタグを持つ行として返す。片方だけを選んだユーザーの絞り込み
+        # から、実際には+20%以上でもある爆発的成長銘柄が漏れないようにする
+        # ため（2026-08-19のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 160, 16),  # +60%
+        ])
+        result = rules.detect_sales_growth(statements)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(set(result["rule"]), {"sales_growth_major", "sales_growth_explosive"})
+        self.assertTrue((result["Code"] == "1234").all())
+        self.assertTrue((result["Date"] == pd.Timestamp("2026-08-10")).all())
+
+    def test_moderate_growth_tagged_as_major_only(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 13),  # +30%
+        ])
+        result = rules.detect_sales_growth(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["rule"], "sales_growth_major")
+
+
 if __name__ == "__main__":
     unittest.main()

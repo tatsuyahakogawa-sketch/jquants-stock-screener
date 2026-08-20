@@ -514,10 +514,14 @@ class TestScreenRegional(unittest.TestCase):
         disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
 
         hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
-        self.assertEqual(len(hits), 1)
-        self.assertEqual(hits.iloc[0]["Code"], "33460")
-        self.assertEqual(hits.iloc[0]["CompanyName"], "ヒロタグループHD")
-        self.assertEqual(hits.iloc[0]["Rule"], "sales_growth_explosive")  # 278%増のため大幅ではなく爆発的側の閾値
+        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)の両方の条件を数値として
+        # 満たす。detect_sales_growthは両方のruleタグを返す（rules.pyのdocstring
+        # 参照。"sales_growth_major"だけを選んでも、実際には+20%以上でもある
+        # 爆発的成長銘柄が漏れないようにするため）。
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive"})
+        self.assertTrue((hits["Code"] == "33460").all())
+        self.assertTrue((hits["CompanyName"] == "ヒロタグループHD").all())
 
     def test_unselected_rule_is_not_evaluated(self):
         statements = pd.DataFrame([

@@ -59,7 +59,24 @@ CurPerType, CurPerEn, CurFYEn, Sales, OP, OdP, NP, EqAR, FSales, FOP, FNP)と
     取得せず捨てると、翌期の最初の四半期開示でこの予想が下方修正されても
     比較対象が無く検知できない(2026-08-19のCodexレビューで指摘)。そのため
     CurFYEnを翌期に設定した予想専用の行(guidance_row、実績値は全てNone)として
-    別途抽出する
+    別途抽出する。CurFYEnは当期の+1年という決め打ちではなく、予想ファクト
+    自身のcontextRefが指す実際のend/instant日付を使う（決算期変更等で来期が
+    12ヶ月ちょうどでないケースに対応するため。2026-08-19のCodexレビューで指摘）
+  - 売上高・営業利益・経常利益・純利益・自己資本比率・1株純資産・予想値は、
+    売上高(NetSales)が見つかった連結/単体のどちらのスコープかを基準に、
+    残り全てを同じスコープからだけ取得する（1行内で連結の売上高と単体の
+    営業利益のような異なるスコープの数値が混在しないようにするため。
+    2026-08-19のCodexレビューで指摘・修正。実データ5社(3346, 1999, 63270,
+    38560, 75320)で従来通り正しく連結スコープが一貫して選ばれることを確認済み）
+  - `FiscalYearEnd`タグはiXBRLの日付変換書式(`format="ixt:dateyearmonthdaycjk"`
+    等、"2027年3月31日"のような表示用テキストを実際の値に変換する仕組み)を
+    使わず、常にISO形式("2026-06-30")のテキストがそのまま入っていることを
+    2026-08-19に実データ5社(3346, 1999, 63270, 38560, 75320)で確認済み
+    （Codexから「dateyearmonthdayjp等の変換書式を考慮していないため
+    日付が読めない場合がある」との指摘があったが、少なくともFiscalYearEndタグ
+    に関しては該当しないことを実データで確認した。他の日付系タグ
+    （株主総会予定日等）では実際にこの変換書式が使われていることも確認済みの
+    ため、将来別のタグを扱う場合は都度確認が必要）
 
 検出できないこと（既知の制約）:
   - 売上高の取得は`NetSales`タグのみを見ており、IFRS採用企業や銀行・保険・
@@ -69,6 +86,15 @@ CurPerType, CurPerEn, CurFYEn, Sales, OP, OdP, NP, EqAR, FSales, FOP, FNP)と
     未検証のタグ名を推測で追加しない（CLAUDE.md「データの正確性を最優先」
     「誤った推測値を出さない」）。該当企業が現れた場合、その決算短信のXBRLを
     実データで確認した上でタグ候補に追加すること
+  - 決算短信(`決算短信`をタイトルに含む開示)以外の財務情報は取得しない。
+    「業績予想の修正に関するお知らせ」のような単独の予想修正開示は対象外
+    （2026-08-19のCodexレビューで指摘）。そのため、決算短信を挟まずに単独で
+    公表された下方修正は、次の決算短信でその修正後の予想が改めて開示される
+    までrules.detect_downward_revision()では検知できない（検知が遅れるだけで
+    誤った数値を出すわけではないが、直近の下方修正が「下方修正歴なし」に
+    見えてしまう期間がありうる）。単独の予想修正開示が決算短信と同じ
+    構造化サマリーXBRL(タクソノミ・タグ名)を持つかは未確認のため、
+    確認が取れるまでは対象を広げない
 """
 from __future__ import annotations
 
@@ -208,20 +234,44 @@ def _find_fact(
     tag_candidates: list[str],
     context_prefix: str,
     required_substring: str,
+    *,
+    required_scope: str | None = None,
 ):
     """tag_candidatesのいずれか、かつcontextRefがcontext_prefixで始まり
     required_substringを含むファクトを探す。連結(Consolidated)を優先する。
     戻り値: (要素, 見つかったcontextRef)。無ければ(None, None)。
+
+    required_scope（"ConsolidatedMember"または"NonConsolidatedMember"）を
+    指定すると、そのスコープのcontextRefだけを対象にする。指定しないと
+    タグごとに独立して連結/単体を選んでしまい、例えば売上高は連結・
+    営業利益はそのタグだけ単体、のように1行内でスコープが混在した数値に
+    なりうる（2026-08-19のCodexレビューで指摘）。_extract_row()では
+    売上高で決まったスコープを他の全指標に対しても固定して使う。
     """
     matches = []
     for tag in tag_candidates:
         for (name, ctx), elem in facts.items():
-            if name == tag and ctx.startswith(context_prefix) and required_substring in ctx:
-                matches.append((_consolidation_rank(ctx), ctx, elem))
+            if name != tag or not ctx.startswith(context_prefix) or required_substring not in ctx:
+                continue
+            # "ConsolidatedMember"は"NonConsolidatedMember"の部分文字列のため、
+            # required_scope not in ctx という単純な包含チェックだと単体側の
+            # contextRefも連結スコープの条件を誤って満たしてしまう。_scope_of()
+            # の判定結果同士を比較する。
+            if required_scope is not None and _scope_of(ctx) != required_scope:
+                continue
+            matches.append((_consolidation_rank(ctx), ctx, elem))
     if not matches:
         return None, None
     matches.sort(key=lambda t: t[0])
     return matches[0][2], matches[0][1]
+
+
+def _scope_of(context_ref: str) -> str | None:
+    if "NonConsolidatedMember" in context_ref:
+        return "NonConsolidatedMember"
+    if "ConsolidatedMember" in context_ref:
+        return "ConsolidatedMember"
+    return None
 
 
 def _extract_row(
@@ -239,24 +289,27 @@ def _extract_row(
     sales_elem, sales_ctx = _find_fact(facts, ["NetSales"], actual_prefix, "ResultMember")
     if sales_elem is None:
         return None
-    op_elem, _ = _find_fact(facts, ["OperatingIncome"], actual_prefix, "ResultMember")
-    odp_elem, _ = _find_fact(facts, ["OrdinaryIncome"], actual_prefix, "ResultMember")
+    scope = _scope_of(sales_ctx)
+    op_elem, _ = _find_fact(facts, ["OperatingIncome"], actual_prefix, "ResultMember", required_scope=scope)
+    odp_elem, _ = _find_fact(facts, ["OrdinaryIncome"], actual_prefix, "ResultMember", required_scope=scope)
     np_elem, _ = _find_fact(
-        facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], actual_prefix, "ResultMember"
+        facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], actual_prefix, "ResultMember",
+        required_scope=scope,
     )
 
     eqar_elem = bps_elem = None
     if include_balance_sheet:
         instant_prefix = actual_prefix.replace("Duration", "Instant")
-        eqar_elem, _ = _find_fact(facts, ["CapitalAdequacyRatio"], instant_prefix, "ResultMember")
-        bps_elem, _ = _find_fact(facts, ["NetAssetsPerShare"], instant_prefix, "ResultMember")
+        eqar_elem, _ = _find_fact(facts, ["CapitalAdequacyRatio"], instant_prefix, "ResultMember", required_scope=scope)
+        bps_elem, _ = _find_fact(facts, ["NetAssetsPerShare"], instant_prefix, "ResultMember", required_scope=scope)
 
     fsales_elem = fop_elem = fnp_elem = None
     if forecast_prefix is not None:
-        fsales_elem, _ = _find_fact(facts, ["NetSales"], forecast_prefix, "ForecastMember")
-        fop_elem, _ = _find_fact(facts, ["OperatingIncome"], forecast_prefix, "ForecastMember")
+        fsales_elem, _ = _find_fact(facts, ["NetSales"], forecast_prefix, "ForecastMember", required_scope=scope)
+        fop_elem, _ = _find_fact(facts, ["OperatingIncome"], forecast_prefix, "ForecastMember", required_scope=scope)
         fnp_elem, _ = _find_fact(
-            facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], forecast_prefix, "ForecastMember"
+            facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], forecast_prefix, "ForecastMember",
+            required_scope=scope,
         )
 
     period_end = None
@@ -284,33 +337,65 @@ def _extract_row(
 
 def _extract_guidance_row(
     facts: dict[tuple[str, str], object],
+    contexts: dict[str, tuple[str | None, str | None, str | None]],
     code: str,
     disclosed_date,
-    next_fy_end,
 ) -> dict | None:
     """本決算(FY)開示に含まれる来期の通期会社予想(NextYearDuration...
-    ForecastMember)だけを抽出し、CurFYEnを翌期に設定した予想専用の行として返す
+    ForecastMember)だけを抽出し、CurFYEnを翌期の予想専用の行として返す
     （実績値(Sales/OP/OdP/NP/EqAR/BPS)は全てNone）。予想値が1つも無ければNone。
     IsPrimary=False（モジュールdocstring参照。実在の開示ではなく、当期の開示に
     埋め込まれた翌期予想であるため）。
+
+    CurFYEnは当期のCurFYEnに単純に+1年するのではなく、予想ファクト自身の
+    contextRefが指すend/instant日付をそのまま使う。決算期変更等で来期が
+    12ヶ月ちょうどでない場合、+1年で決め打ちすると実際の予想対象期間と
+    ずれてしまうため（2026-08-19のCodexレビューで指摘）。対応するcontextRefが
+    見つからない場合はCurFYEn=NaTとし、以降のFY単位の突き合わせでは無視
+    される（誤った期に紐付けるより安全なため、決め打ちの代替値は使わない）。
     """
-    fsales_elem, _ = _find_fact(facts, ["NetSales"], "NextYearDuration", "ForecastMember")
-    fop_elem, _ = _find_fact(facts, ["OperatingIncome"], "NextYearDuration", "ForecastMember")
-    fnp_elem, _ = _find_fact(
+    fsales_elem, fsales_ctx = _find_fact(facts, ["NetSales"], "NextYearDuration", "ForecastMember")
+    fop_elem, fop_ctx = _find_fact(facts, ["OperatingIncome"], "NextYearDuration", "ForecastMember")
+    fnp_elem, fnp_ctx = _find_fact(
         facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], "NextYearDuration", "ForecastMember"
     )
+    anchor_ctx = fsales_ctx or fop_ctx or fnp_ctx
+    if anchor_ctx is None:
+        return None
+
+    # 売上高予想のスコープ(連結/単体)を基準に、営業利益・純利益予想も同じ
+    # スコープだけを対象にする（_extract_row()と同じ理由。スコープ混在防止）。
+    scope = _scope_of(anchor_ctx)
+    if scope is not None:
+        fsales_elem, fsales_ctx = _find_fact(
+            facts, ["NetSales"], "NextYearDuration", "ForecastMember", required_scope=scope
+        )
+        fop_elem, fop_ctx = _find_fact(
+            facts, ["OperatingIncome"], "NextYearDuration", "ForecastMember", required_scope=scope
+        )
+        fnp_elem, fnp_ctx = _find_fact(
+            facts, ["ProfitAttributableToOwnersOfParent", "NetIncome"], "NextYearDuration", "ForecastMember",
+            required_scope=scope,
+        )
+        anchor_ctx = fsales_ctx or fop_ctx or fnp_ctx
+
     fsales = _fact_number(fsales_elem) if fsales_elem is not None else None
     fop = _fact_number(fop_elem) if fop_elem is not None else None
     fnp = _fact_number(fnp_elem) if fnp_elem is not None else None
     if fsales is None and fop is None and fnp is None:
         return None
 
+    next_fy_end = None
+    if anchor_ctx and anchor_ctx in contexts:
+        _start, end, instant = contexts[anchor_ctx]
+        next_fy_end = end or instant
+
     return {
         "Code": code,
         "DiscDate": disclosed_date,
         "CurPerType": "FY",
         "CurPerEn": pd.NaT,
-        "CurFYEn": next_fy_end,
+        "CurFYEn": pd.to_datetime(next_fy_end, errors="coerce") if next_fy_end else pd.NaT,
         "Sales": None,
         "OP": None,
         "OdP": None,
@@ -386,8 +471,8 @@ def parse_tanshin_summary_rows(zip_bytes: bytes, code: str, disclosed_date) -> l
         rows.append(prior_row)
 
     if not is_quarterly:
-        guidance_row = _extract_guidance_row(facts, code, disclosed_date, cur_fy_end + pd.DateOffset(years=1))
-        if guidance_row is not None:
+        guidance_row = _extract_guidance_row(facts, contexts, code, disclosed_date)
+        if guidance_row is not None and pd.notna(guidance_row["CurFYEn"]):
             rows.append(guidance_row)
 
     return rows
