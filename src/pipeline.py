@@ -393,8 +393,13 @@ def compute_market_metrics(
     地方単独上場企業等、J-Quantsに株価データが無い(price_historyが空の)銘柄
     向けに、呼び出し側でyfinance等から取得した参考価格をfallback_priceとして
     渡せる。その場合、EPS/BPS/発行済株式数はJ-Quants由来のまま、株価だけを
-    fallback_priceで補ってPER/PBR/配当利回り/時価総額を計算する
+    fallback_priceで補ってPER/PBR/配当利回りを計算する
     （price_sourceが"yfinance"になり、J-Quants実データとの区別ができる）。
+    ただし時価総額だけは計算しない。発行済株式数(ShOutFY/TrShFY)はJ-Quantsが
+    その銘柄を最後に追えていた時点(東証離脱前)の値のままで、fallback_priceは
+    現在値のため、両者を掛け合わせると異なる時点の値を混在させた誤った時価
+    総額になる（src/regional_stocks.pyのfetch_regional_share_priceのdocstring
+    参照。2026-08-20のCodexレビューで指摘）。
     """
     latest_close = None
     latest_price_date = None
@@ -465,7 +470,7 @@ def compute_market_metrics(
                 )
         if bps is not None and pd.notna(bps) and bps > 0:
             pbr = latest_close / bps
-        if shares_out is not None and pd.notna(shares_out):
+        if shares_out is not None and pd.notna(shares_out) and price_source != "yfinance":
             float_shares = shares_out - (treasury_shares if pd.notna(treasury_shares) else 0)
             market_cap = latest_close * float_shares
         if div_ann is not None and pd.notna(div_ann) and div_ann >= 0:

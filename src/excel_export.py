@@ -66,7 +66,16 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None]:
     end = dt.date.today()
     start = end - dt.timedelta(days=365 * REGIONAL_LISTING_LOOKBACK_YEARS)
     try:
-        disclosures = tdnet_client.get_disclosures_range(start, end)
+        # 当日分のTDnet開示はまだ全件公開されていない可能性がある。
+        # tdnet_clientは期間指定をそのままキャッシュキーにするため、当日を
+        # 含む期間を一度キャッシュしてしまうと同じ銘柄で何度Excelを生成しても
+        # その日のうちは同じ不完全な結果を返し続けてしまう。前日までとは別に、
+        # 当日分だけforce_refresh=Trueで毎回取り直す（src/regional_stocks.pyの
+        # update_regional_storeと同じパターン。2026-08-20のCodexレビューで指摘）。
+        yesterday = end - dt.timedelta(days=1)
+        stable = tdnet_client.get_disclosures_range(start, yesterday) if start <= yesterday else pd.DataFrame()
+        todays = tdnet_client.get_disclosures_range(end, end, force_refresh=True)
+        disclosures = pd.concat([stable, todays], ignore_index=True)
     except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
         logger.info("[%s] TDnetからの会社名/市場情報の取得に失敗しました: %s", code, exc)
         return "", None
@@ -84,10 +93,17 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None]:
         return "", None
     rows = rows.copy()
     rows["pubdate"] = pd.to_datetime(rows["pubdate"], errors="coerce")
-    latest = rows.sort_values("pubdate").iloc[-1]
-    name = latest.get("company_name") or ""
-    markets_string = latest.get("markets_string")
-    return str(name), (str(markets_string) if pd.notna(markets_string) else None)
+    rows = rows.sort_values("pubdate")
+    name = rows.iloc[-1].get("company_name") or ""
+    # markets_stringが欠損している回（会社名だけの開示等）が直近の開示だと、
+    # それより前の回で分かっている市場情報を取り逃してしまう
+    # （src/regional_stocks.py の_latest_company_statusと同じ既知の欠損
+    # パターン。2026-08-20のCodexレビューで指摘）。会社名は単純に最新の開示
+    # から、markets_stringは有効な値を持つ最新の開示から、それぞれ独立に選ぶ。
+    has_valid_market = rows["markets_string"].apply(lambda m: isinstance(m, str) and bool(m))
+    market_rows = rows.loc[has_valid_market]
+    markets_string = market_rows.iloc[-1]["markets_string"] if not market_rows.empty else None
+    return str(name), (str(markets_string) if markets_string is not None else None)
 
 
 def _regional_fallback_price(code: str, markets_string: str | None) -> tuple[float | None, dt.date | None]:
@@ -281,6 +297,11 @@ EXECUTION_TABLE_TEMPLATE = TEMPLATE_DIR / "execution_table_template.xlsx"
 _YEAR_COLS = ["C", "E", "G", "I", "K", "M", "O"]
 _ROW_SALES = {"1Q": 5, "2Q": 6, "3Q": 7, "FY": 8}
 _ROW_PROFIT = {"1Q": 9, "2Q": 10, "3Q": 11, "FY": 12}
+# テンプレートの利益セルは元々小数1桁の書式("0.0;[Red]▲0.0;-")のため、
+# 小数2桁で丸めた値(round(profit / 1e8, 2))をそのまま書き込んでもExcel上は
+# 1桁までしか表示されない。値と書式を同時に更新する必要がある
+# （2026-08-20のCodexレビューで指摘）。
+_PROFIT_NUMBER_FORMAT = "0.00;[Red]▲0.00;-"
 _ROW_PRICE = {"1Q": 14, "2Q": 15, "3Q": 16, "FY": 17}
 
 
@@ -480,7 +501,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             sales_cell.value = math.floor(sales / 1e8)
             sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 2)
+            profit_cell = ws[f"{col}{_ROW_PROFIT[period_type]}"]
+            profit_cell.value = round(profit / 1e8, 2)
+            profit_cell.number_format = _PROFIT_NUMBER_FORMAT
         close = _nearest_close(prices, row["CurPerEn"])
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
@@ -494,7 +517,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.value = math.floor(sales / 1e8)
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 2)
+            forecast_profit_cell = ws[f"{col}{_ROW_PROFIT['FY']}"]
+            forecast_profit_cell.value = round(profit / 1e8, 2)
+            forecast_profit_cell.number_format = _PROFIT_NUMBER_FORMAT
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
@@ -520,7 +545,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             cell.value = math.floor(fsales / 1e8)
             cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 2)
+            fy_profit_cell = ws[f"{col}{_ROW_PROFIT['FY']}"]
+            fy_profit_cell.value = round(fodp / 1e8, 2)
+            fy_profit_cell.number_format = _PROFIT_NUMBER_FORMAT
 
     logger.info(
         "[%s] 会社予想EPS=%s 会社予想年間配当=%s 最新株価=%s PER=%s 配当利回り=%s 列割当=%s",
