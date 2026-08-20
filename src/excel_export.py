@@ -57,13 +57,41 @@ def _get_master_row(client: JQuantsClient, code: str) -> dict:
 
 def _regional_fallback_info(code: str) -> tuple[str, str | None]:
     """equities/masterに載っていない銘柄（地方取引所単独上場等）向けに、
-    TDnet開示から会社名と直近の上場市場情報(markets_string)を補う。
+    会社名と直近の上場市場情報(markets_string)を補う。
 
-    地方単独上場企業の検出に使っているものと同じTDnetデータ（キャッシュ済み
-    分は再利用、無ければ取得）を使う。見つからない場合は("", None)を返す
-    （誤った推測値を出さない。README「地方株」セクション参照）。
+    まず「地方株」ページが定期的に更新している保存済みストア
+    (regional_stocks.load_regional_store()) を参照する。地方単独上場企業の
+    検出・上場廃止チェックは既にそちらで実装・テスト済みのロジック
+    （上場廃止済みの銘柄は除外する等）のため、重複させず結果を再利用する。
+    これによりExcel生成のたびにTDnetの開示を数年分再取得する無駄も避けられる
+    （2026-08-20のCodexレビューで指摘）。
+
+    ストアにまだ無い銘柄（一度も「地方株」ページの更新で検出されていない）は
+    TDnetから直接検索する（フォールバックのフォールバック）。見つからない
+    場合は("", None)を返す（誤った推測値を出さない。README「地方株」
+    セクション参照）。
     """
-    end = dt.date.today()
+    code_str = str(code)
+    candidates = {code_str}
+    if len(code_str) == 4:
+        candidates.add(code_str + "0")
+
+    status = regional_stocks.load_regional_store()["company_status"]
+    if not status.empty:
+        match = status.loc[status["Code"].astype(str).isin(candidates)]
+        if not match.empty:
+            row = match.iloc[0]
+            name = str(row.get("CompanyName") or "")
+            if bool(row.get("IsDelisted")):
+                # 上場廃止済み（地方取引所を含めどの市場にも上場していない）
+                # 銘柄は、株価フォールバックの対象外にする（上場廃止後の
+                # 古いyfinance終値を現在値として誤表示しないため。
+                # 2026-08-20のCodexレビューで指摘）。
+                return name, None
+            markets_string = row.get("MarketsString")
+            return name, (str(markets_string) if isinstance(markets_string, str) and markets_string else None)
+
+    end = regional_stocks._today_jst()
     start = end - dt.timedelta(days=365 * REGIONAL_LISTING_LOOKBACK_YEARS)
     try:
         # 当日分のTDnet開示はまだ全件公開されていない可能性がある。
@@ -81,20 +109,20 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None]:
         return "", None
     if disclosures.empty or "company_code" not in disclosures.columns:
         return "", None
-    # TDnetのcompany_codeもequities/masterと同じ5桁表記（4桁コードは英数字を
-    # 問わず末尾に"0"が付く。例: "231A"→"231A0"）で来ることがあるため、
-    # _get_master_rowと同じ候補突き合わせをする。
-    code_str = str(code)
-    candidates = {code_str}
-    if len(code_str) == 4:
-        candidates.add(code_str + "0")
     rows = disclosures.loc[disclosures["company_code"].astype(str).isin(candidates)]
     if rows.empty:
         return "", None
     rows = rows.copy()
     rows["pubdate"] = pd.to_datetime(rows["pubdate"], errors="coerce")
     rows = rows.sort_values("pubdate")
-    name = rows.iloc[-1].get("company_name") or ""
+    latest = rows.iloc[-1]
+    name = latest.get("company_name") or ""
+    if regional_stocks._DELISTING_KEYWORD in str(latest.get("title") or ""):
+        # 直近の開示自体が上場廃止のお知らせの場合、markets_stringが欠損して
+        # いてもそれより前の開示の市場情報にフォールバックしない（既に上場廃止
+        # した銘柄を地方単独上場のまま扱ってしまうことを防ぐ。ストアに未登録の
+        # 銘柄向けの簡易版チェック。2026-08-20のCodexレビューで指摘）。
+        return str(name), None
     # markets_stringが欠損している回（会社名だけの開示等）が直近の開示だと、
     # それより前の回で分かっている市場情報を取り逃してしまう
     # （src/regional_stocks.py の_latest_company_statusと同じ既知の欠損
@@ -116,7 +144,7 @@ def _regional_fallback_price(code: str, markets_string: str | None) -> tuple[flo
     price, _note = regional_stocks.fetch_regional_share_price(code, markets_string)
     if price is None:
         return None, None
-    return price, dt.date.today()
+    return price, regional_stocks._today_jst()
 
 
 def _ensure_common_stock(master_row: dict, code: str) -> None:
@@ -187,12 +215,28 @@ _YFINANCE_ESTIMATE_NOTE = (
     "この値はJ-Quantsに株価データが無い銘柄（地方取引所単独上場等）向けに、"
     "yfinance（非公式データ源）の現在値を使って計算した参考値です。"
     "J-Quantsで検証された実績値ではありません。"
+    "また、東証離脱後に株式分割・併合が行われた場合、EPS・BPS・配当は分割前の"
+    "基準のままになりPER・PBR・配当利回りも実際とずれる可能性があります"
+    "（東証離脱後の分割・併合を検出できるデータ源が無いため）。"
 )
 
 
 def _add_yfinance_note(ws, *cell_refs: str) -> None:
     for ref in cell_refs:
         ws[ref].comment = Comment(_YFINANCE_ESTIMATE_NOTE, "excel_export.py")
+
+
+def _has_usable_close(prices: pd.DataFrame) -> bool:
+    """株価履歴に実際に使える終値が1件でもあるかを判定する。
+
+    地方取引所単独上場企業等、equities/masterから消えた銘柄は
+    /equities/bars/dailyが空のDataFrameではなく、各営業日の行はあるが
+    C(終値)列が全期間nullという形で返ってくる（CLAUDE.md「データ対象範囲の
+    制約」参照）。prices.emptyだけで判定すると、この「行はあるが中身が
+    全部null」なケースを取りこぼし、地方株のyfinance株価フォールバックが
+    発動しないままになる（2026-08-20のCodexレビューで指摘）。
+    """
+    return not prices.empty and "C" in prices.columns and _to_numeric(prices["C"]).notna().any()
 
 
 def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
@@ -211,7 +255,7 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
         company_name, regional_markets_string = _regional_fallback_info(code)
 
     fallback_price = fallback_price_date = None
-    if prices.empty and regional_markets_string:
+    if not _has_usable_close(prices) and regional_markets_string:
         fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
 
     metrics = pipeline.compute_market_metrics(fins, prices, fallback_price, fallback_price_date)
@@ -261,6 +305,13 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     market_name = master_row.get("MktNm")
     if market_name:
         ws["O4"] = market_name
+    elif regional_markets_string:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はMktNmが無いため、
+        # TDnet/地方株ストア由来のmarkets_stringから市場名を表示する
+        # （2026-08-20のCodexレビューで指摘）。
+        markets = regional_stocks.all_markets_in(regional_markets_string)
+        if markets:
+            ws["O4"] = "・".join(markets)
 
     yuho = edinet_client.fetch_yuho_texts(code, latest_fy_end)
 
@@ -331,7 +382,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         company_name, regional_markets_string = _regional_fallback_info(code)
 
     fallback_price = fallback_price_date = None
-    if prices_raw.empty and regional_markets_string:
+    if not _has_usable_close(prices_raw) and regional_markets_string:
         fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
 
     metrics = pipeline.compute_market_metrics(fins, prices_raw, fallback_price, fallback_price_date)

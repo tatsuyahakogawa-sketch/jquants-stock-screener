@@ -438,6 +438,13 @@ def compute_market_metrics(
             # 開示日以降に株式分割・併合があった場合、1株当たり指標(EPS/BPS/配当)を
             # 現在の株式数基準に換算する（開示日ちょうどの倍率でその後の分割の
             # 有無に関わらず補正されるため、分割が無い場合は倍率1.0で無害）。
+            # 既知の限界: price_sourceが"yfinance"（地方単独上場企業の株価
+            # フォールバック）の場合、price_historyはJ-Quantsの株価履歴
+            # （東証離脱前まで、AdjFactorも東証離脱後の分割・併合を含まない）
+            # のため、東証離脱後に分割・併合が行われてもここでは検出できず
+            # 倍率1.0のままになる。東証離脱後の分割・併合を検出できるデータ源が
+            # 無く是正できないため、呼び出し側(excel_export.py)でyfinance参考値
+            # である旨の注記に含めて開示する（2026-08-20のCodexレビューで指摘）。
             if feps is not None:
                 feps = feps * _split_adjustment_since(price_history, feps_date)
             if bps is not None:
