@@ -38,6 +38,14 @@ def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://ex
     }
 
 
+class TestRegionalStatementRules(unittest.TestCase):
+    def test_profit_doubling_not_offered_yet(self):
+        # profit_doublingは4年分の比較対象が蓄積されるまで判定不能なため、
+        # UIの選択肢からは意図的に外している（2026-08-19の4巡目のCodexレビューで
+        # 指摘: 判定不能なのに「該当なし」としか表示できず紛らわしいため）。
+        self.assertNotIn("profit_doubling", regional_stocks.REGIONAL_STATEMENT_RULES)
+
+
 class TestIsRegionalOnly(unittest.TestCase):
     def test_tokyo_only_is_not_regional(self):
         self.assertFalse(regional_stocks.is_regional_only("東"))
@@ -492,12 +500,16 @@ _REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST = [
 ]
 
 
-def _statement_row(code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None, is_primary=True):
+def _statement_row(
+    code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None, is_primary=True,
+    disclosure_id=None,
+):
     return {
         "id": f"{code}_{per_end}_{disc_date}", "Code": code, "DiscDate": disc_date, "CurPerType": per_type,
         "CurPerEn": pd.Timestamp(per_end), "CurFYEn": pd.Timestamp(fy_end),
         "Sales": sales, "OP": None, "OdP": None, "NP": None, "EqAR": eqar,
         "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": is_primary,
+        "DisclosureId": disclosure_id if disclosure_id is not None else f"{code}_{disc_date}",
     }
 
 
@@ -678,23 +690,62 @@ class TestDedupeSupersededStatements(unittest.TestCase):
                 "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
                 "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
                 "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "orig_disclosure",
             },
             {
-                # 訂正前の(誤った)翌期予想の合成行。同じDiscDateを共有する。
+                # 訂正前の(誤った)翌期予想の合成行。同じDisclosureIdを共有する。
                 "id": "orig_guidance", "Code": "19990", "DiscDate": original_disc_date, "CurPerType": "FY",
                 "CurPerEn": pd.NaT, "CurFYEn": pd.Timestamp("2027-06-30"),
                 "Sales": None, "OP": None, "OdP": None, "NP": None, "EqAR": None,
                 "FSales": None, "FOP": None, "FNP": 999_000_000.0, "BPS": None, "IsPrimary": False,
+                "DisclosureId": "orig_disclosure",
             },
             {
                 "id": "corrected_cur", "Code": "19990", "DiscDate": corrected_disc_date, "CurPerType": "FY",
                 "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
                 "Sales": 7_050_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
                 "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "corrected_disclosure",
             },
         ])
         result = regional_stocks._dedupe_superseded_statements(statements)
         self.assertEqual(set(result["id"]), {"corrected_cur"})
+
+    def test_same_day_correction_does_not_remove_the_corrected_release_own_rows(self):
+        # 元の開示と訂正決算短信が同じ暦日に公開された場合、DiscDate(時刻を
+        # 切り捨てた日付のみ)だけでは区別できない。DisclosureId(TDnet開示の
+        # ID)で区別することで、訂正側の正しい合成行まで巻き添えで削除しない
+        # ことを確認する（2026-08-19の4巡目のCodexレビューで指摘・修正）。
+        # TDnetの開示IDは概ね発行順に大きくなる数字文字列のため、テストでも
+        # その形式(後の開示ほど大きい値)に合わせる。
+        same_day = dt.date(2026, 8, 18)
+        statements = pd.DataFrame([
+            {
+                "id": "orig_cur", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "202608180001",
+            },
+            {
+                "id": "corrected_cur", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_050_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "202608180002",
+            },
+            {
+                # 訂正側(202608180002)自身の翌期予想合成行。DiscDateはcur行と
+                # 同じ同日だが、DisclosureIdは正しく紐付いている。
+                "id": "corrected_guidance", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.NaT, "CurFYEn": pd.Timestamp("2027-06-30"),
+                "Sales": None, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": 500_000_000.0, "BPS": None, "IsPrimary": False,
+                "DisclosureId": "202608180002",
+            },
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(set(result["id"]), {"corrected_cur", "corrected_guidance"})
 
 
 class TestUpdateRegionalStore(unittest.TestCase):

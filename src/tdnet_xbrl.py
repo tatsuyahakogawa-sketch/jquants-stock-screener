@@ -471,7 +471,18 @@ def parse_tanshin_summary_rows(zip_bytes: bytes, code: str, disclosed_date) -> l
         include_balance_sheet=not is_quarterly, forecast_prefix=None, is_primary=False,
     )
     if prior_row is not None:
-        prior_row["CurFYEn"] = cur_fy_end - pd.DateOffset(years=1)
+        if not is_quarterly and pd.notna(prior_row["CurPerEn"]):
+            # 本決算の前年同期行は、CurPerEn(_extract_row()がPriorYearDurationの
+            # contextから取得した実際の期末日)がそのまま前年の本決算末そのもの
+            # を指す。決算期変更で前年が12ヶ月ちょうどでない場合、当期CurFYEnから
+            # 単純に-1年した近似値では実際の期末日とずれるため、既に取得済みの
+            # 実データを優先する（2026-08-19の4巡目のCodexレビューで指摘）。
+            prior_row["CurFYEn"] = prior_row["CurPerEn"]
+        else:
+            # 四半期報告の前年同期行は、CurPerEnが「前年の同じ四半期末」であり
+            # 前年の本決算末そのものではない。前年の本決算末を直接示すcontextが
+            # 無いため、当期CurFYEnから-1年した近似値を使う（従来通り）。
+            prior_row["CurFYEn"] = cur_fy_end - pd.DateOffset(years=1)
         rows.append(prior_row)
 
     if not is_quarterly:

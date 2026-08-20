@@ -43,8 +43,15 @@ from src.pipeline import RULE_LABELS
 # statements_df、TDnet開示タイトル系は通常のdisclosures_dfをそのまま使う。
 REGIONAL_STATEMENT_RULES = [
     "sales_growth_major", "sales_growth_explosive", "equity_ratio_high",
-    "two_quarter_growth", "earnings_beat", "profit_doubling",
+    "two_quarter_growth", "earnings_beat",
 ]
+# profit_doubling(経常利益が4年で2倍以上)はscreen_regional()のディスパッチ
+# ロジック自体には残すが、UI上の選択肢(REGIONAL_STATEMENT_RULES)には含めない。
+# 地方単独上場企業の決算短信データはこの機能の初回スキャン以降しか蓄積されず
+# （TDnetの保持期限切れによりバックフィル不可）、4年分の比較対象が揃うまでは
+# 判定不能なのに、UI上は「該当なし」としか表示できず「4年間誰も倍増していない」
+# ように誤って読める（2026-08-19の4巡目のCodexレビューで指摘）。十分な年数の
+# データが蓄積されるまでは選択肢として出さない。
 REGIONAL_TITLE_RULES = ["new_facility_or_store", "world_first", "large_order", "stock_split"]
 REGIONAL_NEGATIVE_RULE = "downward_revision"
 REGIONAL_APPLICABLE_RULES = REGIONAL_STATEMENT_RULES + REGIONAL_TITLE_RULES
@@ -103,10 +110,16 @@ _COMPANY_STATUS_COLUMNS = [
 # 財務条件(売上高増加・自己資本比率等)をrules.pyのロジックそのまま流用するため。
 # IsPrimaryはJ-Quants側には無い、tdnet_xbrl.py固有の列（実際の開示行か、開示に
 # 埋め込まれた前年同期実績・翌期予想の合成行かの区別。tdnet_xbrl.pyのモジュール
-# docstring参照）。
+# docstring参照）。DisclosureIdも同様にJ-Quants側には無い列で、この行がどの
+# TDnet開示(fetch_regional_statements()のr["id"])から生成されたかを保持する。
+# DiscDateは時刻を切り捨てた日付のみのため、同日に元の開示と訂正決算短信の
+# 両方が公開された場合に区別できない。_dedupe_superseded_statements()で
+# 「置き換えられた開示に属する合成行」を正確に特定するために使う
+# （2026-08-19の4巡目のCodexレビューで指摘: (Code, DiscDate)だけでは同日公開の
+# 訂正を区別できず、訂正側の正しい合成行まで誤って削除しうる不具合があった）。
 _STATEMENTS_COLUMNS = [
     "id", "Code", "DiscDate", "CurPerType", "CurPerEn", "CurFYEn",
-    "Sales", "OP", "OdP", "NP", "EqAR", "FSales", "FOP", "FNP", "BPS", "IsPrimary",
+    "Sales", "OP", "OdP", "NP", "EqAR", "FSales", "FOP", "FNP", "BPS", "IsPrimary", "DisclosureId",
 ]
 _DECISION_TANSHIN_TITLE_KEYWORD = "決算短信"
 
@@ -352,6 +365,7 @@ def fetch_regional_statements(
             continue
         for i, row in enumerate(fetched):
             row["id"] = f"{r['id']}_{i}"
+            row["DisclosureId"] = r["id"]
             rows.append(row)
 
     if not rows:
@@ -614,24 +628,31 @@ def load_regional_store() -> dict[str, pd.DataFrame]:
 
 def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一銘柄・同一決算期(CurPerType, CurPerEn)について実際の開示行
-    (IsPrimary=True)が複数ある場合、最新のDiscDateの行だけを残す（訂正決算短信
-    はTDnet開示としては別ID・別行になるため、id基準の重複排除だけでは元の
+    (IsPrimary=True)が複数ある場合、最新の開示だけを残す（訂正決算短信は
+    TDnet開示としては別ID・別行になるため、id基準の重複排除だけでは元の
     数値の行が残ってしまう。2026-08-19のCodexレビューで指摘、実データで
     「(訂正・数値データ訂正)」開示の存在を確認済み）。
 
-    置き換えられた(古い方の)実際の開示行と同じ(Code, DiscDate)を持つ
+    置き換えられた(古い方の)実際の開示行と同じDisclosureId（fetch_regional_
+    statements()参照。どのTDnet開示から生成された行かを示すID）を持つ
     IsPrimary=False行（その開示に埋め込まれていた前年同期実績・翌期予想の
-    合成行）も一緒に取り除く。1回のparse_tanshin_summary_rows()呼び出しの
-    出力（cur_row+prior_row+guidance_row）は必ず同じDiscDateを共有するため、
-    (Code, DiscDate)でどの開示由来かを一意に紐付けられる。これをしないと、
-    訂正前の誤った翌期予想がguidance_rowとして残り続け、訂正後の正しい予想と
-    比較したdetect_downward_revision()が「訂正で数値が直っただけ」を実際の
-    下方修正と誤検知しうる（2026-08-19の3巡目のCodexレビューで指摘:
-    前回の修正はIsPrimary=True行だけを差し替え、この合成行の後始末が
-    漏れていた）。
+    合成行）も一緒に取り除く。これをしないと、訂正前の誤った翌期予想が
+    guidance_rowとして残り続け、訂正後の正しい予想と比較した
+    detect_downward_revision()が「訂正で数値が直っただけ」を実際の下方修正と
+    誤検知しうる（2026-08-19の3巡目のCodexレビューで指摘）。
+
+    DisclosureIdではなく(Code, DiscDate)をキーにしていた前回の実装は、元の
+    開示と訂正決算短信が同じ暦日に公開された場合にDiscDate（時刻を切り捨てた
+    日付のみ）で区別できず、訂正側の正しい合成行まで巻き添えで削除しうる
+    不具合があった（2026-08-19の4巡目のCodexレビューで指摘）。DisclosureIdは
+    TDnet開示のIDそのものであり、同日公開でも一意に区別できる。
+
+    最新の判定はDiscDateの新しい順を主、DisclosureIdを従（同日公開時の
+    決定的なタイブレークのため。TDnetの開示IDは概ね発行順に大きくなる形式の
+    ため、同日内の順序としても妥当）とする。
 
     翌年の開示のprior_rowと今年の開示のcur_rowが同じCurPerEnを指す正当な
-    ケースは、DiscDateが異なる（別々の開示イベント）ため、この処理では
+    ケースは、DisclosureIdが異なる（別々の開示イベント）ため、この処理では
     誤って統合されない。
     """
     if statements_df.empty or "IsPrimary" not in statements_df.columns:
@@ -650,7 +671,7 @@ def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
         return statements_df
 
     primary["_disc_date_parsed"] = pd.to_datetime(primary["DiscDate"], errors="coerce")
-    primary = primary.sort_values("_disc_date_parsed")
+    primary = primary.sort_values(["_disc_date_parsed", "DisclosureId"])
     kept_primary = primary.groupby(
         ["Code", "CurPerType", "CurPerEn"], as_index=False, group_keys=False, dropna=False
     ).tail(1)
@@ -658,8 +679,8 @@ def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
     kept_primary = kept_primary.drop(columns=["_disc_date_parsed"])
 
     if not superseded.empty and not other.empty:
-        superseded_keys = set(zip(superseded["Code"], superseded["DiscDate"]))
-        other = other.loc[~other.apply(lambda r: (r["Code"], r["DiscDate"]) in superseded_keys, axis=1)]
+        superseded_keys = set(zip(superseded["Code"], superseded["DisclosureId"]))
+        other = other.loc[~other.apply(lambda r: (r["Code"], r["DisclosureId"]) in superseded_keys, axis=1)]
 
     return pd.concat([kept_primary, other], ignore_index=True)
 

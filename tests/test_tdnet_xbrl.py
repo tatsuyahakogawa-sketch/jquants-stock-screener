@@ -290,6 +290,35 @@ class TestParseTanshinSummaryRowsFiscalYear(unittest.TestCase):
         self.assertAlmostEqual(prior["EqAR"], 0.621)
         self.assertEqual(prior["CurFYEn"].date(), dt.date(2025, 6, 30))
 
+    def test_prior_row_fy_uses_actual_prior_period_end_not_minus_one_year(self):
+        # 決算期変更で前年の本決算末が「当期CurFYEnからの単純な-1年」と一致
+        # しない場合、その決め打ち値ではなくPriorYearDurationのcontextから
+        # 実際に取得した期末日(CurPerEn)をそのままCurFYEnに使う
+        # （2026-08-19の4巡目のCodexレビューで指摘・修正）。
+        fragments = [
+            _nonnumeric("tse-ed-t:FiscalYearEnd", "CurrentYearInstant", "2026-06-30"),
+            _nonfraction(
+                "tse-ed-t:NetSales", "CurrentYearDuration_ConsolidatedMember_ResultMember", "7035", scale="6"
+            ),
+            # 前年は決算期変更により3ヶ月の変則決算で、期末は2025-03-31
+            # (当期CurFYEn"2026-06-30"から単純に-1年した"2025-06-30"とは一致しない)
+            _nonfraction(
+                "tse-ed-t:NetSales", "PriorYearDuration_ConsolidatedMember_ResultMember", "1800", scale="6"
+            ),
+            _context("CurrentYearInstant", instant="2026-06-30"),
+            _context(
+                "CurrentYearDuration_ConsolidatedMember_ResultMember", start="2025-07-01", end="2026-06-30",
+            ),
+            _context(
+                "PriorYearDuration_ConsolidatedMember_ResultMember", start="2025-01-01", end="2025-03-31",
+            ),
+        ]
+        rows = tdnet_xbrl.parse_tanshin_summary_rows(_make_zip(fragments), "19990", dt.date(2026, 8, 18))
+        prior = rows[1]
+        self.assertEqual(prior["CurPerEn"].date(), dt.date(2025, 3, 31))
+        # 決め打ちの2025-06-30ではなく、実際の期末日2025-03-31が使われる。
+        self.assertEqual(prior["CurFYEn"].date(), dt.date(2025, 3, 31))
+
     def test_guidance_row_captures_next_year_forecast(self):
         # 来期予想は当期行(CurFYEn=2026-06-30)には含まれず、CurFYEnを
         # 翌期(2027-06-30)に設定した予想専用行として抽出される
