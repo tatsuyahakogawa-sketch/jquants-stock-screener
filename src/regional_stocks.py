@@ -60,6 +60,13 @@ _LISTING_EVENTS_KEY = "listing_events"
 _MAJOR_EVENTS_KEY = "major_events"
 _STATEMENTS_KEY = "statements"
 _WATERMARK_KEY = "watermark"
+# 財務諸表(statements)専用のウォーターマーク。上場イベント等の既存
+# ウォーターマーク(_WATERMARK_KEY)とは別に持つ。この機能を後から追加した
+# 既存デプロイでは、_WATERMARK_KEYが既に最新付近まで進んでいるため、
+# 共用すると初回実行時にREGIONAL_STATEMENTS_LOOKBACK_DAYS分の遡り取得が
+# 行われず、その時点でまだ取得可能だった直近の決算短信を永久に取り逃す
+# （2026-08-19の3巡目のCodexレビューで指摘）。
+_STATEMENTS_WATERMARK_KEY = "statements_watermark"
 
 # yfinanceで現在値取得を実機確認済みのサフィックス（2026-08-13、9388で確認）。
 # 名証・札証単独上場企業は同日に実機確認の上、同サフィックス方式では取得できな
@@ -366,7 +373,7 @@ def _latest_primary_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
         return statements_df
     df = statements_df
     if "IsPrimary" in df.columns:
-        df = df.loc[df["IsPrimary"].fillna(True)]
+        df = df.loc[df["IsPrimary"].fillna(True).astype(bool)]
     if df.empty or "DiscDate" not in df.columns or "Code" not in df.columns:
         return df
     df = df.copy()
@@ -572,6 +579,17 @@ def _save_watermark(date: dt.date) -> None:
     cache.save(_STORE_ENDPOINT, _WATERMARK_KEY, pd.DataFrame({"date": [date.isoformat()]}))
 
 
+def _load_statements_watermark() -> dt.date | None:
+    df = cache.load(_STORE_ENDPOINT, _STATEMENTS_WATERMARK_KEY)
+    if df is None or df.empty:
+        return None
+    return pd.to_datetime(df.iloc[0]["date"]).date()
+
+
+def _save_statements_watermark(date: dt.date) -> None:
+    cache.save(_STORE_ENDPOINT, _STATEMENTS_WATERMARK_KEY, pd.DataFrame({"date": [date.isoformat()]}))
+
+
 def _load_table(key: str, columns: list[str]) -> pd.DataFrame:
     """保存済みテーブルを読む。0件で保存された場合、cache.load()は列情報の
     無い空のDataFrameを返す（cache.pyが空フレームを列無しのマーカー形式で
@@ -598,17 +616,34 @@ def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一銘柄・同一決算期(CurPerType, CurPerEn)について実際の開示行
     (IsPrimary=True)が複数ある場合、最新のDiscDateの行だけを残す（訂正決算短信
     はTDnet開示としては別ID・別行になるため、id基準の重複排除だけでは元の
-    数値の行が残ってしまう。2026-08-19のCodexレビューで指摘、実データでの
-    訂正事例は未確認だが仕組み上起こりうるため対応）。
+    数値の行が残ってしまう。2026-08-19のCodexレビューで指摘、実データで
+    「(訂正・数値データ訂正)」開示の存在を確認済み）。
 
-    IsPrimary=False（開示に埋め込まれた前年同期実績・翌期予想の合成行）は対象外
-    にする。翌年の開示のprior_rowと今年の開示のcur_rowが同じCurPerEnを指す
-    正当なケースがあり、これらは別々の開示イベントとしてどちらも必要なため
-    （このケースをここで統合すると、開示日ベースの時系列比較が壊れる）。
+    置き換えられた(古い方の)実際の開示行と同じ(Code, DiscDate)を持つ
+    IsPrimary=False行（その開示に埋め込まれていた前年同期実績・翌期予想の
+    合成行）も一緒に取り除く。1回のparse_tanshin_summary_rows()呼び出しの
+    出力（cur_row+prior_row+guidance_row）は必ず同じDiscDateを共有するため、
+    (Code, DiscDate)でどの開示由来かを一意に紐付けられる。これをしないと、
+    訂正前の誤った翌期予想がguidance_rowとして残り続け、訂正後の正しい予想と
+    比較したdetect_downward_revision()が「訂正で数値が直っただけ」を実際の
+    下方修正と誤検知しうる（2026-08-19の3巡目のCodexレビューで指摘:
+    前回の修正はIsPrimary=True行だけを差し替え、この合成行の後始末が
+    漏れていた）。
+
+    翌年の開示のprior_rowと今年の開示のcur_rowが同じCurPerEnを指す正当な
+    ケースは、DiscDateが異なる（別々の開示イベント）ため、この処理では
+    誤って統合されない。
     """
     if statements_df.empty or "IsPrimary" not in statements_df.columns:
         return statements_df
-    is_primary = statements_df["IsPrimary"].fillna(True)
+    # 空のDataFrame(cache未初期化時のプレースホルダ)とconcatすると、"IsPrimary"列
+    # がbool dtypeではなくobject dtypeになることがある。object dtypeのまま
+    # ~is_primaryを行うと、pandasが要素ごとのbitwise notとして扱い、
+    # PythonのTrueはint(1)扱いのため~True=-2という数値になってしまい、
+    # 真偽マスクではなく行ラベルの一覧として誤って解釈されKeyErrorになる
+    # （2026-08-19の3巡目のCodexレビューへの対応中に実際に発生させて発見）。
+    # astype(bool)で明示的に真偽値dtypeへ変換してから使う。
+    is_primary = statements_df["IsPrimary"].fillna(True).astype(bool)
     primary = statements_df.loc[is_primary].copy()
     other = statements_df.loc[~is_primary]
     if primary.empty:
@@ -616,12 +651,17 @@ def _dedupe_superseded_statements(statements_df: pd.DataFrame) -> pd.DataFrame:
 
     primary["_disc_date_parsed"] = pd.to_datetime(primary["DiscDate"], errors="coerce")
     primary = primary.sort_values("_disc_date_parsed")
-    primary = (
-        primary.groupby(["Code", "CurPerType", "CurPerEn"], as_index=False, group_keys=False, dropna=False)
-        .tail(1)
-        .drop(columns=["_disc_date_parsed"])
-    )
-    return pd.concat([primary, other], ignore_index=True)
+    kept_primary = primary.groupby(
+        ["Code", "CurPerType", "CurPerEn"], as_index=False, group_keys=False, dropna=False
+    ).tail(1)
+    superseded = primary.loc[~primary["id"].isin(kept_primary["id"])]
+    kept_primary = kept_primary.drop(columns=["_disc_date_parsed"])
+
+    if not superseded.empty and not other.empty:
+        superseded_keys = set(zip(superseded["Code"], superseded["DiscDate"]))
+        other = other.loc[~other.apply(lambda r: (r["Code"], r["DiscDate"]) in superseded_keys, axis=1)]
+
+    return pd.concat([kept_primary, other], ignore_index=True)
 
 
 def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFrame]:
@@ -662,7 +702,28 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
 
     new_listing = detect_regional_listing_events(new_disclosures, was_known_regional)
     new_major = detect_regional_major_events(new_disclosures)
-    new_statements = fetch_regional_statements(new_disclosures, today, was_known_regional)
+
+    # statements専用のウォーターマークが無ければ、上場イベント用の
+    # ウォーターマーク(watermark)が既に進んでいてもREGIONAL_STATEMENTS_
+    # LOOKBACK_DAYS分だけ遡って取得する（機能を後から追加した既存デプロイ
+    # 向けの初回バックフィル。_STATEMENTS_WATERMARK_KEYのコメント参照）。
+    statements_watermark = _load_statements_watermark()
+    statements_start = (
+        statements_watermark + dt.timedelta(days=1)
+        if statements_watermark is not None
+        else today - dt.timedelta(days=REGIONAL_STATEMENTS_LOOKBACK_DAYS)
+    )
+    if statements_start < start:
+        statements_backfill = tdnet_client.get_disclosures_range(statements_start, start - dt.timedelta(days=1))
+        statements_disclosures = pd.concat([statements_backfill, new_disclosures], ignore_index=True)
+        was_known_regional_for_statements = compute_was_known_regional(
+            statements_disclosures, set(stores["company_status"]["Code"])
+        )
+    else:
+        statements_disclosures = new_disclosures
+        was_known_regional_for_statements = was_known_regional
+
+    new_statements = fetch_regional_statements(statements_disclosures, today, was_known_regional_for_statements)
     new_status = _latest_company_status(new_disclosures, was_known_regional)
     # _latest_company_status()はmarkets_stringが有効な回だけを対象にするため、
     # 上場廃止の開示自体でmarkets_stringが欠損しているケースを取り逃す。
@@ -748,6 +809,7 @@ def update_regional_store(today: dt.date | None = None) -> dict[str, pd.DataFram
         # まで進めてしまうと、その日の後刻に追加された開示を二度と取得
         # できなくなるため、前日までしか「スキャン済み」にしない。
         _save_watermark(today - dt.timedelta(days=1))
+        _save_statements_watermark(today - dt.timedelta(days=1))
 
     return {
         "company_status": company_status,

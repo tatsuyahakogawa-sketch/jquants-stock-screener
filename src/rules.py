@@ -392,7 +392,8 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     増収増益の判定は同一銘柄・同一決算期タイプ(CurPerType)内で前年同期と比較する
     （detect_sales_growthと同じ手法）。「2期連続」は、対象の開示とその銘柄の
     時系列上ひとつ前の開示（決算期タイプが変わってもよい。例: 1Q→2Q）の
-    両方が増収増益であることを見る。
+    両方が増収増益であり、かつ両者の決算期末(CurPerEn)が概ね1四半期分
+    （60〜120日）しか離れていないことを見る。
 
     statements_dfに`IsPrimary`列がある場合（src/tdnet_xbrl.py経由の地方株データ。
     実際の開示ではなく、開示に埋め込まれた前年同期実績・翌期予想の合成行を
@@ -402,6 +403,12 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     なる（2026-08-19のCodexレビューで指摘、実データで確認）。J-Quants由来の
     データ(1開示=1行、IsPrimary列なし)ではこの列が無いため全行を対象にする
     既存動作のまま変わらない。
+
+    地方株はTDnet添付ファイルの保持期限切れ等により特定の四半期の開示だけ
+    取得できないことがある（例: 1Qと3Qは取得できたが2Qが欠落）。この場合、
+    単純に「時系列上ひとつ前の開示」を見るだけでは1Qと3Qを連続する2期と
+    誤認してしまう。決算期末の間隔が1四半期分から大きく外れる場合は
+    「連続した2期」とみなさない（2026-08-19の3巡目のCodexレビューで指摘）。
     """
     required = {
         STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_DISCLOSED_DATE,
@@ -431,12 +438,17 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 「2期連続」判定のため、銘柄内を時系列(開示日)順に並べ直して直前の開示と比較する
-    # （IsPrimary列がある場合は実際の開示行のみを対象にする。上のdocstring参照）
-    seq = df.loc[df["IsPrimary"].fillna(True)] if "IsPrimary" in df.columns else df
+    # （IsPrimary列がある場合は実際の開示行のみを対象にする。上のdocstring参照。
+    # astype(bool)は、空のDataFrameとのconcatでIsPrimary列がobject dtypeに
+    # なりうるための明示的な型変換。src/regional_stocks.py参照）
+    seq = df.loc[df["IsPrimary"].fillna(True).astype(bool)] if "IsPrimary" in df.columns else df
     seq = seq.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
     seq = seq.copy()
     seq["prev_grew_yoy"] = seq.groupby(STMT_CODE)["grew_yoy"].shift(1)
-    two_in_a_row = seq["grew_yoy"] & seq["prev_grew_yoy"].fillna(False)
+    seq["prev_period_end_seq"] = seq.groupby(STMT_CODE)[STMT_PERIOD_END].shift(1)
+    seq_gap_days = (seq[STMT_PERIOD_END] - seq["prev_period_end_seq"]).dt.days
+    is_adjacent_period = seq_gap_days.between(60, 120)
+    two_in_a_row = seq["grew_yoy"] & seq["prev_grew_yoy"].fillna(False) & is_adjacent_period.fillna(False)
 
     hit = seq.loc[two_in_a_row].copy()
     if hit.empty:

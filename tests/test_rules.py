@@ -50,6 +50,20 @@ class TestDetectTwoQuarterGrowth(unittest.TestCase):
         result = rules.detect_two_quarter_growth(statements)
         self.assertTrue(result.empty)
 
+    def test_gap_quarter_is_not_treated_as_two_in_a_row(self):
+        # 地方株はTDnet添付ファイルの保持期限切れ等で特定の四半期(例: 2Q)だけ
+        # 取得できないことがある。1Qと3Qの決算期末は半年近く離れており
+        # 「連続した2期」ではないため、両方が増収増益でもヒットしない
+        # （2026-08-19の3巡目のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10, is_primary=True),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 120, 12, is_primary=True),  # +20% (2Qは欠落)
+            _row("1234", "3Q", "2025-12-31", "2025-11-10", 200, 20, is_primary=True),
+            _row("1234", "3Q", "2026-12-31", "2026-11-10", 250, 25, is_primary=True),  # +25%
+        ])
+        result = rules.detect_two_quarter_growth(statements)
+        self.assertTrue(result.empty)
+
     def test_without_isprimary_column_behaves_as_before(self):
         # J-Quants由来のデータ(1開示=1行、IsPrimary列なし)では、全行を対象にした
         # 従来通りの挙動が変わらないことを確認する（後方互換の回帰テスト）。

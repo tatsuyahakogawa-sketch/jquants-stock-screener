@@ -436,6 +436,22 @@ class TestDownloadRetry(unittest.TestCase):
             tdnet_xbrl._download("https://example.com/x.zip")
         self.assertEqual(mock_get.call_count, tdnet_xbrl._MAX_ATTEMPTS)
 
+    def test_429_is_retried(self):
+        # 429(レート制限)は404等の恒久的なエラーとは異なり一時的な過負荷のため、
+        # 5xxと同様に再試行対象にする（2026-08-19の3巡目のCodexレビューで指摘:
+        # 前回の修正では429もstatus<500の「即座に諦める」対象に含まれていた）。
+        resp = MagicMock()
+        resp.status_code = 429
+        bad_resp = MagicMock()
+        bad_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        with (
+            patch("src.tdnet_xbrl.requests.get", return_value=bad_resp) as mock_get,
+            patch("src.tdnet_xbrl.time.sleep"),
+            self.assertRaises(requests.exceptions.HTTPError),
+        ):
+            tdnet_xbrl._download("https://example.com/x.zip")
+        self.assertEqual(mock_get.call_count, tdnet_xbrl._MAX_ATTEMPTS)
+
 
 if __name__ == "__main__":
     unittest.main()

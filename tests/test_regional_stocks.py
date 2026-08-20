@@ -664,6 +664,38 @@ class TestDedupeSupersededStatements(unittest.TestCase):
         result = regional_stocks._dedupe_superseded_statements(statements)
         self.assertEqual(len(result), 1)
 
+    def test_removes_synthetic_guidance_row_belonging_to_superseded_disclosure(self):
+        # 訂正決算短信で置き換えられた(古い方の)実際の開示行だけでなく、その
+        # 開示に埋め込まれていた翌期予想の合成行(guidance_row、同じDiscDate)も
+        # 一緒に取り除く。残したままだと、訂正で修正されたはずの誤った予想値が
+        # detect_downward_revision()の比較対象に残ってしまう
+        # （2026-08-19の3巡目のCodexレビューで指摘）。
+        original_disc_date = dt.date(2026, 8, 18)
+        corrected_disc_date = dt.date(2026, 8, 25)
+        statements = pd.DataFrame([
+            {
+                "id": "orig_cur", "Code": "19990", "DiscDate": original_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+            },
+            {
+                # 訂正前の(誤った)翌期予想の合成行。同じDiscDateを共有する。
+                "id": "orig_guidance", "Code": "19990", "DiscDate": original_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.NaT, "CurFYEn": pd.Timestamp("2027-06-30"),
+                "Sales": None, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": 999_000_000.0, "BPS": None, "IsPrimary": False,
+            },
+            {
+                "id": "corrected_cur", "Code": "19990", "DiscDate": corrected_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_050_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+            },
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(set(result["id"]), {"corrected_cur"})
+
 
 class TestUpdateRegionalStore(unittest.TestCase):
     """cache.pyのCACHE_DIRを一時ディレクトリに差し替えて、実際にparquet往復させる。"""
@@ -918,6 +950,70 @@ class TestUpdateRegionalStore(unittest.TestCase):
             regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
 
         mock_save_watermark.assert_not_called()
+
+    def test_statements_watermark_not_advanced_when_a_table_save_fails(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=disclosures), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")), \
+                patch(f"{_MOD}.cache.save", return_value=False), \
+                patch(f"{_MOD}._save_statements_watermark") as mock_save_statements_watermark:
+            regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        mock_save_statements_watermark.assert_not_called()
+
+    def test_statements_backfill_when_listing_watermark_already_advanced(self):
+        # 上場イベント用のwatermarkは既に進んでいるが、statements機能を後から
+        # 追加した直後でstatements_watermarkがまだ無い状況（既存デプロイへの
+        # 機能追加）。REGIONAL_STATEMENTS_LOOKBACK_DAYS分だけ別途遡って取得し、
+        # まだ取得可能な直近の決算短信を取りこぼさないことを確認する
+        # （2026-08-19の3巡目のCodexレビューで指摘）。
+        regional_stocks._save_watermark(dt.date(2026, 8, 13))  # 上場イベント側は既に8/13まで進んでいる
+
+        backfill_disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-07-01 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 7, 1), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": None, "OdP": None, "NP": None,
+             "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
+        ]
+
+        call_ranges = []
+
+        def fake_get_disclosures_range(start, end, force_refresh=False):
+            call_ranges.append((start, end))
+            if len(call_ranges) == 3:  # stable, today分に続く3回目がstatements用バックフィル
+                return backfill_disclosures
+            return pd.DataFrame()
+
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", side_effect=fake_get_disclosures_range), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")), \
+                patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows):
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 19))
+
+        self.assertEqual(len(call_ranges), 3)
+        # 3回目の呼び出しがstatements専用の遡り取得(today-60〜listing側watermarkの前日)
+        self.assertEqual(call_ranges[2], (dt.date(2026, 6, 20), dt.date(2026, 8, 13)))
+        self.assertEqual(len(result["statements"]), 1)
+        self.assertEqual(result["statements"].iloc[0]["Code"], "33460")
+
+    def test_no_statements_backfill_once_watermarks_are_in_sync(self):
+        # 両方のwatermarkが揃って進んでいる通常運用時は、statements用の
+        # 追加バックフィル取得(3回目の呼び出し)が発生しないことを確認する
+        # （毎回同じ60日分を再取得する無駄を避けるため）。
+        regional_stocks._save_watermark(dt.date(2026, 8, 13))
+        regional_stocks._save_statements_watermark(dt.date(2026, 8, 13))
+
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()) as mock_get, \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")):
+            regional_stocks.update_regional_store(today=dt.date(2026, 8, 15))
+
+        self.assertEqual(len(mock_get.call_args_list), 2)
 
 
 if __name__ == "__main__":

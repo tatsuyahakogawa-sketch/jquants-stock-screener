@@ -108,12 +108,16 @@ from lxml import etree
 
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
 # TDnetの保持期限切れ(404)は再試行しても無駄だが、一時的なタイムアウト・
-# 接続エラー・5xxはネットワークの瞬断で起こりうるため、これらだけ短い間隔で
-# 数回再試行する（再試行しないと、その決算短信の財務データが永久に欠落する
-# ため。regional_stocks.fetch_regional_statements()参照。2026-08-19のCodex
-# レビューで指摘）。
+# 接続エラー・5xx・レート制限(429)はネットワークの瞬断や輻輳で起こりうるため、
+# これらだけ再試行する（再試行しないと、その決算短信の財務データが永久に
+# 欠落するため。regional_stocks.fetch_regional_statements()参照。
+# 2026-08-19のCodexレビューで指摘）。429は一時的な過負荷であり404等の恒久的な
+# エラーとは性質が違うため、これらと同列に「即座に諦める」対象にしない
+# （2026-08-19の2巡目のCodexレビューで、429がそのまま諦める対象に含まれて
+# いた回帰を指摘され修正）。
 _MAX_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 2
+_TOO_MANY_REQUESTS = 429
 
 
 class TdnetXbrlError(Exception):
@@ -131,7 +135,7 @@ def _download(url: str) -> bytes:
             return resp.content
         except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
-            if status is not None and status < 500:
+            if status is not None and status < 500 and status != _TOO_MANY_REQUESTS:
                 raise  # 404等、再試行しても解決しない恒久的なエラーは即座に諦める
             last_exc = exc
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
