@@ -83,6 +83,30 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _is_primary_mask(df: pd.DataFrame) -> pd.Series:
+    """statements_dfの各行が「実際の開示」かどうかを示す真偽Seriesを返す
+    （IsPrimary列が無ければ全行True。J-Quants由来データとの後方互換）。
+
+    地方株のstatements_df(src/tdnet_xbrl.py由来)は、実際の開示行(IsPrimary=True)
+    に加え、開示に埋め込まれた前年同期実績・翌期予想の合成行(IsPrimary=False)を
+    含む。detect_sales_growth等の「前年同期と比較して増加した開示」を検出する
+    関数群は、比較の基準値(prev_*)としては合成行を使ってよいが、検出結果
+    (ヒット)自体は実際に行われた開示に限定する必要がある。合成行がヒットに
+    含まれると、実際には別の（後の）開示で埋め込まれた過去の比較値が、あたかも
+    その開示日に新しく判明した情報であるかのように表示されてしまい、特に
+    直近の実際の開示が逆方向（減収・下方修正等）だった場合に誤解を招く
+    （2026-08-19の5巡目のCodexレビューで指摘: detect_two_quarter_growthは
+    既にIsPrimaryで絞り込んでいたが、detect_sales_growth等の他の関数には
+    同じ絞り込みが漏れていた）。
+
+    astype(bool)は、空のDataFrameとのconcatでIsPrimary列がobject dtypeに
+    なりうるための明示的な型変換（src/regional_stocks.py参照）。
+    """
+    if "IsPrimary" not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df["IsPrimary"].fillna(True).astype(bool)
+
+
 def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
     """ストップ高で終値が確定した(Code, Date)の一覧を返す。"""
     if quotes_df.empty or QUOTES_UPPER_LIMIT_FLAG not in quotes_df.columns:
@@ -215,6 +239,14 @@ def detect_world_first(disclosures_df: pd.DataFrame) -> pd.DataFrame:
 def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一の決算期タイプ(TypeOfCurrentPeriod)の前年同期と比べ、売上高が
     大幅(+20%以上) または 爆発的(+50%以上) に増えた開示の一覧。
+
+    +50%以上の増収は「大幅(+20%以上)」の条件も数値としては満たしているため、
+    両方のruleタグ(sales_growth_major, sales_growth_explosive)を持つ行として
+    それぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。以前は
+    growth_rateに応じて片方のタグだけを選んでいたため、"sales_growth_major"
+    （ラベル表記は「+20%以上」）だけを選択したユーザーの絞り込みから、実際には
+    +20%以上でもある60%成長の銘柄が漏れていた（2026-08-19のCodexレビューで
+    指摘、実データで確認）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_NET_SALES, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
@@ -233,15 +265,21 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     # 前年同期との比較になっているかの軽いチェック（350〜380日程度離れているか）
     gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
     valid &= gap_days.between(330, 400)
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    # prev_net_sales等の比較基準値の計算自体は上のgroupby/shiftで既に全行
+    # （合成行含む）を使っているため、ここで絞ってもその計算には影響しない。
+    valid &= _is_primary_mask(df)
 
     growth = (df[STMT_NET_SALES] - df["prev_net_sales"]) / df["prev_net_sales"]
     df["growth_rate"] = growth
+    df["detail"] = "前年同期比 売上高 " + (df["growth_rate"] * 100).round(1).astype(str) + "% 増"
 
-    hit = df.loc[valid & (growth >= SALES_GROWTH_MAJOR_THRESHOLD)].copy()
-    hit["rule"] = hit["growth_rate"].apply(
-        lambda g: "sales_growth_explosive" if g >= SALES_GROWTH_EXPLOSIVE_THRESHOLD else "sales_growth_major"
-    )
-    hit["detail"] = "前年同期比 売上高 " + (hit["growth_rate"] * 100).round(1).astype(str) + "% 増"
+    hit_major = df.loc[valid & (growth >= SALES_GROWTH_MAJOR_THRESHOLD)].copy()
+    hit_major["rule"] = "sales_growth_major"
+    hit_explosive = df.loc[valid & (growth >= SALES_GROWTH_EXPLOSIVE_THRESHOLD)].copy()
+    hit_explosive["rule"] = "sales_growth_explosive"
+
+    hit = pd.concat([hit_major, hit_explosive], ignore_index=True)
     result = hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
         columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
     )
@@ -275,8 +313,10 @@ def detect_earnings_beat(statements_df: pd.DataFrame) -> pd.DataFrame:
     is_fy_actual = df[STMT_PERIOD_TYPE] == "FY"
     has_prev_forecast = df["prev_forecast_profit"].notna()
     beat = df[STMT_PROFIT] > (df["prev_forecast_profit"] * (1 + EARNINGS_BEAT_THRESHOLD))
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    is_primary = _is_primary_mask(df)
 
-    hit = df.loc[is_fy_actual & has_prev_forecast & beat].copy()
+    hit = df.loc[is_fy_actual & has_prev_forecast & beat & is_primary].copy()
     hit["rule"] = "earnings_beat"
     hit["detail"] = (
         "通期純利益 実績" + hit[STMT_PROFIT].astype(str)
@@ -314,6 +354,7 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
     df = df.dropna(subset=[STMT_ORDINARY_PROFIT])
     df[STMT_FY_END] = pd.to_datetime(df[STMT_FY_END], errors="coerce")
+    df["_is_primary"] = _is_primary_mask(df)
     df = df.sort_values([STMT_CODE, STMT_FY_END])
 
     target_days = 365 * PROFIT_DOUBLING_YEARS
@@ -324,6 +365,10 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
         group = group.reset_index(drop=True)
         for i in range(len(group)):
             cur = group.iloc[i]
+            if not cur["_is_primary"]:
+                # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring
+                # 参照）。比較対象(prev)の探索は合成行を含めたgroup全体から行う。
+                continue
             gap = (cur[STMT_FY_END] - group[STMT_FY_END]).dt.days
             candidates = group.loc[(gap - target_days).abs() <= tolerance_days]
             if candidates.empty:
@@ -364,8 +409,15 @@ def detect_downward_revision(statements_df: pd.DataFrame) -> pd.DataFrame:
     df["prev_forecast_profit"] = df.groupby([STMT_CODE, STMT_FY_END])[STMT_FORECAST_PROFIT].shift(1)
     has_prev = df["prev_forecast_profit"].notna()
     lowered = df[STMT_FORECAST_PROFIT] < (df["prev_forecast_profit"] * (1 - DOWNWARD_REVISION_THRESHOLD))
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    # prior_row(IsPrimary=False)は予想値(FSales/FOP/FNP)を持たないため、既に
+    # 上のdropna(subset=[STMT_FORECAST_PROFIT])で除外される。guidance_row
+    # (IsPrimary=False)は理論上は予想値を持つが、同一(Code, CurFYEn)内で最も
+    # 早い開示になるため通常はhas_prev=Falseとなりヒット候補にならない。将来の
+    # 構造変更に備えた保険として明示的にも絞り込む。
+    is_primary = _is_primary_mask(df)
 
-    hit = df.loc[has_prev & lowered].copy()
+    hit = df.loc[has_prev & lowered & is_primary].copy()
     hit["rule"] = "downward_revision"
     hit["detail"] = (
         "通期純利益予想 下方修正 " + hit["prev_forecast_profit"].astype(str)
@@ -382,7 +434,23 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     増収増益の判定は同一銘柄・同一決算期タイプ(CurPerType)内で前年同期と比較する
     （detect_sales_growthと同じ手法）。「2期連続」は、対象の開示とその銘柄の
     時系列上ひとつ前の開示（決算期タイプが変わってもよい。例: 1Q→2Q）の
-    両方が増収増益であることを見る。
+    両方が増収増益であり、かつ両者の決算期末(CurPerEn)が概ね1四半期分
+    （60〜120日）しか離れていないことを見る。
+
+    statements_dfに`IsPrimary`列がある場合（src/tdnet_xbrl.py経由の地方株データ。
+    実際の開示ではなく、開示に埋め込まれた前年同期実績・翌期予想の合成行を
+    IsPrimary=Falseで含む）、「直前の開示」の判定はIsPrimary=True（実際にその日
+    行われた開示）の行だけを対象にする。合成行を混ぜたまま時系列で1つ前を
+    見ると、実在しない開示が間に挟まったことになり2期連続判定が常に不成立に
+    なる（2026-08-19のCodexレビューで指摘、実データで確認）。J-Quants由来の
+    データ(1開示=1行、IsPrimary列なし)ではこの列が無いため全行を対象にする
+    既存動作のまま変わらない。
+
+    地方株はTDnet添付ファイルの保持期限切れ等により特定の四半期の開示だけ
+    取得できないことがある（例: 1Qと3Qは取得できたが2Qが欠落）。この場合、
+    単純に「時系列上ひとつ前の開示」を見るだけでは1Qと3Qを連続する2期と
+    誤認してしまう。決算期末の間隔が1四半期分から大きく外れる場合は
+    「連続した2期」とみなさない（2026-08-19の3巡目のCodexレビューで指摘）。
     """
     required = {
         STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_DISCLOSED_DATE,
@@ -412,11 +480,17 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 「2期連続」判定のため、銘柄内を時系列(開示日)順に並べ直して直前の開示と比較する
-    df = df.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
-    df["prev_grew_yoy"] = df.groupby(STMT_CODE)["grew_yoy"].shift(1)
-    two_in_a_row = df["grew_yoy"] & df["prev_grew_yoy"].fillna(False)
+    # （実際の開示行のみを対象にする。上のdocstring・_is_primary_mask docstring参照）
+    seq = df.loc[_is_primary_mask(df)]
+    seq = seq.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
+    seq = seq.copy()
+    seq["prev_grew_yoy"] = seq.groupby(STMT_CODE)["grew_yoy"].shift(1)
+    seq["prev_period_end_seq"] = seq.groupby(STMT_CODE)[STMT_PERIOD_END].shift(1)
+    seq_gap_days = (seq[STMT_PERIOD_END] - seq["prev_period_end_seq"]).dt.days
+    is_adjacent_period = seq_gap_days.between(60, 120)
+    two_in_a_row = seq["grew_yoy"] & seq["prev_grew_yoy"].fillna(False) & is_adjacent_period.fillna(False)
 
-    hit = df.loc[two_in_a_row].copy()
+    hit = seq.loc[two_in_a_row].copy()
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 

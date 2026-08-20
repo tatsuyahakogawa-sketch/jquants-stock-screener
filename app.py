@@ -152,10 +152,69 @@ def render_regional_section() -> None:
     company_status = store["company_status"]
     listing_events = store["listing_events"]
     major_events = store["major_events"]
+    statements = store["statements"]
 
     if company_status.empty and listing_events.empty and major_events.empty:
         st.info("まだデータがありません。上の「最新情報を取得（更新）」を押してください。")
         return
+
+    with st.container(border=True):
+        st.markdown("### 💰 財務条件で絞り込む（任意）")
+        st.caption(
+            "地方単独上場企業はJ-Quants対象外のためPBR・PER等は計算できませんが、TDnet決算短信の"
+            "サマリー情報（本決算/四半期の実績・前年同期比較）からは売上高増加・自己資本比率等の"
+            "判定ができます。決算短信のXBRL添付は公開から約1〜1.5ヶ月で取得できなくなるため、"
+            "直近の開示分から順次蓄積されます（README参照）。"
+        )
+        selected_statement_rules = st.pills(
+            "対象にする財務条件",
+            options=regional_stocks.REGIONAL_STATEMENT_RULES,
+            format_func=lambda k: RULE_LABELS[k],
+            selection_mode="multi",
+            default=[],
+            key="regional_statement_rules_pills",
+            label_visibility="collapsed",
+        )
+        exclude_downward_regional = st.checkbox(
+            "業績予想の下方修正歴がある銘柄を除外する", value=True, key="regional_exclude_downward"
+        )
+
+    if selected_statement_rules:
+        rules_to_check = list(selected_statement_rules)
+        if exclude_downward_regional:
+            rules_to_check.append(regional_stocks.REGIONAL_NEGATIVE_RULE)
+        hits = regional_stocks.screen_regional(pd.DataFrame(), statements, company_status, rules_to_check)
+        summary = build_summary(hits)
+        if not summary.empty:
+            if exclude_downward_regional:
+                summary = summary[~summary["HasDownwardRevision"]]
+            # MatchedCountはbuild_summary()が全ルールについて集計した値のため、
+            # ユーザーが選んでいない条件（例: sales_growth_majorのみ選択時に
+            # 実際は閾値50%以上でsales_growth_explosive側にラベル付けされた行）
+            # まで含んでしまう。選択した条件だけで数え直す（app.py内の通常
+            # スクリーニングのMatchedCountSelectedと同じ方式。2026-08-19の
+            # Codexレビューで指摘: これをしないと「合致した条件」欄が空欄の
+            # まま表示されることがあった）。
+            summary["MatchedCountSelected"] = summary[[f"{r}_matched" for r in selected_statement_rules]].sum(axis=1)
+            summary = summary[summary["MatchedCountSelected"] >= 1]
+            summary["MatchedConditions"] = summary.apply(
+                lambda row: "、".join(RULE_LABELS[r] for r in selected_statement_rules if row[f"{r}_matched"]),
+                axis=1,
+            )
+
+        display = (
+            summary[["Code", "CompanyName", "MatchedCountSelected", "MatchedConditions"]]
+            .rename(columns={"MatchedCountSelected": "合致数", "MatchedConditions": "合致した条件"})
+            .sort_values("合致数", ascending=False)
+            if not summary.empty else summary
+        )
+        if display.empty:
+            st.warning("該当なし（財務条件に合致した地方単独上場企業はありませんでした）。")
+        else:
+            st.success(f"{len(display)} 銘柄が財務条件に合致しました。")
+            st.dataframe(display, width="stretch", hide_index=True)
+        st.divider()
+        st.caption("以下は絞り込みなしの一覧です。")
 
     # --- 上場日（Stage=="上場"の最新日）を銘柄ごとに集計 ---
     listed_only = listing_events.loc[listing_events["Stage"] == "上場"] if not listing_events.empty else listing_events

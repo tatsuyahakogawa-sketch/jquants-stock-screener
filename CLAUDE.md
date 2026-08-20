@@ -95,7 +95,7 @@ J-Quantsのマスタとは無関係に地方単独上場企業を特定できる
 Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボードとして
 最速で構築でき、J-Quants呼び出し・スクリーニング処理もPythonで一本化できるため。
 
-- `app.py`: Streamlit UI。単一ページ構成（2026-08-19に`pages/`のマルチページ構成から統合）。「絞り込み条件」内の「地方単独上場企業のみを検索する」チェックボックスで、通常のスクリーニング（絞り込み条件選択 → スクリーニング実行 → 銘柄集計テーブル/CSV）と地方株スキャン結果（下記`src/regional_stocks.py`のUI）を切り替える。地方単独上場企業はPBR等の財務条件と併用不可のため、チェックボックスONの間は財務条件のカードごと非表示にする（2026-08-19にページ切り替えのst.radioから変更。地方株はPBR等の財務条件を持たないため、切り替えではなく条件の一つとして選べる方が自然というフィードバックのため）
+- `app.py`: Streamlit UI。単一ページ構成（2026-08-19に`pages/`のマルチページ構成から統合）。「絞り込み条件」内の「地方単独上場企業のみを検索する」チェックボックスで、通常のスクリーニング（絞り込み条件選択 → スクリーニング実行 → 銘柄集計テーブル/CSV）と地方株スキャン結果（下記`src/regional_stocks.py`のUI）を切り替える（2026-08-19にページ切り替えのst.radioから変更。地方株はPBR等の財務条件を持たないため、切り替えではなく条件の一つとして選べる方が自然というフィードバックのため）。地方株モードではJ-Quantsベースの財務条件カード（PBR等）は非表示になる代わりに、TDnet決算短信ベースの「💰 財務条件で絞り込む」（売上高増加・自己資本比率等、下記`src/tdnet_xbrl.py`参照）が表示される
 - `src/jquants_client.py`: J-Quants認証・レート制限（429時は65秒待って自動リトライ）・ページネーション
 - `src/endpoints.py`: 日付単位バルク取得 + ローカルキャッシュ（`data/cache/`, parquet）
 - `src/cache.py`: 上記ローカルキャッシュの実体。`SUPABASE_URL`/`SUPABASE_KEY`設定時はSupabase（PostgREST）にも保存し、Streamlit Cloudの再デプロイでローカルキャッシュが消えても再利用できるようにする（任意設定、未設定でも動作、README参照）
@@ -105,7 +105,8 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `src/pipeline.py`: 取得〜判定〜銘柄単位集計(build_summary)〜市場データ付与(enrich_with_market_data)のオーケストレーション。時価総額/PER/PBR/配当利回り計算(compute_market_metrics)と上場日近似(estimate_listing_date)はexcel_export.pyと共用
 - `src/excel_export.py`: 銘柄コード→Excel自動生成。企業詳細・実行表とも、元のExcel（個人情報・実データを除いた汎用テンプレート化: `templates/company_detail_template.xlsx`, `templates/execution_table_template.xlsx`）のレイアウト・書式・数式をそのまま使い値だけを埋める方式。定性コメント欄はtdnet_client/edinet_clientの実データで埋め、市況解釈が必要な項目（価格が上下した理由）は空欄のまま
 - `scripts/inspect_schema.py`: J-QuantsレスポンスのカラムをAPI実物で確認する検証用スクリプト
-- `src/regional_stocks.py`: 「地方株」モード用。地方取引所（札幌・福岡・名古屋）単独上場企業をTDnet開示の`markets_string`列（東/福/名/札）で特定し、新規上場・東証関連イベント・M&A等大型イベントを検出する。J-Quantsは地方取引所単独上場企業を対象としないため使用しない。株価（現在値のみ、時価総額は算出不可）は福証単独上場企業のみyfinanceの`.F`サフィックスで取得可（名証・札証・新規英数字コード銘柄は取得不可）。前回スキャン済み日付をキャッシュに保存し、次回はその翌日からだけ追加取得する
+- `src/regional_stocks.py`: 「地方株」モード用。地方取引所（札幌・福岡・名古屋）単独上場企業をTDnet開示の`markets_string`列（東/福/名/札）で特定し、新規上場・東証関連イベント・M&A等大型イベントを検出する。J-Quantsは地方取引所単独上場企業を対象としないため使用しない。株価（現在値のみ、時価総額は算出不可）は福証単独上場企業のみyfinanceの`.F`サフィックスで取得可（名証・札証・新規英数字コード銘柄は取得不可）。前回スキャン済み日付をキャッシュに保存し、次回はその翌日からだけ追加取得する。`fetch_regional_statements()`で決算短信からsrc/tdnet_xbrl.py経由の財務データを蓄積し、`screen_regional()`でsrc/rules.pyの各`detect_*`（売上高増加・自己資本比率等、株価不要の条件のみ）をそのまま適用する（`REGIONAL_STATEMENT_RULES`/`REGIONAL_TITLE_RULES`参照。PBR・ストップ高は株価データが必要なため未対応）
+- `src/tdnet_xbrl.py`: TDnet決算短信の「サマリー情報」XBRL(`url_xbrl`)を、J-Quants(`/fins/summary`)互換の列名(Sales/OP/OdP/NP/EqAR等)にパースする。東証以外の取引所単独上場企業の決算短信も同一の標準タクソノミ(`tse-ed-t:...`)を使うことを実機確認済み。iXBRLの`scale`/`sign`属性を正しく反映しないと単位・符号を誤る（2026-08-19に前年同期の赤字をsign属性なしで正の値と誤読するバグを実機データで発見・修正した経緯あり）。TDnetの開示添付ファイルは公開から約1〜1.5ヶ月で取得できなくなり過去分をバックフィルできないため、決算短信本文に埋め込まれている前年同期実績も1行として一緒に抽出し、初回スキャンの時点から前年同期比較を可能にしている
 - `src/auth.py`: パスワード認証（元はapp.py内にあったものを切り出し）
 
 ## 開発体制（Claude Code + Codexレビュー）

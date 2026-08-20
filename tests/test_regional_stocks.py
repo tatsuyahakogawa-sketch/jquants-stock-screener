@@ -25,7 +25,7 @@ from src import regional_stocks
 _MOD = "src.regional_stocks"
 
 
-def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://example.com/x.pdf"):
+def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://example.com/x.pdf", url_xbrl=None):
     return {
         "id": id_,
         "company_code": code,
@@ -34,7 +34,16 @@ def _disclosure(id_, code, name, title, pubdate, markets_string, url="https://ex
         "pubdate": pubdate,
         "markets_string": markets_string,
         "document_url": url,
+        "url_xbrl": url_xbrl,
     }
+
+
+class TestRegionalStatementRules(unittest.TestCase):
+    def test_profit_doubling_not_offered_yet(self):
+        # profit_doublingは4年分の比較対象が蓄積されるまで判定不能なため、
+        # UIの選択肢からは意図的に外している（2026-08-19の4巡目のCodexレビューで
+        # 指摘: 判定不能なのに「該当なし」としか表示できず紛らわしいため）。
+        self.assertNotIn("profit_doubling", regional_stocks.REGIONAL_STATEMENT_RULES)
 
 
 class TestIsRegionalOnly(unittest.TestCase):
@@ -396,6 +405,349 @@ class TestFetchRegionalSharePrice(unittest.TestCase):
         self.assertIn("取得不可", note)
 
 
+class TestFetchRegionalStatements(unittest.TestCase):
+    def test_filters_to_regional_tanshin_with_xbrl_within_lookback(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "2026年6月期 第1四半期決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+            # 東証を含む(地方単独上場ではない)ため対象外
+            _disclosure("2", "10000", "東証銘柄", "2026年6月期 決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "東", url_xbrl="https://example.com/2.zip"),
+            # 決算短信ではないため対象外
+            _disclosure("3", "33460", "ヒロタグループHD", "新工場設置に関するお知らせ",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/3.zip"),
+            # XBRL添付が無いため対象外
+            _disclosure("4", "33460", "ヒロタグループHD", "2026年6月期 決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl=None),
+            # REGIONAL_STATEMENTS_LOOKBACK_DAYSより古いため対象外
+            _disclosure("5", "33460", "ヒロタグループHD", "2026年3月期 決算短信〔日本基準〕(連結)",
+                        "2025-01-01 15:30:00", "名", url_xbrl="https://example.com/5.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 8, 13), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": 16_000_000.0, "OdP": 14_000_000.0, "NP": 216_000_000.0,
+             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
+        ]
+        with patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows) as mock_fetch:
+            result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+
+        mock_fetch.assert_called_once_with("https://example.com/1.zip", "33460", dt.date(2026, 8, 13))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["id"], "1_0")
+        self.assertEqual(result.iloc[0]["Code"], "33460")
+        self.assertListEqual(list(result.columns), regional_stocks._STATEMENTS_COLUMNS)
+
+    def test_missing_url_xbrl_column_returns_empty_without_error(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名"),
+        ]).drop(columns=["url_xbrl"])
+        result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertTrue(result.empty)
+        self.assertListEqual(list(result.columns), regional_stocks._STATEMENTS_COLUMNS)
+
+    def test_missing_markets_string_included_via_was_known_regional(self):
+        # markets_stringが欠損している決算短信でも、was_known_regionalで直前
+        # まで地方単独上場と分かっていれば対象に含める。含めないと、
+        # update_regional_store()のウォーターマークが進んだ後は同じ開示が
+        # 二度と対象にならず、その四半期の財務データが永久に欠落する
+        # （_latest_company_status/_delisting_dates_by_codeと同種の欠損対応）。
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", float("nan"), url_xbrl="https://example.com/1.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 8, 13), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": 16_000_000.0, "OdP": 14_000_000.0, "NP": 216_000_000.0,
+             "EqAR": 0.34, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
+        ]
+        without_context = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertTrue(without_context.empty)
+
+        with patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows):
+            with_context = regional_stocks.fetch_regional_statements(
+                disclosures, today=dt.date(2026, 8, 19), was_known_regional=pd.Series([True], index=disclosures.index)
+            )
+        self.assertEqual(len(with_context), 1)
+        self.assertEqual(with_context.iloc[0]["Code"], "33460")
+
+    def test_per_disclosure_fetch_failure_is_skipped_not_fatal(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-13 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+            _disclosure("2", "19990", "サイタHD", "決算短信〔日本基準〕(連結)",
+                        "2026-08-18 15:30:00", "福", url_xbrl="https://example.com/2.zip"),
+        ])
+        fake_row = [{
+            "Code": "19990", "DiscDate": dt.date(2026, 8, 18), "CurPerType": "FY",
+            "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+            "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None,
+            "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+        }]
+        with patch(
+            f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows",
+            side_effect=[RuntimeError("boom"), fake_row],
+        ):
+            result = regional_stocks.fetch_regional_statements(disclosures, today=dt.date(2026, 8, 19))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "19990")
+
+
+_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST = [
+    "id", "company_code", "company_name", "title", "pubdate", "markets_string", "document_url", "url_xbrl",
+]
+
+
+def _statement_row(
+    code, disc_date, per_type, per_end, fy_end, sales, prev_sales=None, eqar=None, is_primary=True,
+    disclosure_id=None,
+):
+    return {
+        "id": f"{code}_{per_end}_{disc_date}", "Code": code, "DiscDate": disc_date, "CurPerType": per_type,
+        "CurPerEn": pd.Timestamp(per_end), "CurFYEn": pd.Timestamp(fy_end),
+        "Sales": sales, "OP": None, "OdP": None, "NP": None, "EqAR": eqar,
+        "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": is_primary,
+        "DisclosureId": disclosure_id if disclosure_id is not None else f"{code}_{disc_date}",
+    }
+
+
+class TestScreenRegional(unittest.TestCase):
+    def test_selected_statement_rule_only(self):
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31", 378_000_000.0, eqar=0.34),
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2025-06-30", "2026-03-31", 100_000_000.0),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "33460", "CompanyName": "ヒロタグループHD", "MarketsString": "名",
+             "LastSeenDate": pd.Timestamp("2026-08-13")},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)の両方の条件を数値として
+        # 満たす。detect_sales_growthは両方のruleタグを返す（rules.pyのdocstring
+        # 参照。"sales_growth_major"だけを選んでも、実際には+20%以上でもある
+        # 爆発的成長銘柄が漏れないようにするため）。
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive"})
+        self.assertTrue((hits["Code"] == "33460").all())
+        self.assertTrue((hits["CompanyName"] == "ヒロタグループHD").all())
+
+    def test_unselected_rule_is_not_evaluated(self):
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31", 378_000_000.0, eqar=0.99),
+        ])
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        self.assertTrue(hits.empty)  # equity_ratio_highを選んでいないため、EqAR=0.99でもヒットしない
+
+    def test_title_based_rule_uses_disclosures_df(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "Ｑ－ジオロケ", "新工場設置に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["new_facility_or_store"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Rule"], "new_facility_or_store")
+
+    def test_empty_selection_returns_empty_with_expected_columns(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, [])
+        self.assertTrue(hits.empty)
+        self.assertListEqual(
+            list(hits.columns), ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
+        )
+
+    def test_equity_ratio_uses_latest_statement_only(self):
+        # 本決算のprior_row(前年同期)がEqARを持つケース。当期(最新)のEqARが
+        # 閾値未満でも、古いprior_rowが閾値以上だと誤ってヒットしていた回帰
+        # テスト（2026-08-19のCodexレビューで指摘、実データで確認）。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, eqar=0.50, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=False),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "19990", "CompanyName": "サイタHD", "MarketsString": "福",
+             "LastSeenDate": pd.Timestamp("2026-08-18")},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["equity_ratio_high"])
+        self.assertTrue(hits.empty)  # 最新(当期)は50%のため60%閾値に届かない
+
+    def test_excludes_companies_no_longer_regional(self):
+        # company_status上で既に東証移籍済み(MarketsStringに"東"を含む)の銘柄は、
+        # statements_dfに古い財務データが残っていても地方株の財務条件結果には
+        # 含めない（2026-08-19のCodexレビューで指摘、実データで確認）。
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31",
+                            378_000_000.0, eqar=0.34, is_primary=True),
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2025-06-30", "2026-03-31",
+                            100_000_000.0, is_primary=False),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "33460", "CompanyName": "ヒロタグループHD", "MarketsString": "東名",
+             "LastSeenDate": pd.Timestamp("2026-08-13"), "IsDelisted": False},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
+        self.assertTrue(hits.empty)
+
+
+class TestLatestPrimaryStatements(unittest.TestCase):
+    def test_keeps_only_latest_primary_row_per_company(self):
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, eqar=0.50, is_primary=True),
+            _statement_row("19990", dt.date(2025, 8, 20), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, eqar=0.65, is_primary=False),
+        ])
+        result = regional_stocks._latest_primary_statements(statements)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result.iloc[0]["EqAR"], 0.50)
+
+    def test_empty_input_returns_empty(self):
+        result = regional_stocks._latest_primary_statements(pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS))
+        self.assertTrue(result.empty)
+
+
+class TestCurrentlyRegionalCodes(unittest.TestCase):
+    def test_excludes_tokyo_and_delisted(self):
+        company_status = pd.DataFrame([
+            {"Code": "1", "MarketsString": "福", "IsDelisted": False},
+            {"Code": "2", "MarketsString": "東福", "IsDelisted": False},
+            {"Code": "3", "MarketsString": "名", "IsDelisted": True},
+        ])
+        result = regional_stocks._currently_regional_codes(company_status)
+        self.assertEqual(result, {"1"})
+
+    def test_missing_is_delisted_column_treated_as_not_delisted(self):
+        company_status = pd.DataFrame([{"Code": "1", "MarketsString": "福"}])
+        result = regional_stocks._currently_regional_codes(company_status)
+        self.assertEqual(result, {"1"})
+
+    def test_empty_input_returns_none(self):
+        self.assertIsNone(regional_stocks._currently_regional_codes(pd.DataFrame()))
+
+
+class TestDedupeSupersededStatements(unittest.TestCase):
+    def test_keeps_latest_primary_row_for_same_period(self):
+        # 訂正決算短信で同じ期(CurPerType, CurPerEn)の実際の開示行(IsPrimary=True)
+        # が複数ある場合、最新のDiscDateだけを残す。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2026-06-30", "2026-06-30",
+                            7_035_000_000.0, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 25), "FY", "2026-06-30", "2026-06-30",
+                            7_050_000_000.0, is_primary=True),  # 訂正後の数値
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Sales"], 7_050_000_000.0)
+
+    def test_does_not_merge_synthetic_rows_from_different_disclosures(self):
+        # 今年の開示のprior_row(前年同期の合成行)と、去年の開示のcur_rowが
+        # 同じCurPerEnを指すのは正当なケースであり、統合してはいけない
+        # （開示日ベースの時系列比較が壊れるため）。
+        statements = pd.DataFrame([
+            _statement_row("19990", dt.date(2025, 8, 20), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, is_primary=True),
+            _statement_row("19990", dt.date(2026, 8, 18), "FY", "2025-06-30", "2025-06-30",
+                            7_841_000_000.0, is_primary=False),
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 2)
+
+    def test_missing_isprimary_column_returns_unchanged(self):
+        statements = pd.DataFrame([{"Code": "1", "CurPerType": "FY", "CurPerEn": pd.Timestamp("2026-06-30")}])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(len(result), 1)
+
+    def test_removes_synthetic_guidance_row_belonging_to_superseded_disclosure(self):
+        # 訂正決算短信で置き換えられた(古い方の)実際の開示行だけでなく、その
+        # 開示に埋め込まれていた翌期予想の合成行(guidance_row、同じDiscDate)も
+        # 一緒に取り除く。残したままだと、訂正で修正されたはずの誤った予想値が
+        # detect_downward_revision()の比較対象に残ってしまう
+        # （2026-08-19の3巡目のCodexレビューで指摘）。
+        original_disc_date = dt.date(2026, 8, 18)
+        corrected_disc_date = dt.date(2026, 8, 25)
+        statements = pd.DataFrame([
+            {
+                "id": "orig_cur", "Code": "19990", "DiscDate": original_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "orig_disclosure",
+            },
+            {
+                # 訂正前の(誤った)翌期予想の合成行。同じDisclosureIdを共有する。
+                "id": "orig_guidance", "Code": "19990", "DiscDate": original_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.NaT, "CurFYEn": pd.Timestamp("2027-06-30"),
+                "Sales": None, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": 999_000_000.0, "BPS": None, "IsPrimary": False,
+                "DisclosureId": "orig_disclosure",
+            },
+            {
+                "id": "corrected_cur", "Code": "19990", "DiscDate": corrected_disc_date, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_050_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "corrected_disclosure",
+            },
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(set(result["id"]), {"corrected_cur"})
+
+    def test_same_day_correction_does_not_remove_the_corrected_release_own_rows(self):
+        # 元の開示と訂正決算短信が同じ暦日に公開された場合、DiscDate(時刻を
+        # 切り捨てた日付のみ)だけでは区別できない。DisclosureId(TDnet開示の
+        # ID)で区別することで、訂正側の正しい合成行まで巻き添えで削除しない
+        # ことを確認する（2026-08-19の4巡目のCodexレビューで指摘・修正）。
+        # TDnetの開示IDは概ね発行順に大きくなる数字文字列のため、テストでも
+        # その形式(後の開示ほど大きい値)に合わせる。
+        same_day = dt.date(2026, 8, 18)
+        statements = pd.DataFrame([
+            {
+                "id": "orig_cur", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_035_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "202608180001",
+            },
+            {
+                "id": "corrected_cur", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2026-06-30"),
+                "Sales": 7_050_000_000.0, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True,
+                "DisclosureId": "202608180002",
+            },
+            {
+                # 訂正側(202608180002)自身の翌期予想合成行。DiscDateはcur行と
+                # 同じ同日だが、DisclosureIdは正しく紐付いている。
+                "id": "corrected_guidance", "Code": "19990", "DiscDate": same_day, "CurPerType": "FY",
+                "CurPerEn": pd.NaT, "CurFYEn": pd.Timestamp("2027-06-30"),
+                "Sales": None, "OP": None, "OdP": None, "NP": None, "EqAR": None,
+                "FSales": None, "FOP": None, "FNP": 500_000_000.0, "BPS": None, "IsPrimary": False,
+                "DisclosureId": "202608180002",
+            },
+        ])
+        result = regional_stocks._dedupe_superseded_statements(statements)
+        self.assertEqual(set(result["id"]), {"corrected_cur", "corrected_guidance"})
+
+
 class TestUpdateRegionalStore(unittest.TestCase):
     """cache.pyのCACHE_DIRを一時ディレクトリに差し替えて、実際にparquet往復させる。"""
 
@@ -649,6 +1001,70 @@ class TestUpdateRegionalStore(unittest.TestCase):
             regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
 
         mock_save_watermark.assert_not_called()
+
+    def test_statements_watermark_not_advanced_when_a_table_save_fails(self):
+        disclosures = pd.DataFrame([
+            _disclosure("1", "93880", "Ｑ－パパネッツ", "福岡証券取引所本則市場への重複上場に関するお知らせ",
+                        "2026-08-01 08:00:00", "福"),
+        ])
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=disclosures), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")), \
+                patch(f"{_MOD}.cache.save", return_value=False), \
+                patch(f"{_MOD}._save_statements_watermark") as mock_save_statements_watermark:
+            regional_stocks.update_regional_store(today=dt.date(2026, 8, 13))
+
+        mock_save_statements_watermark.assert_not_called()
+
+    def test_statements_backfill_when_listing_watermark_already_advanced(self):
+        # 上場イベント用のwatermarkは既に進んでいるが、statements機能を後から
+        # 追加した直後でstatements_watermarkがまだ無い状況（既存デプロイへの
+        # 機能追加）。REGIONAL_STATEMENTS_LOOKBACK_DAYS分だけ別途遡って取得し、
+        # まだ取得可能な直近の決算短信を取りこぼさないことを確認する
+        # （2026-08-19の3巡目のCodexレビューで指摘）。
+        regional_stocks._save_watermark(dt.date(2026, 8, 13))  # 上場イベント側は既に8/13まで進んでいる
+
+        backfill_disclosures = pd.DataFrame([
+            _disclosure("1", "33460", "ヒロタグループHD", "決算短信〔日本基準〕(連結)",
+                        "2026-07-01 15:30:00", "名", url_xbrl="https://example.com/1.zip"),
+        ])
+        fake_rows = [
+            {"Code": "33460", "DiscDate": dt.date(2026, 7, 1), "CurPerType": "1Q",
+             "CurPerEn": pd.Timestamp("2026-06-30"), "CurFYEn": pd.Timestamp("2027-03-31"),
+             "Sales": 378_000_000.0, "OP": None, "OdP": None, "NP": None,
+             "EqAR": None, "FSales": None, "FOP": None, "FNP": None, "BPS": None, "IsPrimary": True},
+        ]
+
+        call_ranges = []
+
+        def fake_get_disclosures_range(start, end, force_refresh=False):
+            call_ranges.append((start, end))
+            if len(call_ranges) == 3:  # stable, today分に続く3回目がstatements用バックフィル
+                return backfill_disclosures
+            return pd.DataFrame()
+
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", side_effect=fake_get_disclosures_range), \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")), \
+                patch(f"{_MOD}.tdnet_xbrl.fetch_tanshin_statement_rows", return_value=fake_rows):
+            result = regional_stocks.update_regional_store(today=dt.date(2026, 8, 19))
+
+        self.assertEqual(len(call_ranges), 3)
+        # 3回目の呼び出しがstatements専用の遡り取得(today-60〜listing側watermarkの前日)
+        self.assertEqual(call_ranges[2], (dt.date(2026, 6, 20), dt.date(2026, 8, 13)))
+        self.assertEqual(len(result["statements"]), 1)
+        self.assertEqual(result["statements"].iloc[0]["Code"], "33460")
+
+    def test_no_statements_backfill_once_watermarks_are_in_sync(self):
+        # 両方のwatermarkが揃って進んでいる通常運用時は、statements用の
+        # 追加バックフィル取得(3回目の呼び出し)が発生しないことを確認する
+        # （毎回同じ60日分を再取得する無駄を避けるため）。
+        regional_stocks._save_watermark(dt.date(2026, 8, 13))
+        regional_stocks._save_statements_watermark(dt.date(2026, 8, 13))
+
+        with patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()) as mock_get, \
+                patch(f"{_MOD}.fetch_regional_share_price", return_value=(None, "取得不可（テスト）")):
+            regional_stocks.update_regional_store(today=dt.date(2026, 8, 15))
+
+        self.assertEqual(len(mock_get.call_args_list), 2)
 
 
 if __name__ == "__main__":
