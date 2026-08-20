@@ -380,14 +380,31 @@ def _latest_operating_margin(fins: pd.DataFrame) -> float | None:
     return float(row["OP"] / row["Sales"] * 100)
 
 
-def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> dict:
+def compute_market_metrics(
+    fins: pd.DataFrame,
+    price_history: pd.DataFrame,
+    fallback_price: float | None = None,
+    fallback_price_date: dt.date | None = None,
+) -> dict:
     """財務履歴と株価履歴から、時価総額・PER・PBR・配当利回り・最新終値等を計算する。
 
     enrich_with_market_data（銘柄集計テーブル用）とexcel_export（Excel出力用）の
     両方から呼ばれる共通ロジック。
+
+    地方単独上場企業等、J-Quantsに株価データが無い(price_historyが空の)銘柄
+    向けに、呼び出し側でyfinance等から取得した参考価格をfallback_priceとして
+    渡せる。その場合、EPS/BPS/発行済株式数はJ-Quants由来のまま、株価だけを
+    fallback_priceで補ってPER/PBR/配当利回りを計算する
+    （price_sourceが"yfinance"になり、J-Quants実データとの区別ができる）。
+    ただし時価総額だけは計算しない。発行済株式数(ShOutFY/TrShFY)はJ-Quantsが
+    その銘柄を最後に追えていた時点(東証離脱前)の値のままで、fallback_priceは
+    現在値のため、両者を掛け合わせると異なる時点の値を混在させた誤った時価
+    総額になる（src/regional_stocks.pyのfetch_regional_share_priceのdocstring
+    参照。2026-08-20のCodexレビューで指摘）。
     """
     latest_close = None
     latest_price_date = None
+    price_source = None
     if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
         price_history = price_history.copy()
         price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
@@ -395,6 +412,12 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
         if not price_history.empty:
             latest_close = _to_numeric(price_history["C"]).iloc[-1]
             latest_price_date = price_history["Date"].iloc[-1]
+            price_source = "jquants"
+
+    if (latest_close is None or pd.isna(latest_close)) and fallback_price is not None and pd.notna(fallback_price):
+        latest_close = float(fallback_price)
+        latest_price_date = pd.Timestamp(fallback_price_date) if fallback_price_date is not None else None
+        price_source = "yfinance"
 
     feps = bps = shares_out = treasury_shares = div_ann = annualized_eps = None
     feps_date = bps_date = div_ann_date = annualized_eps_date = None
@@ -416,6 +439,13 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
             # 開示日以降に株式分割・併合があった場合、1株当たり指標(EPS/BPS/配当)を
             # 現在の株式数基準に換算する（開示日ちょうどの倍率でその後の分割の
             # 有無に関わらず補正されるため、分割が無い場合は倍率1.0で無害）。
+            # 既知の限界: price_sourceが"yfinance"（地方単独上場企業の株価
+            # フォールバック）の場合、price_historyはJ-Quantsの株価履歴
+            # （東証離脱前まで、AdjFactorも東証離脱後の分割・併合を含まない）
+            # のため、東証離脱後に分割・併合が行われてもここでは検出できず
+            # 倍率1.0のままになる。東証離脱後の分割・併合を検出できるデータ源が
+            # 無く是正できないため、呼び出し側(excel_export.py)でyfinance参考値
+            # である旨の注記に含めて開示する（2026-08-20のCodexレビューで指摘）。
             if feps is not None:
                 feps = feps * _split_adjustment_since(price_history, feps_date)
             if bps is not None:
@@ -448,7 +478,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
                 )
         if bps is not None and pd.notna(bps) and bps > 0:
             pbr = latest_close / bps
-        if shares_out is not None and pd.notna(shares_out):
+        if shares_out is not None and pd.notna(shares_out) and price_source != "yfinance":
             float_shares = shares_out - (treasury_shares if pd.notna(treasury_shares) else 0)
             market_cap = latest_close * float_shares
         if div_ann is not None and pd.notna(div_ann) and div_ann >= 0:
@@ -458,6 +488,7 @@ def compute_market_metrics(fins: pd.DataFrame, price_history: pd.DataFrame) -> d
     return {
         "latest_close": latest_close,
         "latest_price_date": latest_price_date,
+        "price_source": price_source,
         "market_cap": market_cap,
         "per": per,
         "pbr": pbr,
