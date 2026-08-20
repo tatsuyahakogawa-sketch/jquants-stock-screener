@@ -83,6 +83,30 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _is_primary_mask(df: pd.DataFrame) -> pd.Series:
+    """statements_dfの各行が「実際の開示」かどうかを示す真偽Seriesを返す
+    （IsPrimary列が無ければ全行True。J-Quants由来データとの後方互換）。
+
+    地方株のstatements_df(src/tdnet_xbrl.py由来)は、実際の開示行(IsPrimary=True)
+    に加え、開示に埋め込まれた前年同期実績・翌期予想の合成行(IsPrimary=False)を
+    含む。detect_sales_growth等の「前年同期と比較して増加した開示」を検出する
+    関数群は、比較の基準値(prev_*)としては合成行を使ってよいが、検出結果
+    (ヒット)自体は実際に行われた開示に限定する必要がある。合成行がヒットに
+    含まれると、実際には別の（後の）開示で埋め込まれた過去の比較値が、あたかも
+    その開示日に新しく判明した情報であるかのように表示されてしまい、特に
+    直近の実際の開示が逆方向（減収・下方修正等）だった場合に誤解を招く
+    （2026-08-19の5巡目のCodexレビューで指摘: detect_two_quarter_growthは
+    既にIsPrimaryで絞り込んでいたが、detect_sales_growth等の他の関数には
+    同じ絞り込みが漏れていた）。
+
+    astype(bool)は、空のDataFrameとのconcatでIsPrimary列がobject dtypeに
+    なりうるための明示的な型変換（src/regional_stocks.py参照）。
+    """
+    if "IsPrimary" not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df["IsPrimary"].fillna(True).astype(bool)
+
+
 def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
     """ストップ高で終値が確定した(Code, Date)の一覧を返す。"""
     if quotes_df.empty or QUOTES_UPPER_LIMIT_FLAG not in quotes_df.columns:
@@ -241,6 +265,10 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     # 前年同期との比較になっているかの軽いチェック（350〜380日程度離れているか）
     gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
     valid &= gap_days.between(330, 400)
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    # prev_net_sales等の比較基準値の計算自体は上のgroupby/shiftで既に全行
+    # （合成行含む）を使っているため、ここで絞ってもその計算には影響しない。
+    valid &= _is_primary_mask(df)
 
     growth = (df[STMT_NET_SALES] - df["prev_net_sales"]) / df["prev_net_sales"]
     df["growth_rate"] = growth
@@ -285,8 +313,10 @@ def detect_earnings_beat(statements_df: pd.DataFrame) -> pd.DataFrame:
     is_fy_actual = df[STMT_PERIOD_TYPE] == "FY"
     has_prev_forecast = df["prev_forecast_profit"].notna()
     beat = df[STMT_PROFIT] > (df["prev_forecast_profit"] * (1 + EARNINGS_BEAT_THRESHOLD))
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    is_primary = _is_primary_mask(df)
 
-    hit = df.loc[is_fy_actual & has_prev_forecast & beat].copy()
+    hit = df.loc[is_fy_actual & has_prev_forecast & beat & is_primary].copy()
     hit["rule"] = "earnings_beat"
     hit["detail"] = (
         "通期純利益 実績" + hit[STMT_PROFIT].astype(str)
@@ -324,6 +354,7 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
     df = df.dropna(subset=[STMT_ORDINARY_PROFIT])
     df[STMT_FY_END] = pd.to_datetime(df[STMT_FY_END], errors="coerce")
+    df["_is_primary"] = _is_primary_mask(df)
     df = df.sort_values([STMT_CODE, STMT_FY_END])
 
     target_days = 365 * PROFIT_DOUBLING_YEARS
@@ -334,6 +365,10 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
         group = group.reset_index(drop=True)
         for i in range(len(group)):
             cur = group.iloc[i]
+            if not cur["_is_primary"]:
+                # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring
+                # 参照）。比較対象(prev)の探索は合成行を含めたgroup全体から行う。
+                continue
             gap = (cur[STMT_FY_END] - group[STMT_FY_END]).dt.days
             candidates = group.loc[(gap - target_days).abs() <= tolerance_days]
             if candidates.empty:
@@ -374,8 +409,15 @@ def detect_downward_revision(statements_df: pd.DataFrame) -> pd.DataFrame:
     df["prev_forecast_profit"] = df.groupby([STMT_CODE, STMT_FY_END])[STMT_FORECAST_PROFIT].shift(1)
     has_prev = df["prev_forecast_profit"].notna()
     lowered = df[STMT_FORECAST_PROFIT] < (df["prev_forecast_profit"] * (1 - DOWNWARD_REVISION_THRESHOLD))
+    # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+    # prior_row(IsPrimary=False)は予想値(FSales/FOP/FNP)を持たないため、既に
+    # 上のdropna(subset=[STMT_FORECAST_PROFIT])で除外される。guidance_row
+    # (IsPrimary=False)は理論上は予想値を持つが、同一(Code, CurFYEn)内で最も
+    # 早い開示になるため通常はhas_prev=Falseとなりヒット候補にならない。将来の
+    # 構造変更に備えた保険として明示的にも絞り込む。
+    is_primary = _is_primary_mask(df)
 
-    hit = df.loc[has_prev & lowered].copy()
+    hit = df.loc[has_prev & lowered & is_primary].copy()
     hit["rule"] = "downward_revision"
     hit["detail"] = (
         "通期純利益予想 下方修正 " + hit["prev_forecast_profit"].astype(str)
@@ -438,10 +480,8 @@ def detect_two_quarter_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 「2期連続」判定のため、銘柄内を時系列(開示日)順に並べ直して直前の開示と比較する
-    # （IsPrimary列がある場合は実際の開示行のみを対象にする。上のdocstring参照。
-    # astype(bool)は、空のDataFrameとのconcatでIsPrimary列がobject dtypeに
-    # なりうるための明示的な型変換。src/regional_stocks.py参照）
-    seq = df.loc[df["IsPrimary"].fillna(True).astype(bool)] if "IsPrimary" in df.columns else df
+    # （実際の開示行のみを対象にする。上のdocstring・_is_primary_mask docstring参照）
+    seq = df.loc[_is_primary_mask(df)]
     seq = seq.sort_values([STMT_CODE, STMT_DISCLOSED_DATE])
     seq = seq.copy()
     seq["prev_grew_yoy"] = seq.groupby(STMT_CODE)["grew_yoy"].shift(1)

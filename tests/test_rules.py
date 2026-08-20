@@ -104,6 +104,48 @@ class TestDetectSalesGrowth(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["rule"], "sales_growth_major")
 
+    def test_excludes_synthetic_rows_from_hits(self):
+        # 2026年の実際の開示が一度も取得できず(XBRL保持期限切れ等)、2025年の
+        # 実開示(埋め込み前年同期=2024年)と2027年の実開示(埋め込み前年同期=
+        # 2026年)だけが残っている状況。2026年の合成行(IsPrimary=False、
+        # DiscDateは2027年の開示日を借用)が2025年の実開示と比べて閾値以上
+        # 増収していても、それ自体をヒットとして出してはいけない。ヒットの
+        # 日付が2027年の実開示日になるため、実際は2027年に減収したにも
+        # 関わらず「増収」と表示されてしまう（2026-08-19の5巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2025-08-10", 80, 8, is_primary=False),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 90, 9, is_primary=True),
+            # 2026年の合成行: 2025年比+25%(閾値超え)だが実際の開示ではない
+            _row("1234", "1Q", "2026-06-30", "2027-08-10", 100, 10, is_primary=False),
+            # 2027年の実開示: 2026年比で実際には減収
+            _row("1234", "1Q", "2027-06-30", "2027-08-10", 70, 7, is_primary=True),
+        ])
+        result = rules.detect_sales_growth(statements)
+        self.assertTrue(result.empty)
+
+
+class TestDetectEarningsBeat(unittest.TestCase):
+    def test_excludes_synthetic_rows_from_hits(self):
+        # 2025年の実際のFY開示が一度も取得できず、Q3(2025)の実開示(会社予想
+        # FNP=100)と、2026年のFY開示に埋め込まれた2025年の合成行(実績NP=150、
+        # DiscDateは2026年の開示日を借用)だけが残っている状況。この合成行が
+        # Q3時点の予想を上回っていても、それ自体をヒットとして出してはいけない
+        # （2026-08-19の5巡目のCodexレビューで指摘されたdetect_sales_growthと
+        # 同種の問題が、同じ構造を持つdetect_earnings_beatにもあったため修正）。
+        statements = pd.DataFrame([
+            {
+                "Code": "1234", "CurPerType": "3Q", "CurFYEn": pd.Timestamp("2025-06-30"),
+                "DiscDate": pd.Timestamp("2025-02-10"), "NP": None, "FNP": 100,
+            },
+            {
+                "Code": "1234", "CurPerType": "FY", "CurFYEn": pd.Timestamp("2025-06-30"),
+                "DiscDate": pd.Timestamp("2026-08-10"), "NP": 150, "FNP": None, "IsPrimary": False,
+            },
+        ])
+        result = rules.detect_earnings_beat(statements)
+        self.assertTrue(result.empty)
+
 
 if __name__ == "__main__":
     unittest.main()
