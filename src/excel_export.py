@@ -54,9 +54,9 @@ def _get_master_row(client: JQuantsClient, code: str) -> dict:
     return row.iloc[0].to_dict() if not row.empty else {}
 
 
-def _regional_fallback_info(code: str) -> tuple[str, str | None]:
+def _regional_fallback_info(code: str) -> tuple[str, str | None, float | None]:
     """equities/masterに載っていない銘柄（地方取引所単独上場等）向けに、
-    会社名と直近の上場市場情報(markets_string)を補う。
+    会社名・直近の上場市場情報(markets_string)・現在値を補う。
 
     regional_stocks.update_regional_store()（「地方株」ページの更新ボタンと
     同じ関数）を呼ぶ。この関数は前回スキャン済み日付の翌日からtodayまでの
@@ -67,45 +67,44 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None]:
     常にこちらを使って鮮度を保証する（2026-08-20のCodexレビューで指摘。
     上場廃止・市場移籍のchronology判定もupdate_regional_store側の
     実装・テスト済みロジックをそのまま再利用でき、二重実装を避けられる）。
-    見つからない場合は("", None)を返す（誤った推測値を出さない。README
-    「地方株」セクション参照）。
+
+    現在値はupdate_regional_store()が現在も地方単独上場の銘柄について
+    その場でyfinanceから取得済みの値(CurrentPrice)をそのまま返す。別途
+    fetch_regional_share_priceを呼び直すと、1回のExcel生成で同じ銘柄の
+    株価をyfinanceに2回問い合わせることになり（地方株ストア全体の更新で
+    1回、この銘柄個別でさらに1回）、後者だけ一時的なエラーになった場合に
+    前者で取得できていたはずの値まで空欄になってしまう
+    （2026-08-24のCodexレビューで指摘・修正）。
+
+    見つからない場合は("", None, None)を返す（誤った推測値を出さない。
+    README「地方株」セクション参照）。
     """
     try:
         status = regional_stocks.update_regional_store()["company_status"]
     except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
         logger.info("[%s] 地方株ストアの更新に失敗しました: %s", code, exc)
-        return "", None
+        return "", None, None
     if status.empty:
-        return "", None
+        return "", None, None
     code_str = str(code)
     candidates = {code_str}
     if len(code_str) == 4:
         candidates.add(code_str + "0")
     match = status.loc[status["Code"].astype(str).isin(candidates)]
     if match.empty:
-        return "", None
+        return "", None, None
     row = match.iloc[0]
     name = str(row.get("CompanyName") or "")
     if bool(row.get("IsDelisted")):
         # 上場廃止済み（地方取引所を含めどの市場にも上場していない）銘柄は、
         # 株価フォールバックの対象外にする（上場廃止後の古いyfinance終値を
         # 現在値として誤表示しないため）。
-        return name, None
+        return name, None, None
     markets_string = row.get("MarketsString")
-    return name, (str(markets_string) if isinstance(markets_string, str) and markets_string else None)
-
-
-def _regional_fallback_price(code: str, markets_string: str | None) -> tuple[float | None, dt.date | None]:
-    """地方単独上場企業向けのyfinance株価フォールバック（現在値のみ、実機確認済み
-    な福証銘柄のみ成功しうる。src/regional_stocks.pyのfetch_regional_share_priceと
-    同じロジックを再利用する）。取得できない場合は(None, None)を返す。
-    """
-    if not markets_string:
-        return None, None
-    price, _note = regional_stocks.fetch_regional_share_price(code, markets_string)
-    if price is None:
-        return None, None
-    return price, regional_stocks._today_jst()
+    markets_string = str(markets_string) if isinstance(markets_string, str) and markets_string else None
+    current_price = row.get("CurrentPrice")
+    current_price = float(current_price) if pd.notna(current_price) else None
+    return name, markets_string, current_price
 
 
 def _ensure_common_stock(master_row: dict, code: str) -> None:
@@ -210,14 +209,14 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
 
     company_name = master_row.get("CoName", "")
     regional_markets_string = None
+    fallback_price = fallback_price_date = None
     if not master_row:
         # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
-        # 市場情報を補う（README「地方株」セクション参照）。
-        company_name, regional_markets_string = _regional_fallback_info(code)
-
-    fallback_price = fallback_price_date = None
-    if not _has_usable_close(prices) and regional_markets_string:
-        fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
+        # 市場情報・現在値を補う（README「地方株」セクション参照）。
+        company_name, regional_markets_string, fallback_current_price = _regional_fallback_info(code)
+        if not _has_usable_close(prices) and fallback_current_price is not None:
+            fallback_price = fallback_current_price
+            fallback_price_date = regional_stocks._today_jst()
 
     metrics = pipeline.compute_market_metrics(fins, prices, fallback_price, fallback_price_date)
     listing_date, _recently_listed = pipeline.estimate_listing_date(prices)
@@ -336,15 +335,14 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     prices_raw = endpoints.get_price_history_by_code(client, code)
 
     company_name = master_row.get("CoName", "")
-    regional_markets_string = None
+    fallback_price = fallback_price_date = None
     if not master_row:
         # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
-        # 市場情報を補う（README「地方株」セクション参照）。
-        company_name, regional_markets_string = _regional_fallback_info(code)
-
-    fallback_price = fallback_price_date = None
-    if not _has_usable_close(prices_raw) and regional_markets_string:
-        fallback_price, fallback_price_date = _regional_fallback_price(code, regional_markets_string)
+        # 市場情報・現在値を補う（README「地方株」セクション参照）。
+        company_name, _regional_markets_string, fallback_current_price = _regional_fallback_info(code)
+        if not _has_usable_close(prices_raw) and fallback_current_price is not None:
+            fallback_price = fallback_current_price
+            fallback_price_date = regional_stocks._today_jst()
 
     metrics = pipeline.compute_market_metrics(fins, prices_raw, fallback_price, fallback_price_date)
     used_yfinance = metrics.get("price_source") == "yfinance"

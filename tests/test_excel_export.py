@@ -20,43 +20,63 @@ from src import excel_export
 _MOD = "src.excel_export"
 
 
-def _status_row(code, name, markets_string, is_delisted=False):
+def _status_row(code, name, markets_string, is_delisted=False, current_price=None):
     return {
         "Code": code, "CompanyName": name, "MarketsString": markets_string,
         "LastSeenDate": pd.Timestamp("2026-08-01"), "LastDelistingDate": pd.NaT,
-        "IsDelisted": is_delisted, "CurrentPrice": None, "CurrentPriceNote": "",
+        "IsDelisted": is_delisted, "CurrentPrice": current_price, "CurrentPriceNote": "",
     }
 
 
 class TestRegionalFallbackInfo(unittest.TestCase):
     """_regional_fallback_infoはregional_stocks.update_regional_store()
     （「地方株」ページの更新ボタンと同じ、自己ウォーターマーク方式の差分更新）
-    経由で会社名・市場情報を取得する。load_regional_store()（読み取り専用）
-    だとストアが古いまま(上場廃止・市場変更を取りこぼす)になりうるため、
-    常にupdate_regional_store()で鮮度を保証する
+    経由で会社名・市場情報・現在値を取得する。load_regional_store()（読み取り
+    専用）だとストアが古いまま(上場廃止・市場変更を取りこぼす)になりうる
+    ため、常にupdate_regional_store()で鮮度を保証する
     （2026-08-20の3巡目のCodexレビューで指摘・修正）。
     """
 
     def test_uses_updated_store_result(self):
-        store = {"company_status": pd.DataFrame([_status_row("93880", "テスト株式会社", "福")])}
+        store = {"company_status": pd.DataFrame(
+            [_status_row("93880", "テスト株式会社", "福", current_price=830.0)]
+        )}
         with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store) as mock_update:
-            name, markets_string = excel_export._regional_fallback_info("9388")
+            name, markets_string, price = excel_export._regional_fallback_info("9388")
 
         mock_update.assert_called_once_with()
         self.assertEqual(name, "テスト株式会社")
         self.assertEqual(markets_string, "福")
+        self.assertEqual(price, 830.0)
 
-    def test_delisted_company_returns_no_market(self):
-        # 上場廃止済みの銘柄は、株価フォールバックを発動させないためmarkets_string
-        # をNoneで返す（古いyfinance終値を現在値として誤表示しないため）。
+    def test_reuses_current_price_already_fetched_by_store_update(self):
+        # update_regional_store()は現在も地方単独上場の銘柄について、その場で
+        # yfinanceからCurrentPriceを取得済み。ここで別途fetch_regional_share_price
+        # を呼び直すと、1回のExcel生成でyfinanceに2回問い合わせることになり、
+        # 個別の再取得だけが一時的に失敗した場合に前者の値まで失われてしまう
+        # （2026-08-24の4巡目のCodexレビューで指摘・修正）。
         store = {"company_status": pd.DataFrame(
-            [_status_row("93880", "テスト株式会社", "福", is_delisted=True)]
+            [_status_row("93880", "テスト株式会社", "福", current_price=830.0)]
+        )}
+        with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store), \
+                patch(f"{_MOD}.regional_stocks.fetch_regional_share_price") as mock_fetch:
+            _name, _markets_string, price = excel_export._regional_fallback_info("9388")
+
+        mock_fetch.assert_not_called()
+        self.assertEqual(price, 830.0)
+
+    def test_delisted_company_returns_no_market_or_price(self):
+        # 上場廃止済みの銘柄は、株価フォールバックを発動させないためmarkets_string・
+        # 現在値ともNoneで返す（古いyfinance終値を現在値として誤表示しないため）。
+        store = {"company_status": pd.DataFrame(
+            [_status_row("93880", "テスト株式会社", "福", is_delisted=True, current_price=830.0)]
         )}
         with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store):
-            name, markets_string = excel_export._regional_fallback_info("9388")
+            name, markets_string, price = excel_export._regional_fallback_info("9388")
 
         self.assertEqual(name, "テスト株式会社")
         self.assertIsNone(markets_string)
+        self.assertIsNone(price)
 
     def test_returns_blank_when_company_not_found(self):
         store = {"company_status": pd.DataFrame(
@@ -64,16 +84,17 @@ class TestRegionalFallbackInfo(unittest.TestCase):
                      "LastDelistingDate", "IsDelisted", "CurrentPrice", "CurrentPriceNote"]
         )}
         with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store):
-            name, markets_string = excel_export._regional_fallback_info("9388")
+            name, markets_string, price = excel_export._regional_fallback_info("9388")
 
         self.assertEqual(name, "")
         self.assertIsNone(markets_string)
+        self.assertIsNone(price)
 
     def test_matches_four_digit_code_with_trailing_zero(self):
         # TDnet/regional_stocks側のcompany_codeは5桁表記(4桁+"0")のことがある。
         store = {"company_status": pd.DataFrame([_status_row("93880", "テスト株式会社", "福")])}
         with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store):
-            name, markets_string = excel_export._regional_fallback_info("9388")
+            name, markets_string, _price = excel_export._regional_fallback_info("9388")
 
         self.assertEqual(name, "テスト株式会社")
         self.assertEqual(markets_string, "福")
@@ -82,10 +103,11 @@ class TestRegionalFallbackInfo(unittest.TestCase):
         # TDnetミラー障害等でupdate_regional_store()自体が例外を投げても、
         # 呼び出し元の処理(Excel生成)は続行できるよう空の結果を返す。
         with patch(f"{_MOD}.regional_stocks.update_regional_store", side_effect=RuntimeError("network down")):
-            name, markets_string = excel_export._regional_fallback_info("9388")
+            name, markets_string, price = excel_export._regional_fallback_info("9388")
 
         self.assertEqual(name, "")
         self.assertIsNone(markets_string)
+        self.assertIsNone(price)
 
 
 class TestHasUsableClose(unittest.TestCase):
