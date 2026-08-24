@@ -15,8 +15,9 @@ from pathlib import Path
 
 import openpyxl
 import pandas as pd
+from openpyxl.comments import Comment
 
-from src import edinet_client, endpoints, pipeline
+from src import edinet_client, endpoints, pipeline, regional_stocks
 from src.jquants_client import JQuantsClient
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,70 @@ def _get_master_row(client: JQuantsClient, code: str) -> dict:
         candidates.add(code_str + "0")
     row = listed.loc[listed["Code"].astype(str).isin(candidates)]
     return row.iloc[0].to_dict() if not row.empty else {}
+
+
+def _regional_fallback_info(code: str) -> tuple[str, str | None, float | None]:
+    """equities/masterに載っていない銘柄（地方取引所単独上場等）向けに、
+    会社名・直近の上場市場情報(markets_string)・現在値を補う。
+
+    regional_stocks.update_regional_store()（「地方株」ページの更新ボタンと
+    同じ関数）を呼ぶ。この関数は前回スキャン済み日付の翌日からtodayまでの
+    差分だけを取得する自己ウォーターマーク方式のため、ストアが既に最新で
+    あれば当日分のTDnet開示を1回取得するだけで済み、初回のみ数年分を
+    ブートストラップする。load_regional_store()（読み取り専用）を使うと
+    ストアが古いまま（上場廃止・市場変更を取りこぼす）になりうるため、
+    常にこちらを使って鮮度を保証する（2026-08-20のCodexレビューで指摘。
+    上場廃止・市場移籍のchronology判定もupdate_regional_store側の
+    実装・テスト済みロジックをそのまま再利用でき、二重実装を避けられる）。
+
+    現在値はupdate_regional_store()が現在も地方単独上場の銘柄について
+    その場でyfinanceから取得済みの値(CurrentPrice)をそのまま返す。別途
+    fetch_regional_share_priceを呼び直すと、1回のExcel生成で同じ銘柄の
+    株価をyfinanceに2回問い合わせることになり（地方株ストア全体の更新で
+    1回、この銘柄個別でさらに1回）、後者だけ一時的なエラーになった場合に
+    前者で取得できていたはずの値まで空欄になってしまう
+    （2026-08-24のCodexレビューで指摘・修正）。
+
+    見つからない場合は("", None, None)を返す（誤った推測値を出さない。
+    README「地方株」セクション参照）。
+    """
+    try:
+        status = regional_stocks.update_regional_store()["company_status"]
+    except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
+        logger.info("[%s] 地方株ストアの更新に失敗しました: %s", code, exc)
+        return "", None, None
+    if status.empty:
+        return "", None, None
+    code_str = str(code)
+    candidates = {code_str}
+    if len(code_str) == 4:
+        candidates.add(code_str + "0")
+    match = status.loc[status["Code"].astype(str).isin(candidates)]
+    if match.empty:
+        return "", None, None
+    row = match.iloc[0]
+    name = str(row.get("CompanyName") or "")
+    if bool(row.get("IsDelisted")):
+        # 上場廃止済み（地方取引所を含めどの市場にも上場していない）銘柄は、
+        # 株価フォールバックの対象外にする（上場廃止後の古いyfinance終値を
+        # 現在値として誤表示しないため）。
+        return name, None, None
+    markets_string = row.get("MarketsString")
+    markets_string = str(markets_string) if isinstance(markets_string, str) and markets_string else None
+    current_price = row.get("CurrentPrice")
+    current_price = float(current_price) if pd.notna(current_price) else None
+    if current_price is not None and not regional_stocks.is_regional_only(markets_string):
+        # update_regional_store()は「現在も地方単独上場」の銘柄だけCurrentPrice
+        # を更新し、東証を含む市場に移った銘柄は更新をスキップして古い値を
+        # そのまま保持する（regional_stocks.py内のコメント参照）。TDnet側では
+        # 既に東証移籍(例: markets_stringが"福"→"東福")が反映されているのに
+        # J-Quantsのマスタがまだ追いついていない（equities/masterに未反映で
+        # master_rowが空のまま）タイミングでは、この関数のIsDelisted判定だけ
+        # では弾けず、更新が止まった古いyfinance価格を「現在値」として誤って
+        # 提示してしまう。markets_stringが既に地方単独上場でなくなっている
+        # 場合は現在値を返さない（2026-08-24の5巡目のCodexレビューで指摘・修正）。
+        current_price = None
+    return name, markets_string, current_price
 
 
 def _ensure_common_stock(master_row: dict, code: str) -> None:
@@ -117,6 +182,34 @@ def _latest_actual_fy_end(fins: pd.DataFrame) -> dt.date | None:
     return f["CurFYEn"].max().date()
 
 
+_YFINANCE_ESTIMATE_NOTE = (
+    "この値はJ-Quantsに株価データが無い銘柄（地方取引所単独上場等）向けに、"
+    "yfinance（非公式データ源）の現在値を使って計算した参考値です。"
+    "J-Quantsで検証された実績値ではありません。"
+    "また、東証離脱後に株式分割・併合が行われた場合、EPS・BPS・配当は分割前の"
+    "基準のままになりPER・PBR・配当利回りも実際とずれる可能性があります"
+    "（東証離脱後の分割・併合を検出できるデータ源が無いため）。"
+)
+
+
+def _add_yfinance_note(ws, *cell_refs: str) -> None:
+    for ref in cell_refs:
+        ws[ref].comment = Comment(_YFINANCE_ESTIMATE_NOTE, "excel_export.py")
+
+
+def _has_usable_close(prices: pd.DataFrame) -> bool:
+    """株価履歴に実際に使える終値が1件でもあるかを判定する。
+
+    地方取引所単独上場企業等、equities/masterから消えた銘柄は
+    /equities/bars/dailyが空のDataFrameではなく、各営業日の行はあるが
+    C(終値)列が全期間nullという形で返ってくる（CLAUDE.md「データ対象範囲の
+    制約」参照）。prices.emptyだけで判定すると、この「行はあるが中身が
+    全部null」なケースを取りこぼし、地方株のyfinance株価フォールバックが
+    発動しないままになる（2026-08-20のCodexレビューで指摘）。
+    """
+    return not prices.empty and "C" in prices.columns and _to_numeric(prices["C"]).notna().any()
+
+
 def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     """銘柄コードから「企業詳細」シートを埋めたExcel(bytes)を生成する。"""
     code = str(code)
@@ -124,14 +217,27 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     _ensure_common_stock(master_row, code)
     fins = endpoints.get_financials_by_code(client, code)
     prices = endpoints.get_price_history_by_code(client, code)
-    metrics = pipeline.compute_market_metrics(fins, prices)
+
+    company_name = master_row.get("CoName", "")
+    regional_markets_string = None
+    fallback_price = fallback_price_date = None
+    if not master_row:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
+        # 市場情報・現在値を補う（README「地方株」セクション参照）。
+        company_name, regional_markets_string, fallback_current_price = _regional_fallback_info(code)
+        if not _has_usable_close(prices) and fallback_current_price is not None:
+            fallback_price = fallback_current_price
+            fallback_price_date = regional_stocks._today_jst()
+
+    metrics = pipeline.compute_market_metrics(fins, prices, fallback_price, fallback_price_date)
     listing_date, _recently_listed = pipeline.estimate_listing_date(prices)
+    used_yfinance = metrics.get("price_source") == "yfinance"
 
     wb = openpyxl.load_workbook(COMPANY_DETAIL_TEMPLATE)
     ws = wb["原本"]
 
     ws["B1"] = code
-    ws["E1"] = master_row.get("CoName", "")
+    ws["E1"] = company_name
 
     latest_fy_end = _latest_actual_fy_end(fins)
     if latest_fy_end is not None:
@@ -156,6 +262,9 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     if latest_close is not None and pd.notna(latest_close):
         ws["B3"] = round(latest_close)
 
+    if used_yfinance:
+        _add_yfinance_note(ws, "E2", "I2", "M2", "Q2", "B3")
+
     if listing_date is not None:
         ws["F3"] = listing_date
         ws["F3"].number_format = "yyyy/m/d"
@@ -167,6 +276,13 @@ def build_company_detail_excel(client: JQuantsClient, code: str) -> bytes:
     market_name = master_row.get("MktNm")
     if market_name:
         ws["O4"] = market_name
+    elif regional_markets_string:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はMktNmが無いため、
+        # TDnet/地方株ストア由来のmarkets_stringから市場名を表示する
+        # （2026-08-20のCodexレビューで指摘）。
+        markets = regional_stocks.all_markets_in(regional_markets_string)
+        if markets:
+            ws["O4"] = "・".join(markets)
 
     yuho = edinet_client.fetch_yuho_texts(code, latest_fy_end)
 
@@ -203,6 +319,11 @@ EXECUTION_TABLE_TEMPLATE = TEMPLATE_DIR / "execution_table_template.xlsx"
 _YEAR_COLS = ["C", "E", "G", "I", "K", "M", "O"]
 _ROW_SALES = {"1Q": 5, "2Q": 6, "3Q": 7, "FY": 8}
 _ROW_PROFIT = {"1Q": 9, "2Q": 10, "3Q": 11, "FY": 12}
+# テンプレートの利益セルは元々小数1桁の書式("0.0;[Red]▲0.0;-")のため、
+# 小数2桁で丸めた値(round(profit / 1e8, 2))をそのまま書き込んでもExcel上は
+# 1桁までしか表示されない。値と書式を同時に更新する必要がある
+# （2026-08-20のCodexレビューで指摘）。
+_PROFIT_NUMBER_FORMAT = "0.00;[Red]▲0.00;-"
 _ROW_PRICE = {"1Q": 14, "2Q": 15, "3Q": 16, "FY": 17}
 
 
@@ -223,7 +344,19 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     _ensure_common_stock(master_row, code)
     fins = endpoints.get_financials_by_code(client, code)
     prices_raw = endpoints.get_price_history_by_code(client, code)
-    metrics = pipeline.compute_market_metrics(fins, prices_raw)
+
+    company_name = master_row.get("CoName", "")
+    fallback_price = fallback_price_date = None
+    if not master_row:
+        # equities/masterに無い銘柄（地方取引所単独上場等）はTDnetから会社名・
+        # 市場情報・現在値を補う（README「地方株」セクション参照）。
+        company_name, _regional_markets_string, fallback_current_price = _regional_fallback_info(code)
+        if not _has_usable_close(prices_raw) and fallback_current_price is not None:
+            fallback_price = fallback_current_price
+            fallback_price_date = regional_stocks._today_jst()
+
+    metrics = pipeline.compute_market_metrics(fins, prices_raw, fallback_price, fallback_price_date)
+    used_yfinance = metrics.get("price_source") == "yfinance"
 
     prices = prices_raw.copy()
     if not prices.empty:
@@ -234,7 +367,7 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     ws = wb["1"]
 
     ws["B1"] = code
-    ws["C1"] = master_row.get("CoName", "")
+    ws["C1"] = company_name
     latest_fy_end = _latest_actual_fy_end(fins)
     if latest_fy_end is not None:
         ws["M1"] = latest_fy_end.month
@@ -251,6 +384,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
         ws["O2"] = math.trunc(metrics["dividend_yield"] * 1000) / 10
     if metrics["latest_close"] is not None and pd.notna(metrics["latest_close"]):
         ws["B3"] = round(metrics["latest_close"])
+
+    if used_yfinance:
+        _add_yfinance_note(ws, "B2", "F2", "J2", "O2", "B3")
 
     required = {"CurFYEn", "CurPerType", "DiscDate", "Sales", "OdP"}
     if fins.empty or not required.issubset(fins.columns):
@@ -368,6 +504,15 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
     for year, col in col_for_year.items():
         ws[f"{col}4"] = f"{year}年予想" if year in forecast_years else f"{year}年"
 
+    # 利益セルの書式(小数2桁)は、値を書き込む行だけでなく割り当てた年列全体に
+    # 先に適用しておく。四半期データが無い・会社予想が未開示等でAPI側から
+    # 値を書き込まず手入力に委ねる（空欄のままにする）セルも対象にしないと、
+    # ユーザーが後から手入力した値がテンプレート由来の小数1桁書式のまま
+    # 表示されてしまう（2026-08-20のCodexレビューで指摘）。
+    for col in col_for_year.values():
+        for row_num in _ROW_PROFIT.values():
+            ws[f"{col}{row_num}"].number_format = _PROFIT_NUMBER_FORMAT
+
     for _, row in f_actual.sort_values(["CurFYEn", "CurPerType"]).iterrows():
         period_type = row["CurPerType"]
         if period_type not in _ROW_SALES:
@@ -386,7 +531,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             sales_cell.value = math.floor(sales / 1e8)
             sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT[period_type]}"] = round(profit / 1e8, 1)
+            profit_cell = ws[f"{col}{_ROW_PROFIT[period_type]}"]
+            profit_cell.value = round(profit / 1e8, 2)
+            profit_cell.number_format = _PROFIT_NUMBER_FORMAT
         close = _nearest_close(prices, row["CurPerEn"])
         if close is not None:
             ws[f"{col}{_ROW_PRICE[period_type]}"] = round(close)
@@ -400,7 +547,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             forecast_sales_cell.value = math.floor(sales / 1e8)
             forecast_sales_cell.number_format = "0;[Red]▲0;-"
         if pd.notna(profit):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(profit / 1e8, 1)
+            forecast_profit_cell = ws[f"{col}{_ROW_PROFIT['FY']}"]
+            forecast_profit_cell.value = round(profit / 1e8, 2)
+            forecast_profit_cell.number_format = _PROFIT_NUMBER_FORMAT
 
     # 決算期が3月以外の会社等では、直近の実績年度がまだ本決算を迎えておらず
     # （1Q/2Q等の実績しかない）「決算」行が空欄になることがある。その場合は
@@ -426,7 +575,9 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
             cell.value = math.floor(fsales / 1e8)
             cell.number_format = "0;[Red]▲0;-"
         if pd.notna(fodp):
-            ws[f"{col}{_ROW_PROFIT['FY']}"] = round(fodp / 1e8, 1)
+            fy_profit_cell = ws[f"{col}{_ROW_PROFIT['FY']}"]
+            fy_profit_cell.value = round(fodp / 1e8, 2)
+            fy_profit_cell.number_format = _PROFIT_NUMBER_FORMAT
 
     logger.info(
         "[%s] 会社予想EPS=%s 会社予想年間配当=%s 最新株価=%s PER=%s 配当利回り=%s 列割当=%s",
