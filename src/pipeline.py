@@ -136,9 +136,15 @@ def run_screening(
         rules.detect_downward_revision(statements_df),
     ]
 
+    # ユーザーがTDNET_TITLE_BASED_RULESを1つも選択していない場合（例: ストップ高・
+    # PBRのみ選択）、TDnet開示件数がいくら多くても検索結果には反映されないため、
+    # 件数上限チェック・警告は行わない（無関係な警告で「期間を絞り込め」と
+    # 誤って促してしまうことを防ぐ。2026-08-24のCodexレビューで指摘・修正）。
+    tdnet_rule_requested = selected_rules is None or any(r in TDNET_TITLE_BASED_RULES for r in selected_rules)
+
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
-        if len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
+        if tdnet_rule_requested and len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
             # 期間が広すぎる等でTDnet開示が大量に該当する場合、タイトルの
             # キーワード一致で判定するTDNET_TITLE_BASED_RULES（新工場・新店舗・
             # 東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表）の

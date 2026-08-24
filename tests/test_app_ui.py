@@ -159,6 +159,34 @@ class TestTdnetDisclosureLimitWarningIsVisible(unittest.TestCase):
         warning_texts = [w.value for w in at.warning]
         self.assertTrue(any("200件を超えました" in t for t in warning_texts))
 
+    def test_warning_survives_a_later_unrelated_rerun(self):
+        # st.warningをボタン押下時のrunでしか出さないと、AND/OR切り替え等
+        # 別ウィジェット操作による再実行でsummary(結果)はsession_stateから
+        # 表示され続けるのに警告だけ消えてしまう（2026-08-24のCodexレビューで
+        # 指摘・修正: summary_warningsとしてsession_stateに永続化し、結果を
+        # 表示するたびに毎回re-renderするようにした）。
+        import warnings as warnings_module
+
+        def _fake_run_screening(client, start, end, selected_rules=None):
+            warnings_module.warn("テスト用の警告メッセージ：200件を超えました")
+            return pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
+
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening), \
+                patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.pills(key="material_events_pills").set_value(["stop_high"])
+            at.run(timeout=30)
+            next(b for b in at.button if b.label == "スクリーニング実行").click()
+            at.run(timeout=30)
+            # ボタンを押さない別操作による再実行（AND/OR切り替え）を模す。
+            at.radio(key="event_logic").set_value("AND検索")
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        warning_texts = [w.value for w in at.warning]
+        self.assertTrue(any("200件を超えました" in t for t in warning_texts))
+
 
 if __name__ == "__main__":
     unittest.main()
