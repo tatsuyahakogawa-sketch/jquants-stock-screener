@@ -175,11 +175,16 @@ def run_screening(
             hits.append(rules.detect_world_first(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
-        # 他のルールの結果は返す（README参照）。
-        messages.append(
-            "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
-            f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
-        )
+        # 他のルールの結果は返す（README参照）。ユーザーがTDNET_TITLE_BASED_RULES
+        # を1つも選択していない場合は、この失敗が検索結果に一切影響しないため
+        # メッセージも出さない（無関係な「7件の検索をスキップしました」表示で
+        # 完了した検索結果が不完全であるかのように見せてしまうことを防ぐ。
+        # 2026-08-24の3巡目のCodexレビューで指摘・修正）。
+        if tdnet_rule_requested:
+            messages.append(
+                "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
+                f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
+            )
 
     hits = [h for h in hits if not h.empty]
     if not hits:

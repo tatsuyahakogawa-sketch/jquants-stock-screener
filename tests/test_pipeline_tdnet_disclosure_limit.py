@@ -55,6 +55,19 @@ def _run(disclosures_df: pd.DataFrame, selected_rules=("new_facility_or_store",)
         )
 
 
+def _run_with_tdnet_failure(selected_rules):
+    with (
+        patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+        patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+        patch(f"{_MOD}.endpoints.get_statements_range", return_value=pd.DataFrame()),
+        patch(f"{_MOD}.tdnet_client.get_disclosures_range", side_effect=RuntimeError("TDnetミラー障害(テスト)")),
+    ):
+        return pipeline.run_screening(
+            client=object(), start=dt.date(2026, 8, 1), end=dt.date(2026, 8, 5),
+            selected_rules=list(selected_rules) if selected_rules is not None else None,
+        )
+
+
 class TestTdnetDisclosureLimit(unittest.TestCase):
     def test_within_limit_runs_title_based_rules_normally(self):
         hits, messages = _run(_facility_disclosures(config.MAX_TDNET_DISCLOSURES_FOR_SCREENING))
@@ -89,6 +102,21 @@ class TestTdnetDisclosureLimit(unittest.TestCase):
         )
         self.assertTrue(hits.empty)
         self.assertEqual(len(messages), 1)
+
+    def test_tdnet_fetch_failure_warns_when_tdnet_rule_selected(self):
+        hits, messages = _run_with_tdnet_failure(selected_rules=["new_facility_or_store"])
+        self.assertTrue(hits.empty)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("TDnet開示情報の取得に失敗しました", messages[0])
+
+    def test_tdnet_fetch_failure_is_silent_when_no_tdnet_rule_selected(self):
+        # stop_high・pbr_low等、J-Quants由来のルールしか選んでいない場合は
+        # TDnetミラーが障害中でも検索結果に一切影響しないため、無関係な
+        # 「取得に失敗しました」警告を出してはいけない（2026-08-24の3巡目の
+        # Codexレビューで指摘・修正）。
+        hits, messages = _run_with_tdnet_failure(selected_rules=["stop_high", "pbr_low"])
+        self.assertTrue(hits.empty)  # J-Quants側もモックで空データのため空(仕様上は無関係)
+        self.assertEqual(messages, [])
 
 
 if __name__ == "__main__":
