@@ -119,7 +119,7 @@ st.info(
 st.caption("契約プラン（Light）は遅延なしで過去5年分のデータを取得できます。")
 
 
-def render_regional_section() -> None:
+def render_regional_section(selected_market_chars: set[str]) -> None:
     """地方証券取引所（札幌・福岡・名古屋）単独上場企業の発見支援。
 
     まだ注目されていない地方上場企業を早く見つけることを目的とし、以下を表示する。
@@ -131,6 +131,11 @@ def render_regional_section() -> None:
     単独上場企業を一切対象としないため使用しない（CLAUDE.md参照）。PBR等の財務
     条件は計算に必要な決算数値自体がJ-Quantsから取得できず併用不可のため、この
     モードでは財務条件のカードごと表示しない。
+
+    selected_market_chars: ユーザーが選択した取引所（regional_stocks.
+    REGIONAL_MARKET_LABELSのキー文字、例:{"札","福"}）。この文字を1つでも
+    含む現在の市場(markets_string)の銘柄だけを対象にする
+    （2026-08-24にユーザーが指定）。
     """
     st.caption(
         "地方証券取引所（札幌・福岡・名古屋）単独上場企業の新規上場・東証関連イベント・"
@@ -158,6 +163,21 @@ def render_regional_section() -> None:
         st.info("まだデータがありません。上の「最新情報を取得（更新）」を押してください。")
         return
 
+    def _matches_selected_markets(markets_string) -> bool:
+        if not isinstance(markets_string, str) or not markets_string:
+            return False
+        return any(char in markets_string for char in selected_market_chars)
+
+    # 財務条件での絞り込み・「イベントが無い銘柄」の一覧(still_regional)は、
+    # company_statusの現在の市場で選択済み取引所に絞り込んだ上で使う
+    # （下のイベント一覧側は、市場情報が無い開示行への対応上、company_statusと
+    # 各開示自身のmarkets_stringを両方見る別ロジック(_market_matches_filter)で
+    # 判定する）。
+    company_status_in_selected_markets = (
+        company_status.loc[company_status["MarketsString"].apply(_matches_selected_markets)]
+        if not company_status.empty else company_status
+    )
+
     with st.container(border=True):
         st.markdown("### 💰 財務条件で絞り込む（任意）")
         st.caption(
@@ -183,8 +203,21 @@ def render_regional_section() -> None:
         rules_to_check = list(selected_statement_rules)
         if exclude_downward_regional:
             rules_to_check.append(regional_stocks.REGIONAL_NEGATIVE_RULE)
-        hits = regional_stocks.screen_regional(pd.DataFrame(), statements, company_status, rules_to_check)
-        summary = build_summary(hits)
+        if company_status_in_selected_markets.empty:
+            # regional_stocks._currently_regional_codes()は、company_status_dfが
+            # 空の場合を「企業ステータス情報が無いので絞り込まない」という意味に
+            # 解釈する（ストア自体が未取得の場合に誤って全件除外しないための仕様）。
+            # ここでのcompany_status_in_selected_marketsの空は、その意味ではなく
+            # 「選択した取引所に該当する現存の地方単独上場企業が0件」という意味の
+            # ため、そのままscreen_regionalに渡すと絞り込みが効かず、選択して
+            # いない取引所の銘柄まで結果に出てしまう。この場合は「情報なし」扱い
+            # にせず明示的に空の結果として扱う（2026-08-24のCodexレビューで指摘・修正）。
+            summary = build_summary(pd.DataFrame(columns=["Code", "CompanyName", "Rule", "RuleLabel", "Date", "Detail"]))
+        else:
+            hits = regional_stocks.screen_regional(
+                pd.DataFrame(), statements, company_status_in_selected_markets, rules_to_check
+            )
+            summary = build_summary(hits)
         if not summary.empty:
             if exclude_downward_regional:
                 summary = summary[~summary["HasDownwardRevision"]]
@@ -260,16 +293,27 @@ def render_regional_section() -> None:
     def _currently_regional(code: str) -> bool:
         return bool(currently_regional_by_code.get(code, False))
 
-    def _market_display(code: str, fallback_markets_string: str) -> str:
+    def _resolved_markets_string(code: str, fallback_markets_string: str) -> str:
         # 個々のイベント発生時点のmarkets_stringではなく、company_statusが持つ
         # 直近の値を優先する。東証移籍が完了した銘柄の古いイベント行が、
         # 移籍前の地方単独上場の市場のまま表示され続けないようにするため。
-        markets_string = markets_string_by_code.get(code, fallback_markets_string)
+        return markets_string_by_code.get(code, fallback_markets_string)
+
+    def _market_display(code: str, fallback_markets_string: str) -> str:
+        markets_string = _resolved_markets_string(code, fallback_markets_string)
         return "・".join(regional_stocks.all_markets_in(markets_string)) or str(markets_string)
+
+    def _matches_market_filter(code: str, fallback_markets_string: str) -> bool:
+        markets_string = _resolved_markets_string(code, fallback_markets_string)
+        if not isinstance(markets_string, str) or not markets_string:
+            return False
+        return any(char in markets_string for char in selected_market_chars)
 
     # --- ①②③を1つの「イベント」テーブルにまとめる（④: id基準で重複排除） ---
     rows: list[dict] = []
     for _, r in listing_events.iterrows():
+        if not _matches_market_filter(r["Code"], r["MarketsString"]):
+            continue
         label = ("🔴東証関連: " if r["IsTokyoRelated"] else "地方市場: ") + f"上場{r['Stage']}"
         rows.append({
             "id": r["id"],
@@ -286,6 +330,8 @@ def render_regional_section() -> None:
             "_currently_regional": _currently_regional(r["Code"]),
         })
     for _, r in major_events.iterrows():
+        if not _matches_market_filter(r["Code"], r["MarketsString"]):
+            continue
         rows.append({
             "id": r["id"],
             "コード": r["Code"],
@@ -305,10 +351,10 @@ def render_regional_section() -> None:
     # 表示対象（イベント検出だけに頼ると、通常開示しかしていない銘柄が
     # 一覧からまるごと漏れてしまうため）。
     codes_with_event = {r["コード"] for r in rows}
-    if not company_status.empty:
-        is_regional = company_status["MarketsString"].apply(regional_stocks.is_regional_only)
-        is_delisted = company_status["IsDelisted"].fillna(False).astype(bool)
-        still_regional = company_status.loc[is_regional & ~is_delisted]
+    if not company_status_in_selected_markets.empty:
+        is_regional = company_status_in_selected_markets["MarketsString"].apply(regional_stocks.is_regional_only)
+        is_delisted = company_status_in_selected_markets["IsDelisted"].fillna(False).astype(bool)
+        still_regional = company_status_in_selected_markets.loc[is_regional & ~is_delisted]
         for _, r in still_regional.iterrows():
             if r["Code"] in codes_with_event:
                 continue
@@ -375,7 +421,21 @@ regional_only = st.checkbox(
 )
 
 if regional_only:
-    render_regional_section()
+    # REGIONAL_MARKET_LABELSは{文字: 表示名}（例:{"福":"福証", ...}）なので、
+    # pillsの選択肢は「札幌・福岡・名古屋」の表記順に合わせて明示的に並べる。
+    _market_char_by_label = {label: char for char, label in regional_stocks.REGIONAL_MARKET_LABELS.items()}
+    _market_labels_in_order = ["札証", "福証", "名証"]
+    selected_market_labels = st.pills(
+        "対象にする取引所",
+        options=_market_labels_in_order,
+        selection_mode="multi",
+        default=_market_labels_in_order,
+        key="regional_market_filter_pills",
+    )
+    if not selected_market_labels:
+        st.warning("対象にする取引所を1つ以上選択してください。")
+    else:
+        render_regional_section({_market_char_by_label[label] for label in selected_market_labels})
 else:
     max_end = dt.date.today() - dt.timedelta(days=1)
     default_end = max_end
