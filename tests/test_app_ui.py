@@ -131,22 +131,27 @@ class TestRegionalSortByCurrentlyRegional(unittest.TestCase):
         self.assertEqual(codes[0], "22220")
 
 
+def _fake_run_screening_with_message(client, start, end, selected_rules=None):
+    """run_screeningの戻り値契約(hits_df, messages)に合わせたテスト用スタブ。
+
+    以前はPython標準のwarnings.warnでメッセージを発していたが、
+    warnings.catch_warnings()はプロセスグローバルな状態を書き換えるため
+    スレッドセーフでなく、Streamlitの複数セッション同時実行下では別セッション
+    の警告を誤って捕捉しうる。そのため戻り値として明示的に返す方式に変更した
+    （2026-08-24の2巡目のCodexレビューで指摘・修正）。
+    """
+    hits = pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
+    return hits, ["テスト用の警告メッセージ：200件を超えました"]
+
+
 class TestTdnetDisclosureLimitWarningIsVisible(unittest.TestCase):
-    """run_screening内部のwarnings.warn（TDnet開示件数の上限超過等）が、
+    """run_screeningが返す注意メッセージ（TDnet開示件数の上限超過等）が、
     サーバーログだけでなくst.warningとして画面にも表示されることの確認
-    （2026-08-24にユーザーが指定した機能。warnings.warnはStreamlit画面には
-    自動で出ないため、app.py側でwarnings.catch_warningsを使って捕捉・表示する
-    実装にした）。
+    （2026-08-24にユーザーが指定した機能）。
     """
 
-    def test_run_screening_warning_is_shown_as_st_warning(self):
-        import warnings as warnings_module
-
-        def _fake_run_screening(client, start, end, selected_rules=None):
-            warnings_module.warn("テスト用の警告メッセージ：200件を超えました")
-            return pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
-
-        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening), \
+    def test_run_screening_message_is_shown_as_st_warning(self):
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening_with_message), \
                 patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
             at = AppTest.from_file(APP_PATH)
             at.run(timeout=30)
@@ -165,13 +170,7 @@ class TestTdnetDisclosureLimitWarningIsVisible(unittest.TestCase):
         # 表示され続けるのに警告だけ消えてしまう（2026-08-24のCodexレビューで
         # 指摘・修正: summary_warningsとしてsession_stateに永続化し、結果を
         # 表示するたびに毎回re-renderするようにした）。
-        import warnings as warnings_module
-
-        def _fake_run_screening(client, start, end, selected_rules=None):
-            warnings_module.warn("テスト用の警告メッセージ：200件を超えました")
-            return pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
-
-        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening), \
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening_with_message), \
                 patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
             at = AppTest.from_file(APP_PATH)
             at.run(timeout=30)

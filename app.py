@@ -14,7 +14,6 @@ TDnetベースの地方株スキャン結果を表示する（地方単独上場
 from __future__ import annotations
 
 import datetime as dt
-import warnings
 
 import pandas as pd
 import requests
@@ -466,16 +465,16 @@ else:
             with st.spinner("J-Quants からデータを取得し、条件判定しています…"):
                 try:
                     client = JQuantsClient()
-                    # run_screening内部のwarnings.warn（TDnet取得失敗・TDnet開示件数
-                    # 超過等）は、そのままだとサーバーログにしか出ずStreamlit画面には
-                    # 表示されない。ここで捕捉してst.warningとして画面に出す
-                    # （2026-08-24にユーザーが指定したTDnet開示件数上限の通知用に追加）。
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        hits = run_screening(
-                            client, start_date, end_date,
-                            selected_rules=selected_events + selected_attributes,
-                        )
+                    # run_screeningはTDnet取得失敗・TDnet開示件数超過等の注意メッセージを
+                    # 戻り値として返す（以前はwarnings.warn経由だったが、
+                    # warnings.catch_warnings()はプロセスグローバルな状態を書き換える
+                    # ためスレッドセーフでなく、Streamlitの複数セッション同時実行下では
+                    # 別セッションの警告を誤って捕捉しうる。2026-08-24の2巡目のCodex
+                    # レビューで指摘・修正）。
+                    hits, messages = run_screening(
+                        client, start_date, end_date,
+                        selected_rules=selected_events + selected_attributes,
+                    )
                     summary = build_summary(hits)
                     if not summary.empty:
                         with st.spinner(f"合致した{len(summary)}銘柄の時価総額・PER・PBR・配当利回りを取得しています…"):
@@ -485,7 +484,7 @@ else:
                     # 別ウィジェット操作による再実行時に消えてしまい、結果(summary)だけが
                     # 表示され続けてしまう。summaryと一緒にsession_stateへ保存し、結果を
                     # 表示するたびに毎回re-renderする（2026-08-24のCodexレビューで指摘・修正）。
-                    st.session_state["summary_warnings"] = [str(w.message) for w in caught]
+                    st.session_state["summary_warnings"] = messages
                 except JQuantsAuthError as e:
                     st.error(f"J-Quants への認証に失敗しました: {e}")
                 except requests.exceptions.HTTPError as e:
