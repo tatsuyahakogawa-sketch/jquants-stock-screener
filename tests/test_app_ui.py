@@ -131,5 +131,61 @@ class TestRegionalSortByCurrentlyRegional(unittest.TestCase):
         self.assertEqual(codes[0], "22220")
 
 
+def _fake_run_screening_with_message(client, start, end, selected_rules=None):
+    """run_screeningの戻り値契約(hits_df, messages)に合わせたテスト用スタブ。
+
+    以前はPython標準のwarnings.warnでメッセージを発していたが、
+    warnings.catch_warnings()はプロセスグローバルな状態を書き換えるため
+    スレッドセーフでなく、Streamlitの複数セッション同時実行下では別セッション
+    の警告を誤って捕捉しうる。そのため戻り値として明示的に返す方式に変更した
+    （2026-08-24の2巡目のCodexレビューで指摘・修正）。
+    """
+    hits = pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
+    return hits, ["テスト用の警告メッセージ：200件を超えました"]
+
+
+class TestTdnetDisclosureLimitWarningIsVisible(unittest.TestCase):
+    """run_screeningが返す注意メッセージ（TDnet開示件数の上限超過等）が、
+    サーバーログだけでなくst.warningとして画面にも表示されることの確認
+    （2026-08-24にユーザーが指定した機能）。
+    """
+
+    def test_run_screening_message_is_shown_as_st_warning(self):
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening_with_message), \
+                patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.pills(key="material_events_pills").set_value(["stop_high"])
+            at.run(timeout=30)
+            next(b for b in at.button if b.label == "スクリーニング実行").click()
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        warning_texts = [w.value for w in at.warning]
+        self.assertTrue(any("200件を超えました" in t for t in warning_texts))
+
+    def test_warning_survives_a_later_unrelated_rerun(self):
+        # st.warningをボタン押下時のrunでしか出さないと、AND/OR切り替え等
+        # 別ウィジェット操作による再実行でsummary(結果)はsession_stateから
+        # 表示され続けるのに警告だけ消えてしまう（2026-08-24のCodexレビューで
+        # 指摘・修正: summary_warningsとしてsession_stateに永続化し、結果を
+        # 表示するたびに毎回re-renderするようにした）。
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening_with_message), \
+                patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.pills(key="material_events_pills").set_value(["stop_high"])
+            at.run(timeout=30)
+            next(b for b in at.button if b.label == "スクリーニング実行").click()
+            at.run(timeout=30)
+            # ボタンを押さない別操作による再実行（AND/OR切り替え）を模す。
+            at.radio(key="event_logic").set_value("AND検索")
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        warning_texts = [w.value for w in at.warning]
+        self.assertTrue(any("200件を超えました" in t for t in warning_texts))
+
+
 if __name__ == "__main__":
     unittest.main()

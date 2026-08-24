@@ -465,7 +465,13 @@ else:
             with st.spinner("J-Quants からデータを取得し、条件判定しています…"):
                 try:
                     client = JQuantsClient()
-                    hits = run_screening(
+                    # run_screeningはTDnet取得失敗・TDnet開示件数超過等の注意メッセージを
+                    # 戻り値として返す（以前はwarnings.warn経由だったが、
+                    # warnings.catch_warnings()はプロセスグローバルな状態を書き換える
+                    # ためスレッドセーフでなく、Streamlitの複数セッション同時実行下では
+                    # 別セッションの警告を誤って捕捉しうる。2026-08-24の2巡目のCodex
+                    # レビューで指摘・修正）。
+                    hits, messages = run_screening(
                         client, start_date, end_date,
                         selected_rules=selected_events + selected_attributes,
                     )
@@ -474,6 +480,11 @@ else:
                         with st.spinner(f"合致した{len(summary)}銘柄の時価総額・PER・PBR・配当利回りを取得しています…"):
                             summary = enrich_with_market_data(client, summary)
                     st.session_state["summary"] = summary
+                    # 警告はこのボタン押下時のst.warning呼び出しだけでは、AND/OR切り替え等
+                    # 別ウィジェット操作による再実行時に消えてしまい、結果(summary)だけが
+                    # 表示され続けてしまう。summaryと一緒にsession_stateへ保存し、結果を
+                    # 表示するたびに毎回re-renderする（2026-08-24のCodexレビューで指摘・修正）。
+                    st.session_state["summary_warnings"] = messages
                 except JQuantsAuthError as e:
                     st.error(f"J-Quants への認証に失敗しました: {e}")
                 except requests.exceptions.HTTPError as e:
@@ -493,6 +504,9 @@ else:
 
     if "summary" in st.session_state:
         summary = st.session_state["summary"]
+
+        for message in st.session_state.get("summary_warnings", []):
+            st.warning(message)
 
         expected_cols = {f"{r}_matched" for r in (selected_events + selected_attributes)}
         if not summary.empty and not expected_cols.issubset(summary.columns):

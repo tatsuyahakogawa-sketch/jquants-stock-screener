@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import warnings
 
 import pandas as pd
 
@@ -16,6 +15,7 @@ from src import endpoints, rules, score, tdnet_client
 from src.config import (
     LISTING_LOOKBACK_YEARS,
     LISTING_DATE_BOUNDARY_TOLERANCE_DAYS,
+    MAX_TDNET_DISCLOSURES_FOR_SCREENING,
     PROFIT_DOUBLING_YEARS,
 )
 from src.jquants_client import JQuantsClient
@@ -77,7 +77,7 @@ def run_screening(
     start: dt.date,
     end: dt.date,
     selected_rules: list[str] | None = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[str]]:
     """start〜end の期間で全ルールを適用し、イベント単位の結果をまとめて返す。
 
     selected_rules: 画面上で選択中のルール名一覧。Noneの場合は従来通り常に
@@ -85,7 +85,16 @@ def run_screening(
     場合、YOY_LOOKBACK_RULESが1つも含まれていなければ決算データの取得期間を
     start〜endに限定し、遡り取得を省略して高速化する。
 
-    戻り値の列: Code, CompanyName, Rule, RuleLabel, Date, Detail
+    戻り値: (イベント単位の結果DataFrame(列: Code, CompanyName, Rule, RuleLabel,
+    Date, Detail), ユーザーへの注意メッセージ一覧)。
+
+    注意メッセージ（TDnet取得失敗・TDnet開示件数の上限超過等）は、以前は
+    Python標準のwarnings.warn()で発していたが、warnings.catch_warnings()は
+    プロセスグローバルなwarnings.filters/showwarning実装を書き換えるため
+    スレッドセーフではない。Streamlitは複数セッションを同一プロセス内の
+    別スレッドで同時実行しうるため、あるセッションの警告を別セッションが
+    捕捉してしまう競合が起こりうる。そのため戻り値として明示的に返す方式に
+    変更した（2026-08-24の2巡目のCodexレビューで指摘・修正）。
     """
     listed_info = endpoints.get_listed_info(client)
     name_map: dict[str, str] = {}
@@ -135,25 +144,51 @@ def run_screening(
         rules.detect_downward_revision(statements_df),
     ]
 
+    # ユーザーがTDNET_TITLE_BASED_RULESを1つも選択していない場合（例: ストップ高・
+    # PBRのみ選択）、TDnet開示件数がいくら多くても検索結果には反映されないため、
+    # 件数上限チェック・警告は行わない（無関係な警告で「期間を絞り込め」と
+    # 誤って促してしまうことを防ぐ。2026-08-24のCodexレビューで指摘・修正）。
+    tdnet_rule_requested = selected_rules is None or any(r in TDNET_TITLE_BASED_RULES for r in selected_rules)
+
+    messages: list[str] = []
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
-        hits.append(rules.detect_new_facility_or_store(disclosures_df))
-        hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
-        hits.append(rules.detect_stock_split(disclosures_df))
-        hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
-        hits.append(rules.detect_large_order(disclosures_df))
-        hits.append(rules.detect_world_first(disclosures_df))
+        if tdnet_rule_requested and len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
+            # 期間が広すぎる等でTDnet開示が大量に該当する場合、タイトルの
+            # キーワード一致で判定するTDNET_TITLE_BASED_RULES（新工場・新店舗・
+            # 東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表）の
+            # 検索は行わない（それ以上の処理を止めてユーザーに知らせ、期間を
+            # 絞り込んでもらう。他のルール(J-Quants由来)の結果はそのまま返す。
+            # 2026-08-24にユーザーが指定）。
+            messages.append(
+                f"指定期間のTDnet開示件数が{len(disclosures_df)}件と多く、上限"
+                f"（{MAX_TDNET_DISCLOSURES_FOR_SCREENING}件）を超えたため、新工場・新店舗・"
+                "東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表の検索を"
+                "行いませんでした。期間を絞り込んで再実行してください。"
+            )
+        else:
+            hits.append(rules.detect_new_facility_or_store(disclosures_df))
+            hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
+            hits.append(rules.detect_stock_split(disclosures_df))
+            hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
+            hits.append(rules.detect_large_order(disclosures_df))
+            hits.append(rules.detect_world_first(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
-        # 他のルールの結果は返す（README参照）。
-        warnings.warn(
-            "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
-            f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
-        )
+        # 他のルールの結果は返す（README参照）。ユーザーがTDNET_TITLE_BASED_RULES
+        # を1つも選択していない場合は、この失敗が検索結果に一切影響しないため
+        # メッセージも出さない（無関係な「7件の検索をスキップしました」表示で
+        # 完了した検索結果が不完全であるかのように見せてしまうことを防ぐ。
+        # 2026-08-24の3巡目のCodexレビューで指摘・修正）。
+        if tdnet_rule_requested:
+            messages.append(
+                "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
+                f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
+            )
 
     hits = [h for h in hits if not h.empty]
     if not hits:
-        return pd.DataFrame(columns=["Code", "CompanyName", "Rule", "RuleLabel", "Date", "Detail"])
+        return pd.DataFrame(columns=["Code", "CompanyName", "Rule", "RuleLabel", "Date", "Detail"]), messages
 
     result = pd.concat(hits, ignore_index=True)
     result = result.rename(columns={"rule": "Rule", "detail": "Detail"})
@@ -173,7 +208,7 @@ def run_screening(
         (result["Date"] >= pd.Timestamp(start)) & (result["Date"] <= pd.Timestamp(end))
     ]
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
-    return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]]
+    return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages
 
 
 def build_summary(hits: pd.DataFrame) -> pd.DataFrame:
