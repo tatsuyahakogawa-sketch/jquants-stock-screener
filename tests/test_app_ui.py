@@ -12,7 +12,9 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -63,6 +65,70 @@ class TestSlowPerformancePillsSeparation(unittest.TestCase):
         self.assertEqual(len(at.exception), 0)
         captions = [c.value for c in at.caption]
         self.assertTrue(any("1件選択中" in c for c in captions))
+
+
+def _regional_store_for_sort_test():
+    # 「現在も地方単独上場の銘柄を先頭に」ソートの検証用データ。
+    # 11110は現在も地方単独上場、22220は既に東証へ移籍完了済み
+    # （過去の移籍イベントだけが①のイベント一覧に残っている）。
+    company_status = pd.DataFrame([
+        {"Code": "11110", "CompanyName": "現在も地方単独", "MarketsString": "福",
+         "LastSeenDate": pd.Timestamp("2026-08-01"), "LastDelistingDate": pd.NaT,
+         "IsDelisted": False, "CurrentPrice": None, "CurrentPriceNote": ""},
+        {"Code": "22220", "CompanyName": "東証移籍済み", "MarketsString": "東福",
+         "LastSeenDate": pd.Timestamp("2026-08-10"), "LastDelistingDate": pd.NaT,
+         "IsDelisted": False, "CurrentPrice": None, "CurrentPriceNote": ""},
+    ])
+    listing_events = pd.DataFrame([
+        # 発表日は22220の方が新しいため、「イベントの新しい順」なら22220が先頭になる。
+        {"id": "e1", "Code": "22220", "CompanyName": "東証移籍済み", "Date": pd.Timestamp("2026-08-10"),
+         "MarketsString": "東福", "TargetMarkets": "東", "Stage": "完了", "IsTokyoRelated": True,
+         "Title": "東証移籍完了", "Url": None},
+    ])
+    major_events = pd.DataFrame(
+        columns=["id", "Code", "CompanyName", "Date", "MarketsString", "Title", "Url", "MatchedKeyword"]
+    )
+    return {
+        "company_status": company_status,
+        "listing_events": listing_events,
+        "major_events": major_events,
+        "statements": pd.DataFrame(),
+    }
+
+
+class TestRegionalSortByCurrentlyRegional(unittest.TestCase):
+    """「並び順」に追加した「現在も地方単独上場の銘柄を先頭に」の単体テスト
+    （2026-08-24に追加。東証へ既に移籍完了した銘柄と、今も地方取引所のみに
+    上場している銘柄を区別してソートできるようにするための機能）。
+    """
+
+    def test_currently_regional_company_sorted_first(self):
+        with patch("src.regional_stocks.load_regional_store", return_value=_regional_store_for_sort_test()):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.checkbox(key="regional_only").set_value(True)
+            at.run(timeout=30)
+            sort_radio = next(r for r in at.radio if "現在も地方単独上場の銘柄を先頭に" in r.options)
+            sort_radio.set_value("現在も地方単独上場の銘柄を先頭に")
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        codes = list(at.dataframe[0].value["コード"])
+        self.assertEqual(codes.index("11110"), 0)
+        self.assertLess(codes.index("11110"), codes.index("22220"))
+
+    def test_default_event_date_sort_still_puts_newer_event_first(self):
+        # 既存の「イベントの新しい順」（デフォルト）は今回の変更で壊れていない
+        # ことの回帰確認（22220の方が発表日が新しいため先頭になる）。
+        with patch("src.regional_stocks.load_regional_store", return_value=_regional_store_for_sort_test()):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.checkbox(key="regional_only").set_value(True)
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        codes = list(at.dataframe[0].value["コード"])
+        self.assertEqual(codes[0], "22220")
 
 
 if __name__ == "__main__":

@@ -244,6 +244,22 @@ def render_regional_section() -> None:
         company_status.set_index("Code")["MarketsString"] if not company_status.empty else pd.Series(dtype="object")
     )
 
+    # 「現在も地方単独上場の銘柄を先頭に」ソート用。個々のイベント発生時点の
+    # markets_stringではなく、_market_displayと同じくcompany_statusが持つ
+    # 直近の値で「今も東証に上場していないか」を判定する（東証移籍が完了した
+    # 銘柄は、移籍前の古いイベントが残っていてもこの並び順では後方になる）。
+    if not company_status.empty:
+        currently_regional_by_code = (
+            company_status["MarketsString"].apply(regional_stocks.is_regional_only)
+            & ~company_status["IsDelisted"].fillna(False).astype(bool)
+        )
+        currently_regional_by_code.index = company_status["Code"]
+    else:
+        currently_regional_by_code = pd.Series(dtype="bool")
+
+    def _currently_regional(code: str) -> bool:
+        return bool(currently_regional_by_code.get(code, False))
+
     def _market_display(code: str, fallback_markets_string: str) -> str:
         # 個々のイベント発生時点のmarkets_stringではなく、company_statusが持つ
         # 直近の値を優先する。東証移籍が完了した銘柄の古いイベント行が、
@@ -267,6 +283,7 @@ def render_regional_section() -> None:
             "内容": r["Title"],
             "URL": r["Url"],
             "_is_tokyo": r["IsTokyoRelated"],
+            "_currently_regional": _currently_regional(r["Code"]),
         })
     for _, r in major_events.iterrows():
         rows.append({
@@ -281,6 +298,7 @@ def render_regional_section() -> None:
             "内容": r["Title"],
             "URL": r["Url"],
             "_is_tokyo": False,
+            "_currently_regional": _currently_regional(r["Code"]),
         })
 
     # イベントが1件も検出されていない地方単独上場企業も、①の一覧としては
@@ -306,6 +324,7 @@ def render_regional_section() -> None:
                 "内容": "（新規上場・大型イベントの検出なし。通常開示のみ確認）",
                 "URL": None,
                 "_is_tokyo": False,
+                "_currently_regional": True,  # still_regionalの定義上、この行は必ず現在も地方単独上場
             })
 
     if not rows:
@@ -314,15 +333,26 @@ def render_regional_section() -> None:
 
     events_df = pd.DataFrame(rows).drop_duplicates(subset=["id"])
 
-    sort_option = st.radio("並び順", ["イベントの新しい順", "上場日の新しい順", "最重要イベントを先頭に"], horizontal=True)
+    sort_option = st.radio(
+        "並び順",
+        ["イベントの新しい順", "上場日の新しい順", "最重要イベントを先頭に", "現在も地方単独上場の銘柄を先頭に"],
+        horizontal=True,
+    )
     if sort_option == "イベントの新しい順":
         events_df = events_df.sort_values("発表日", ascending=False, na_position="last")
     elif sort_option == "上場日の新しい順":
         events_df = events_df.sort_values("上場日", ascending=False, na_position="last")
-    else:
+    elif sort_option == "最重要イベントを先頭に":
         events_df = events_df.sort_values(["_is_tokyo", "発表日"], ascending=[False, False], na_position="last")
+    else:
+        # 東証に一度も上場していない（今も地方取引所のみの）銘柄を先頭に集め、
+        # 既に東証へ移籍完了した銘柄（過去の移籍イベントが①に残っているだけの
+        # もの）は後方にまとめる。
+        events_df = events_df.sort_values(
+            ["_currently_regional", "発表日"], ascending=[False, False], na_position="last",
+        )
 
-    display_df = events_df.drop(columns=["id", "_is_tokyo"]).copy()
+    display_df = events_df.drop(columns=["id", "_is_tokyo", "_currently_regional"]).copy()
     display_df["上場日"] = display_df["上場日"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "不明")
 
     st.dataframe(
