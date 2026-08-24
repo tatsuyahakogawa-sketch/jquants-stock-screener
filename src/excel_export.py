@@ -17,8 +17,7 @@ import openpyxl
 import pandas as pd
 from openpyxl.comments import Comment
 
-from src import edinet_client, endpoints, pipeline, regional_stocks, tdnet_client
-from src.config import REGIONAL_LISTING_LOOKBACK_YEARS
+from src import edinet_client, endpoints, pipeline, regional_stocks
 from src.jquants_client import JQuantsClient
 
 logger = logging.getLogger(__name__)
@@ -59,79 +58,41 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None]:
     """equities/masterに載っていない銘柄（地方取引所単独上場等）向けに、
     会社名と直近の上場市場情報(markets_string)を補う。
 
-    まず「地方株」ページが定期的に更新している保存済みストア
-    (regional_stocks.load_regional_store()) を参照する。地方単独上場企業の
-    検出・上場廃止チェックは既にそちらで実装・テスト済みのロジック
-    （上場廃止済みの銘柄は除外する等）のため、重複させず結果を再利用する。
-    これによりExcel生成のたびにTDnetの開示を数年分再取得する無駄も避けられる
-    （2026-08-20のCodexレビューで指摘）。
-
-    ストアにまだ無い銘柄（一度も「地方株」ページの更新で検出されていない）は
-    TDnetから直接検索する（フォールバックのフォールバック）。見つからない
-    場合は("", None)を返す（誤った推測値を出さない。README「地方株」
-    セクション参照）。
+    regional_stocks.update_regional_store()（「地方株」ページの更新ボタンと
+    同じ関数）を呼ぶ。この関数は前回スキャン済み日付の翌日からtodayまでの
+    差分だけを取得する自己ウォーターマーク方式のため、ストアが既に最新で
+    あれば当日分のTDnet開示を1回取得するだけで済み、初回のみ数年分を
+    ブートストラップする。load_regional_store()（読み取り専用）を使うと
+    ストアが古いまま（上場廃止・市場変更を取りこぼす）になりうるため、
+    常にこちらを使って鮮度を保証する（2026-08-20のCodexレビューで指摘。
+    上場廃止・市場移籍のchronology判定もupdate_regional_store側の
+    実装・テスト済みロジックをそのまま再利用でき、二重実装を避けられる）。
+    見つからない場合は("", None)を返す（誤った推測値を出さない。README
+    「地方株」セクション参照）。
     """
+    try:
+        status = regional_stocks.update_regional_store()["company_status"]
+    except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
+        logger.info("[%s] 地方株ストアの更新に失敗しました: %s", code, exc)
+        return "", None
+    if status.empty:
+        return "", None
     code_str = str(code)
     candidates = {code_str}
     if len(code_str) == 4:
         candidates.add(code_str + "0")
-
-    status = regional_stocks.load_regional_store()["company_status"]
-    if not status.empty:
-        match = status.loc[status["Code"].astype(str).isin(candidates)]
-        if not match.empty:
-            row = match.iloc[0]
-            name = str(row.get("CompanyName") or "")
-            if bool(row.get("IsDelisted")):
-                # 上場廃止済み（地方取引所を含めどの市場にも上場していない）
-                # 銘柄は、株価フォールバックの対象外にする（上場廃止後の
-                # 古いyfinance終値を現在値として誤表示しないため。
-                # 2026-08-20のCodexレビューで指摘）。
-                return name, None
-            markets_string = row.get("MarketsString")
-            return name, (str(markets_string) if isinstance(markets_string, str) and markets_string else None)
-
-    end = regional_stocks._today_jst()
-    start = end - dt.timedelta(days=365 * REGIONAL_LISTING_LOOKBACK_YEARS)
-    try:
-        # 当日分のTDnet開示はまだ全件公開されていない可能性がある。
-        # tdnet_clientは期間指定をそのままキャッシュキーにするため、当日を
-        # 含む期間を一度キャッシュしてしまうと同じ銘柄で何度Excelを生成しても
-        # その日のうちは同じ不完全な結果を返し続けてしまう。前日までとは別に、
-        # 当日分だけforce_refresh=Trueで毎回取り直す（src/regional_stocks.pyの
-        # update_regional_storeと同じパターン。2026-08-20のCodexレビューで指摘）。
-        yesterday = end - dt.timedelta(days=1)
-        stable = tdnet_client.get_disclosures_range(start, yesterday) if start <= yesterday else pd.DataFrame()
-        todays = tdnet_client.get_disclosures_range(end, end, force_refresh=True)
-        disclosures = pd.concat([stable, todays], ignore_index=True)
-    except Exception as exc:  # noqa: BLE001 -- TDnetミラー障害時も他の処理は続行する
-        logger.info("[%s] TDnetからの会社名/市場情報の取得に失敗しました: %s", code, exc)
+    match = status.loc[status["Code"].astype(str).isin(candidates)]
+    if match.empty:
         return "", None
-    if disclosures.empty or "company_code" not in disclosures.columns:
-        return "", None
-    rows = disclosures.loc[disclosures["company_code"].astype(str).isin(candidates)]
-    if rows.empty:
-        return "", None
-    rows = rows.copy()
-    rows["pubdate"] = pd.to_datetime(rows["pubdate"], errors="coerce")
-    rows = rows.sort_values("pubdate")
-    latest = rows.iloc[-1]
-    name = latest.get("company_name") or ""
-    if regional_stocks._DELISTING_KEYWORD in str(latest.get("title") or ""):
-        # 直近の開示自体が上場廃止のお知らせの場合、markets_stringが欠損して
-        # いてもそれより前の開示の市場情報にフォールバックしない（既に上場廃止
-        # した銘柄を地方単独上場のまま扱ってしまうことを防ぐ。ストアに未登録の
-        # 銘柄向けの簡易版チェック。2026-08-20のCodexレビューで指摘）。
-        return str(name), None
-    # markets_stringが欠損している回（会社名だけの開示等）が直近の開示だと、
-    # それより前の回で分かっている市場情報を取り逃してしまう
-    # （src/regional_stocks.py の_latest_company_statusと同じ既知の欠損
-    # パターン。2026-08-20のCodexレビューで指摘）。会社名は単純に最新の開示
-    # から、markets_stringは有効な値を持つ最新の開示から、それぞれ独立に選ぶ。
-    has_valid_market = rows["markets_string"].apply(lambda m: isinstance(m, str) and bool(m))
-    market_rows = rows.loc[has_valid_market]
-    markets_string = market_rows.iloc[-1]["markets_string"] if not market_rows.empty else None
-    return str(name), (str(markets_string) if markets_string is not None else None)
+    row = match.iloc[0]
+    name = str(row.get("CompanyName") or "")
+    if bool(row.get("IsDelisted")):
+        # 上場廃止済み（地方取引所を含めどの市場にも上場していない）銘柄は、
+        # 株価フォールバックの対象外にする（上場廃止後の古いyfinance終値を
+        # 現在値として誤表示しないため）。
+        return name, None
+    markets_string = row.get("MarketsString")
+    return name, (str(markets_string) if isinstance(markets_string, str) and markets_string else None)
 
 
 def _regional_fallback_price(code: str, markets_string: str | None) -> tuple[float | None, dt.date | None]:
@@ -533,6 +494,15 @@ def build_execution_table_excel(client: JQuantsClient, code: str) -> bytes:
 
     for year, col in col_for_year.items():
         ws[f"{col}4"] = f"{year}年予想" if year in forecast_years else f"{year}年"
+
+    # 利益セルの書式(小数2桁)は、値を書き込む行だけでなく割り当てた年列全体に
+    # 先に適用しておく。四半期データが無い・会社予想が未開示等でAPI側から
+    # 値を書き込まず手入力に委ねる（空欄のままにする）セルも対象にしないと、
+    # ユーザーが後から手入力した値がテンプレート由来の小数1桁書式のまま
+    # 表示されてしまう（2026-08-20のCodexレビューで指摘）。
+    for col in col_for_year.values():
+        for row_num in _ROW_PROFIT.values():
+            ws[f"{col}{row_num}"].number_format = _PROFIT_NUMBER_FORMAT
 
     for _, row in f_actual.sort_values(["CurFYEn", "CurPerType"]).iterrows():
         period_type = row["CurPerType"]
