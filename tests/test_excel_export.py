@@ -65,6 +65,24 @@ class TestRegionalFallbackInfo(unittest.TestCase):
         mock_fetch.assert_not_called()
         self.assertEqual(price, 830.0)
 
+    def test_rejects_stale_price_after_tokyo_market_transition_not_yet_in_master(self):
+        # update_regional_store()は「現在も地方単独上場」の銘柄だけCurrentPrice
+        # を更新し、東証を含む市場に移った銘柄は更新をスキップして古い値を
+        # そのまま保持する。TDnetでは既に東証移籍(markets_stringが"福"→"東福")
+        # が反映されているのに、J-Quantsのマスタがまだ追いついていない
+        # （equities/masterに未反映でmaster_rowが空のまま）タイミングでは、
+        # IsDelisted判定だけでは弾けず、更新が止まった古い価格を「現在値」として
+        # 誤って提示してしまう（2026-08-24の5巡目のCodexレビューで指摘・修正）。
+        store = {"company_status": pd.DataFrame(
+            [_status_row("93880", "テスト株式会社", "東福", is_delisted=False, current_price=830.0)]
+        )}
+        with patch(f"{_MOD}.regional_stocks.update_regional_store", return_value=store):
+            name, markets_string, price = excel_export._regional_fallback_info("9388")
+
+        self.assertEqual(name, "テスト株式会社")
+        self.assertEqual(markets_string, "東福")  # 市場表示自体は最新のTDnet情報のまま
+        self.assertIsNone(price)  # ただし現在値(古い可能性がある)は返さない
+
     def test_delisted_company_returns_no_market_or_price(self):
         # 上場廃止済みの銘柄は、株価フォールバックを発動させないためmarkets_string・
         # 現在値ともNoneで返す（古いyfinance終値を現在値として誤表示しないため）。

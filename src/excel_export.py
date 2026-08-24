@@ -104,6 +104,17 @@ def _regional_fallback_info(code: str) -> tuple[str, str | None, float | None]:
     markets_string = str(markets_string) if isinstance(markets_string, str) and markets_string else None
     current_price = row.get("CurrentPrice")
     current_price = float(current_price) if pd.notna(current_price) else None
+    if current_price is not None and not regional_stocks.is_regional_only(markets_string):
+        # update_regional_store()は「現在も地方単独上場」の銘柄だけCurrentPrice
+        # を更新し、東証を含む市場に移った銘柄は更新をスキップして古い値を
+        # そのまま保持する（regional_stocks.py内のコメント参照）。TDnet側では
+        # 既に東証移籍(例: markets_stringが"福"→"東福")が反映されているのに
+        # J-Quantsのマスタがまだ追いついていない（equities/masterに未反映で
+        # master_rowが空のまま）タイミングでは、この関数のIsDelisted判定だけ
+        # では弾けず、更新が止まった古いyfinance価格を「現在値」として誤って
+        # 提示してしまう。markets_stringが既に地方単独上場でなくなっている
+        # 場合は現在値を返さない（2026-08-24の5巡目のCodexレビューで指摘・修正）。
+        current_price = None
     return name, markets_string, current_price
 
 
