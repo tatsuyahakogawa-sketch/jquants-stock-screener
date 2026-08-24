@@ -203,10 +203,21 @@ def render_regional_section(selected_market_chars: set[str]) -> None:
         rules_to_check = list(selected_statement_rules)
         if exclude_downward_regional:
             rules_to_check.append(regional_stocks.REGIONAL_NEGATIVE_RULE)
-        hits = regional_stocks.screen_regional(
-            pd.DataFrame(), statements, company_status_in_selected_markets, rules_to_check
-        )
-        summary = build_summary(hits)
+        if company_status_in_selected_markets.empty:
+            # regional_stocks._currently_regional_codes()は、company_status_dfが
+            # 空の場合を「企業ステータス情報が無いので絞り込まない」という意味に
+            # 解釈する（ストア自体が未取得の場合に誤って全件除外しないための仕様）。
+            # ここでのcompany_status_in_selected_marketsの空は、その意味ではなく
+            # 「選択した取引所に該当する現存の地方単独上場企業が0件」という意味の
+            # ため、そのままscreen_regionalに渡すと絞り込みが効かず、選択して
+            # いない取引所の銘柄まで結果に出てしまう。この場合は「情報なし」扱い
+            # にせず明示的に空の結果として扱う（2026-08-24のCodexレビューで指摘・修正）。
+            summary = build_summary(pd.DataFrame(columns=["Code", "CompanyName", "Rule", "RuleLabel", "Date", "Detail"]))
+        else:
+            hits = regional_stocks.screen_regional(
+                pd.DataFrame(), statements, company_status_in_selected_markets, rules_to_check
+            )
+            summary = build_summary(hits)
         if not summary.empty:
             if exclude_downward_regional:
                 summary = summary[~summary["HasDownwardRevision"]]

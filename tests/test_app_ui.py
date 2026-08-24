@@ -151,6 +151,50 @@ class TestRegionalMarketFilter(unittest.TestCase):
         codes = set(at.dataframe[0].value["コード"])
         self.assertEqual(codes, {"33330"})
 
+    def test_financial_condition_hits_from_unselected_market_do_not_leak(self):
+        # regional_stocks._currently_regional_codes()は、company_status_dfが
+        # 空の場合を「企業ステータス情報が無いので絞り込まない」と解釈する
+        # （ストア自体が未取得の場合に誤って全件除外しないための仕様）。選択した
+        # 取引所に該当する現存の地方単独上場企業が1件も無い場合（company_status
+        # 自体に福証の銘柄しか無く、かつ「札証」だけを選択した場合等）、この空の
+        # DataFrameがそのままscreen_regionalに渡ると同じ「絞り込まない」扱いに
+        # なり、選択していない取引所の銘柄の財務条件ヒットが結果に紛れ込んで
+        # しまう（2026-08-24のCodexレビューで指摘・修正）。company_statusに
+        # 福証の33330しか存在しない状態で自己資本比率60%以上のstatementsを
+        # 持たせ、「札証」だけを選択した場合、財務条件の結果は空でなければならない
+        # （company_status_in_selected_marketsが単なる部分絞り込みではなく完全に
+        # 空になるケースを再現するため、他の取引所の銘柄をあえて含めない）。
+        store = {
+            "company_status": pd.DataFrame([
+                {"Code": "33330", "CompanyName": "福証単独銘柄", "MarketsString": "福",
+                 "LastSeenDate": pd.Timestamp("2026-08-01"), "LastDelistingDate": pd.NaT,
+                 "IsDelisted": False, "CurrentPrice": None, "CurrentPriceNote": ""},
+            ]),
+            "listing_events": pd.DataFrame(
+                columns=["id", "Code", "CompanyName", "Date", "MarketsString", "TargetMarkets",
+                         "Stage", "IsTokyoRelated", "Title", "Url"]
+            ),
+            "major_events": pd.DataFrame(
+                columns=["id", "Code", "CompanyName", "Date", "MarketsString", "Title", "Url", "MatchedKeyword"]
+            ),
+            "statements": pd.DataFrame([
+                {"Code": "33330", "DiscDate": "2026-08-01", "EqAR": 0.8},
+            ]),
+        }
+        with patch("src.regional_stocks.load_regional_store", return_value=store):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.checkbox(key="regional_only").set_value(True)
+            at.run(timeout=30)
+            at.pills(key="regional_market_filter_pills").set_value(["札証"])
+            at.run(timeout=30)
+            at.pills(key="regional_statement_rules_pills").set_value(["equity_ratio_high"])
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        warning_texts = [w.value for w in at.warning]
+        self.assertTrue(any("該当なし" in t for t in warning_texts))
+
     def test_deselecting_all_markets_shows_warning_instead_of_table(self):
         with patch("src.regional_stocks.load_regional_store", return_value=_regional_store_for_market_filter_test()):
             at = AppTest.from_file(APP_PATH)
