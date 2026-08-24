@@ -130,12 +130,24 @@ def _ensure_common_stock(master_row: dict, code: str) -> None:
 
 
 def _nearest_close(prices: pd.DataFrame, target_date) -> float | None:
-    """target_date以前で最も近い（無ければ最初の）取引日の終値を返す。"""
-    if prices.empty or target_date is None or pd.isna(target_date):
+    """target_date以前で最も近い、実際に終値がある（無ければ全期間で最初に
+    終値がある）取引日の終値を返す。
+
+    出来高が無い日（薄商いで売買が成立しなかった日）は、/equities/bars/daily
+    がO/H/L/C全てnullの行を返すことがある。target_date自体やそれ以前の
+    「直近の行」がたまたま無取引日だった場合、その行をそのまま使うと終値が
+    空欄になってしまう（実データで7902の2023-06-30・2023-07-06が無取引日と
+    確認）。終値がある行だけに絞ってから直近を探す
+    （2026-08-24にユーザー報告のバグ調査で発見・修正）。
+    """
+    if prices.empty or "C" not in prices.columns or target_date is None or pd.isna(target_date):
+        return None
+    priced = prices.loc[_to_numeric(prices["C"]).notna()]
+    if priced.empty:
         return None
     target = pd.Timestamp(target_date)
-    on_or_before = prices.loc[prices["Date"] <= target]
-    row = on_or_before.iloc[-1] if not on_or_before.empty else prices.iloc[0]
+    on_or_before = priced.loc[priced["Date"] <= target]
+    row = on_or_before.iloc[-1] if not on_or_before.empty else priced.iloc[0]
     close = _to_numeric(pd.Series([row.get("C")])).iloc[0]
     return None if pd.isna(close) else float(close)
 

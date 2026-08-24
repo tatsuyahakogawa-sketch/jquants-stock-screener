@@ -144,5 +144,41 @@ class TestHasUsableClose(unittest.TestCase):
         self.assertTrue(excel_export._has_usable_close(prices))
 
 
+class TestNearestClose(unittest.TestCase):
+    """薄商いで売買が成立しなかった日（O/H/L/C全てnullの行）を、直近の終値と
+    して誤って扱わないことの単体テスト（2026-08-24にユーザー報告で発見・
+    修正。実データで銘柄コード7902の2023-06-30・2023-07-06が無取引日と確認）。
+    """
+
+    def _prices(self, rows):
+        df = pd.DataFrame(rows, columns=["Date", "C"])
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df
+
+    def test_exact_date_match_with_null_close_falls_back_to_prior_trading_day(self):
+        prices = self._prices([
+            ("2023-06-29", 829.0),
+            ("2023-06-30", None),  # 無取引日
+            ("2023-07-03", 837.0),
+        ])
+        self.assertEqual(excel_export._nearest_close(prices, "2023-06-30"), 829.0)
+
+    def test_target_before_all_valid_data_falls_back_to_first_valid_row(self):
+        prices = self._prices([
+            ("2023-06-28", None),  # 無取引日
+            ("2023-06-29", 829.0),
+            ("2023-07-03", 837.0),
+        ])
+        self.assertEqual(excel_export._nearest_close(prices, "2023-06-01"), 829.0)
+
+    def test_all_null_close_returns_none(self):
+        prices = self._prices([("2023-06-29", None), ("2023-06-30", None)])
+        self.assertIsNone(excel_export._nearest_close(prices, "2023-06-30"))
+
+    def test_normal_case_unaffected(self):
+        prices = self._prices([("2023-06-29", 829.0), ("2023-06-30", 831.0)])
+        self.assertEqual(excel_export._nearest_close(prices, "2023-06-30"), 831.0)
+
+
 if __name__ == "__main__":
     unittest.main()

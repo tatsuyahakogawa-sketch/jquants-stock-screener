@@ -443,10 +443,18 @@ def compute_market_metrics(
     if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
         price_history = price_history.copy()
         price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
+        price_history["C"] = _to_numeric(price_history["C"])
         price_history = price_history.dropna(subset=["Date"]).sort_values("Date")
-        if not price_history.empty:
-            latest_close = _to_numeric(price_history["C"]).iloc[-1]
-            latest_price_date = price_history["Date"].iloc[-1]
+        # 出来高が無い日（薄商いで売買が成立しなかった日）は、/equities/bars/daily
+        # がO/H/L/C全てnullの行を返すことがある。直近の行を無条件にlatest_closeと
+        # すると、たまたま最新の取得日が無取引日だった銘柄で現在値・PER・PBR・
+        # 時価総額・配当利回りが軒並み空欄になってしまう（実データで7902において
+        # 2023-06-30・2023-07-06が無取引日と確認）。終値がある直近の行まで遡る
+        # （2026-08-24にユーザー報告のバグ調査で発見・修正）。
+        priced_history = price_history.dropna(subset=["C"])
+        if not priced_history.empty:
+            latest_close = priced_history["C"].iloc[-1]
+            latest_price_date = priced_history["Date"].iloc[-1]
             price_source = "jquants"
 
     if (latest_close is None or pd.isna(latest_close)) and fallback_price is not None and pd.notna(fallback_price):

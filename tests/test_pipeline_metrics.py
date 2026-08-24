@@ -57,5 +57,39 @@ class TestMetricsAsOf(unittest.TestCase):
             self.assertIn(key, metrics)
 
 
+class TestLatestCloseSkipsNoTradeDays(unittest.TestCase):
+    """薄商いで売買が成立しなかった日（O/H/L/C全てnullの行）が最新の取得日
+    だった場合に、現在値・PER・PBR・時価総額・配当利回りが軒並み空欄になって
+    しまう問題の単体テスト（2026-08-24にユーザー報告で発見・修正。実データで
+    銘柄コード7902の2023-06-30・2023-07-06が無取引日と確認。/equities/bars/daily
+    は無取引日もO/H/L/C全てnullの行として返してくる）。
+    """
+
+    def _fins(self):
+        return pd.DataFrame({
+            "DiscDate": ["2026-05-14"], "CurPerType": ["FY"],
+            "FEPS": [20.0], "BPS": [300.0],
+            "ShOutFY": [1_000_000], "TrShFY": [0],
+            "DivAnn": [10.0], "FDivAnn": [10.0],
+        })
+
+    def test_latest_row_with_null_close_falls_back_to_prior_trading_day(self):
+        prices = pd.DataFrame({
+            "Date": ["2026-08-05", "2026-08-06", "2026-08-07"],
+            "C": [400.0, 420.0, None],
+        })
+        metrics = pipeline.compute_market_metrics(self._fins(), prices)
+        self.assertEqual(metrics["latest_close"], 420.0)
+        self.assertEqual(metrics["latest_price_date"], pd.Timestamp("2026-08-06"))
+        self.assertEqual(metrics["price_source"], "jquants")
+        self.assertIsNotNone(metrics["per"])
+
+    def test_all_rows_null_close_leaves_metrics_blank(self):
+        prices = pd.DataFrame({"Date": ["2026-08-06", "2026-08-07"], "C": [None, None]})
+        metrics = pipeline.compute_market_metrics(self._fins(), prices)
+        self.assertIsNone(metrics["latest_close"])
+        self.assertIsNone(metrics["price_source"])
+
+
 if __name__ == "__main__":
     unittest.main()
