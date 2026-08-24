@@ -376,6 +376,16 @@ def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
     （例: 開示後に1→8の分割があると、PER/PBRが実際の8倍小さく、配当利回りが
     実際の8倍大きく出てしまう）。分割等が無い、またはデータが無い場合は1.0
     （無調整）を返す。
+
+    薄商いで売買が成立しなかった日（O/H/L/C全てnullの行）がsince_date以前の
+    直近行になる場合、そのまま使うとC/AdjCが両方nullで「分割等が無い」扱い
+    (1.0固定)になってしまい、実際には分割があってもPER/PBR/配当利回りが
+    誤って無調整のまま計算される。latest_close側の無取引日フォールバック
+    （_nearest_close・compute_market_metricsの最新終値算出）により、以前は
+    無取引日のせいでlatest_close自体が空欄になっていた銘柄でもPER/PBR/配当
+    利回りが計算されるようになったため、この関数側の同種の欠陥も顕在化する
+    （2026-08-24のCodexレビューで指摘・修正）。C・AdjCが両方揃っている行だけ
+    を対象に直近を探す。
     """
     if since_date is None or pd.isna(since_date):
         return 1.0
@@ -383,14 +393,16 @@ def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
         return 1.0
     p = price_history.copy()
     p["Date"] = pd.to_datetime(p["Date"], errors="coerce")
-    p = p.dropna(subset=["Date"]).sort_values("Date")
+    p["C"] = _to_numeric(p["C"])
+    p["AdjC"] = _to_numeric(p["AdjC"])
+    p = p.dropna(subset=["Date", "C", "AdjC"]).sort_values("Date")
     on_or_before = p.loc[p["Date"] <= pd.Timestamp(since_date)]
     if on_or_before.empty:
         return 1.0
     row = on_or_before.iloc[-1]
-    c = _to_numeric(pd.Series([row.get("C")])).iloc[0]
-    adj_c = _to_numeric(pd.Series([row.get("AdjC")])).iloc[0]
-    if pd.isna(c) or pd.isna(adj_c) or c == 0:
+    c = row["C"]
+    adj_c = row["AdjC"]
+    if c == 0:
         return 1.0
     return float(adj_c / c)
 
@@ -443,10 +455,18 @@ def compute_market_metrics(
     if not price_history.empty and "Date" in price_history.columns and "C" in price_history.columns:
         price_history = price_history.copy()
         price_history["Date"] = pd.to_datetime(price_history["Date"], errors="coerce")
+        price_history["C"] = _to_numeric(price_history["C"])
         price_history = price_history.dropna(subset=["Date"]).sort_values("Date")
-        if not price_history.empty:
-            latest_close = _to_numeric(price_history["C"]).iloc[-1]
-            latest_price_date = price_history["Date"].iloc[-1]
+        # 出来高が無い日（薄商いで売買が成立しなかった日）は、/equities/bars/daily
+        # がO/H/L/C全てnullの行を返すことがある。直近の行を無条件にlatest_closeと
+        # すると、たまたま最新の取得日が無取引日だった銘柄で現在値・PER・PBR・
+        # 時価総額・配当利回りが軒並み空欄になってしまう（実データで7902において
+        # 2023-06-30・2023-07-06が無取引日と確認）。終値がある直近の行まで遡る
+        # （2026-08-24にユーザー報告のバグ調査で発見・修正）。
+        priced_history = price_history.dropna(subset=["C"])
+        if not priced_history.empty:
+            latest_close = priced_history["C"].iloc[-1]
+            latest_price_date = priced_history["Date"].iloc[-1]
             price_source = "jquants"
 
     if (latest_close is None or pd.isna(latest_close)) and fallback_price is not None and pd.notna(fallback_price):
