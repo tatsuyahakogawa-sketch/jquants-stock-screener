@@ -91,5 +91,54 @@ class TestLatestCloseSkipsNoTradeDays(unittest.TestCase):
         self.assertIsNone(metrics["price_source"])
 
 
+class TestSplitAdjustmentSkipsNoTradeDays(unittest.TestCase):
+    """_split_adjustment_sinceが、開示日時点で直近のC/AdjCを探す際に無取引日
+    （O/H/L/C全てnullの行）をそのまま使ってしまう問題の単体テスト
+    （2026-08-24のCodexレビューで指摘・修正）。
+
+    latest_close側の無取引日フォールバック修正により、以前は無取引日のせいで
+    latest_close自体が空欄になっていた銘柄でもPER/PBR/配当利回りが計算される
+    ようになった。その際、開示日の直近行がたまたま無取引日だと、C/AdjCが
+    両方nullで「分割等が無い」(1.0固定)と誤判定され、実際にはあった分割が
+    無視されて誤ったPER/PBR/配当利回りが計算されてしまう。
+    """
+
+    def test_looks_back_past_no_trade_day_to_find_split_ratio(self):
+        # 2026-01-09(開示日=since_date)は無取引日でC/AdjCともnull。
+        # その前日2026-01-08は有効なC/AdjCを持ち、1→2分割の累積倍率(0.5)を示す。
+        price_history = pd.DataFrame({
+            "Date": ["2026-01-08", "2026-01-09"],
+            "C": [1000.0, None],
+            "AdjC": [500.0, None],
+        })
+        ratio = pipeline._split_adjustment_since(price_history, "2026-01-09")
+        self.assertEqual(ratio, 0.5)
+
+    def test_no_trade_day_without_earlier_valid_row_falls_back_to_no_adjustment(self):
+        price_history = pd.DataFrame({"Date": ["2026-01-09"], "C": [None], "AdjC": [None]})
+        self.assertEqual(pipeline._split_adjustment_since(price_history, "2026-01-09"), 1.0)
+
+    def test_recovered_latest_close_uses_correctly_split_adjusted_eps_for_per(self):
+        # latest_close側の無取引日フォールバックでPERが計算されるようになった
+        # 銘柄で、FEPSの基準日(開示日)側の分割調整も正しく効くことを確認する
+        # 統合的なテスト。分割前FEPS=20.0、1→2分割後の現在株式数基準では
+        # 10.0相当になるはずなので、PER = latest_close(480) / 10.0 = 48.0
+        # （分割調整が効かず1.0のままだとPER = 480/20.0 = 24.0になってしまう）。
+        prices = pd.DataFrame({
+            "Date": ["2026-01-08", "2026-01-09", "2026-01-15", "2026-01-16"],
+            "C": [1000.0, None, 480.0, None],
+            "AdjC": [500.0, None, 480.0, None],
+        })
+        fins = pd.DataFrame({
+            "DiscDate": ["2026-01-09"], "CurPerType": ["FY"],
+            "FEPS": [20.0], "BPS": [300.0],
+            "ShOutFY": [1_000_000], "TrShFY": [0],
+            "DivAnn": [10.0], "FDivAnn": [10.0],
+        })
+        metrics = pipeline.compute_market_metrics(fins, prices)
+        self.assertEqual(metrics["latest_close"], 480.0)
+        self.assertAlmostEqual(metrics["per"], 48.0)
+
+
 if __name__ == "__main__":
     unittest.main()

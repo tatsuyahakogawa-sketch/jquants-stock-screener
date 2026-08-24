@@ -376,6 +376,16 @@ def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
     （例: 開示後に1→8の分割があると、PER/PBRが実際の8倍小さく、配当利回りが
     実際の8倍大きく出てしまう）。分割等が無い、またはデータが無い場合は1.0
     （無調整）を返す。
+
+    薄商いで売買が成立しなかった日（O/H/L/C全てnullの行）がsince_date以前の
+    直近行になる場合、そのまま使うとC/AdjCが両方nullで「分割等が無い」扱い
+    (1.0固定)になってしまい、実際には分割があってもPER/PBR/配当利回りが
+    誤って無調整のまま計算される。latest_close側の無取引日フォールバック
+    （_nearest_close・compute_market_metricsの最新終値算出）により、以前は
+    無取引日のせいでlatest_close自体が空欄になっていた銘柄でもPER/PBR/配当
+    利回りが計算されるようになったため、この関数側の同種の欠陥も顕在化する
+    （2026-08-24のCodexレビューで指摘・修正）。C・AdjCが両方揃っている行だけ
+    を対象に直近を探す。
     """
     if since_date is None or pd.isna(since_date):
         return 1.0
@@ -383,14 +393,16 @@ def _split_adjustment_since(price_history: pd.DataFrame, since_date) -> float:
         return 1.0
     p = price_history.copy()
     p["Date"] = pd.to_datetime(p["Date"], errors="coerce")
-    p = p.dropna(subset=["Date"]).sort_values("Date")
+    p["C"] = _to_numeric(p["C"])
+    p["AdjC"] = _to_numeric(p["AdjC"])
+    p = p.dropna(subset=["Date", "C", "AdjC"]).sort_values("Date")
     on_or_before = p.loc[p["Date"] <= pd.Timestamp(since_date)]
     if on_or_before.empty:
         return 1.0
     row = on_or_before.iloc[-1]
-    c = _to_numeric(pd.Series([row.get("C")])).iloc[0]
-    adj_c = _to_numeric(pd.Series([row.get("AdjC")])).iloc[0]
-    if pd.isna(c) or pd.isna(adj_c) or c == 0:
+    c = row["C"]
+    adj_c = row["AdjC"]
+    if c == 0:
         return 1.0
     return float(adj_c / c)
 
