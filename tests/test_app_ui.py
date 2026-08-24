@@ -131,5 +131,34 @@ class TestRegionalSortByCurrentlyRegional(unittest.TestCase):
         self.assertEqual(codes[0], "22220")
 
 
+class TestTdnetDisclosureLimitWarningIsVisible(unittest.TestCase):
+    """run_screening内部のwarnings.warn（TDnet開示件数の上限超過等）が、
+    サーバーログだけでなくst.warningとして画面にも表示されることの確認
+    （2026-08-24にユーザーが指定した機能。warnings.warnはStreamlit画面には
+    自動で出ないため、app.py側でwarnings.catch_warningsを使って捕捉・表示する
+    実装にした）。
+    """
+
+    def test_run_screening_warning_is_shown_as_st_warning(self):
+        import warnings as warnings_module
+
+        def _fake_run_screening(client, start, end, selected_rules=None):
+            warnings_module.warn("テスト用の警告メッセージ：200件を超えました")
+            return pd.DataFrame(columns=["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"])
+
+        with patch("src.pipeline.run_screening", side_effect=_fake_run_screening), \
+                patch("src.jquants_client.JQuantsClient.__init__", return_value=None):
+            at = AppTest.from_file(APP_PATH)
+            at.run(timeout=30)
+            at.pills(key="material_events_pills").set_value(["stop_high"])
+            at.run(timeout=30)
+            next(b for b in at.button if b.label == "スクリーニング実行").click()
+            at.run(timeout=30)
+
+        self.assertEqual(len(at.exception), 0)
+        warning_texts = [w.value for w in at.warning]
+        self.assertTrue(any("200件を超えました" in t for t in warning_texts))
+
+
 if __name__ == "__main__":
     unittest.main()

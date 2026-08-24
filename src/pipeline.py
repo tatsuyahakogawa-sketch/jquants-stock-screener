@@ -16,6 +16,7 @@ from src import endpoints, rules, score, tdnet_client
 from src.config import (
     LISTING_LOOKBACK_YEARS,
     LISTING_DATE_BOUNDARY_TOLERANCE_DAYS,
+    MAX_TDNET_DISCLOSURES_FOR_SCREENING,
     PROFIT_DOUBLING_YEARS,
 )
 from src.jquants_client import JQuantsClient
@@ -137,12 +138,26 @@ def run_screening(
 
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
-        hits.append(rules.detect_new_facility_or_store(disclosures_df))
-        hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
-        hits.append(rules.detect_stock_split(disclosures_df))
-        hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
-        hits.append(rules.detect_large_order(disclosures_df))
-        hits.append(rules.detect_world_first(disclosures_df))
+        if len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
+            # 期間が広すぎる等でTDnet開示が大量に該当する場合、タイトルの
+            # キーワード一致で判定するTDNET_TITLE_BASED_RULES（新工場・新店舗・
+            # 東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表）の
+            # 検索は行わない（それ以上の処理を止めてユーザーに知らせ、期間を
+            # 絞り込んでもらう。他のルール(J-Quants由来)の結果はそのまま返す。
+            # 2026-08-24にユーザーが指定）。
+            warnings.warn(
+                f"指定期間のTDnet開示件数が{len(disclosures_df)}件と多く、上限"
+                f"（{MAX_TDNET_DISCLOSURES_FOR_SCREENING}件）を超えたため、新工場・新店舗・"
+                "東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表の検索を"
+                "行いませんでした。期間を絞り込んで再実行してください。"
+            )
+        else:
+            hits.append(rules.detect_new_facility_or_store(disclosures_df))
+            hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
+            hits.append(rules.detect_stock_split(disclosures_df))
+            hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
+            hits.append(rules.detect_large_order(disclosures_df))
+            hits.append(rules.detect_world_first(disclosures_df))
     except Exception as e:
         # TDnetの非公式ミラーは個人運営で不安定なことがあるため、失敗しても
         # 他のルールの結果は返す（README参照）。
