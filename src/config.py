@@ -17,6 +17,7 @@
 # 増収率のしきい値（前年同期比、対象期間の累計売上高で比較）
 SALES_GROWTH_MAJOR_THRESHOLD = 0.20   # 「大幅に増えた」の下限 (+20%)
 SALES_GROWTH_EXPLOSIVE_THRESHOLD = 0.50  # 「爆発的に伸びた」の下限 (+50%)
+SALES_GROWTH_DOUBLING_THRESHOLD = 1.00  # 「1年で2倍以上」の下限 (+100%)
 
 # 決算が会社予想を上回ったと判定する上振れ率のしきい値
 EARNINGS_BEAT_THRESHOLD = 0.0  # 0 = 予想を1円でも上回れば対象。必要に応じて調整可

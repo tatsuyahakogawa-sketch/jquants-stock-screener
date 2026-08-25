@@ -1,9 +1,14 @@
-"""src/rules.py の detect_stock_split（株式分割・併合の新規発表検出）の単体テスト。
+"""src/rules.py の detect_stock_split（株式分割・株式併合の新規発表検出）の単体テスト。
 
 「株式分割」「株式併合」というキーワードが含まれるだけで判定していた旧ロジックの
 誤検出（配当予想修正・株主優待変更等の後日談を新規発表として拾ってしまう）を
 防ぐための_classify_stock_split_titleを中心に検証する。実際のTDnet開示タイトル
 （2026年8月時点）で確認済みの実例をそのまま使用。
+
+分割（"stock_split"）と併合（"stock_consolidation"）は株価インパクトが逆方向の
+別事象のため、2026-08-24にユーザーの指定で別ruleに分離した
+（_classify_stock_split_titleの戻り値に一致したキーワードを追加し、
+detect_stock_splitがそれに応じてrule/event_typeを振り分ける）。
 
 実行方法:
     python -m unittest discover tests
@@ -25,52 +30,61 @@ class TestClassifyStockSplitTitleIncludes(unittest.TestCase):
     """新規の決定・発表として検出すべきタイトル。"""
 
     def test_simple_split_notice(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割に関するお知らせ")
+        is_new, _, keyword = rules._classify_stock_split_title("株式分割に関するお知らせ")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式分割")
 
     def test_simple_consolidation_notice(self):
-        is_new, _ = rules._classify_stock_split_title("株式併合に関するお知らせ")
+        is_new, _, keyword = rules._classify_stock_split_title("株式併合に関するお知らせ")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式併合")
 
     def test_split_with_articles_amendment_joined_by_oyobi(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割及び定款の一部変更に関するお知らせ")
+        is_new, _, keyword = rules._classify_stock_split_title("株式分割及び定款の一部変更に関するお知らせ")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式分割")
 
     def test_board_resolution_wording(self):
-        is_new, _ = rules._classify_stock_split_title("取締役会で株式分割を決議した旨の開示")
+        is_new, _, keyword = rules._classify_stock_split_title("取締役会で株式分割を決議した旨の開示")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式分割")
 
     def test_shareholder_meeting_agenda_wording(self):
-        is_new, _ = rules._classify_stock_split_title("株主総会に株式併合を付議する旨の開示")
+        is_new, _, keyword = rules._classify_stock_split_title("株主総会に株式併合を付議する旨の開示")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式併合")
 
     def test_real_example_yagi_original_announcement(self):
         # 7460 ヤギ 2026-05-11（分割そのものの新規発表。定款変更を伴っていても新規発表扱い）
-        is_new, reason = rules._classify_stock_split_title(
+        is_new, reason, keyword = rules._classify_stock_split_title(
             "株式分割及び株式分割に伴う定款の一部変更に関するお知らせ"
         )
         self.assertTrue(is_new)
         self.assertIn("単独で出現", reason)
+        self.assertEqual(keyword, "株式分割")
 
     def test_real_example_bundled_split_articles_dividend(self):
         # 5706/6622/1926/1965/4667/7716等で共通の実際のタイトル形式
-        is_new, _ = rules._classify_stock_split_title(
+        is_new, _, keyword = rules._classify_stock_split_title(
             "株式分割および株式分割に伴う定款の一部変更ならびに配当予想の修正に関するお知らせ"
         )
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式分割")
 
     def test_real_example_comma_listed_topics(self):
         # 5232 住友大阪セメント
-        is_new, _ = rules._classify_stock_split_title("株式分割、定款の一部変更、配当予想の修正等に関するお知らせ")
+        is_new, _, keyword = rules._classify_stock_split_title("株式分割、定款の一部変更、配当予想の修正等に関するお知らせ")
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式分割")
 
     def test_real_example_consolidation_shareholder_meeting(self):
         # 7082 ジモティー（株式併合の付議。ユーザーの一般規則には合致するが個別の
         # 期待値と食い違うため、変更後もこの挙動になることをレポートで明示する）
-        is_new, _ = rules._classify_stock_split_title(
+        is_new, _, keyword = rules._classify_stock_split_title(
             "株式併合並びに単元株式数の定めの廃止及び定款一部変更に関する臨時株主総会開催のお知らせ"
         )
         self.assertTrue(is_new)
+        self.assertEqual(keyword, "株式併合")
 
 
 class TestClassifyStockSplitTitleExcludes(unittest.TestCase):
@@ -78,34 +92,36 @@ class TestClassifyStockSplitTitleExcludes(unittest.TestCase):
 
     def test_dividend_forecast_revision_due_to_split(self):
         # 7460 ヤギ 2026-08-03（今回の主な誤検出例）
-        is_new, reason = rules._classify_stock_split_title("株式分割に伴う配当予想の修正に関するお知らせ")
+        is_new, reason, keyword = rules._classify_stock_split_title("株式分割に伴う配当予想の修正に関するお知らせ")
         self.assertFalse(is_new)
         self.assertIn("配当予想の修正", reason)
+        self.assertEqual(keyword, "株式分割")
 
     def test_shareholder_benefit_change_due_to_split(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割に伴う株主優待制度の変更について")
+        is_new, _, _keyword = rules._classify_stock_split_title("株式分割に伴う株主優待制度の変更について")
         self.assertFalse(is_new)
 
     def test_articles_amendment_only_due_to_split(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割に伴う定款変更のみに関するお知らせ")
+        is_new, _, _keyword = rules._classify_stock_split_title("株式分割に伴う定款変更のみに関するお知らせ")
         self.assertFalse(is_new)
 
     def test_stock_acquisition_right_adjustment_due_to_split(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割に伴う新株予約権の調整に関するお知らせ")
+        is_new, _, _keyword = rules._classify_stock_split_title("株式分割に伴う新株予約権の調整に関するお知らせ")
         self.assertFalse(is_new)
 
     def test_shares_outstanding_change_due_to_split(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割後の発行済株式数に関するお知らせ")
+        is_new, _, _keyword = rules._classify_stock_split_title("株式分割後の発行済株式数に関するお知らせ")
         self.assertFalse(is_new)
 
     def test_real_example_conversion_price_adjustment(self):
-        is_new, _ = rules._classify_stock_split_title("株式分割に伴う転換価額及び行使価額等の調整に関するお知らせ")
+        is_new, _, _keyword = rules._classify_stock_split_title("株式分割に伴う転換価額及び行使価額等の調整に関するお知らせ")
         self.assertFalse(is_new)
 
     def test_no_keyword_at_all(self):
-        is_new, reason = rules._classify_stock_split_title("業績予想の修正に関するお知らせ")
+        is_new, reason, keyword = rules._classify_stock_split_title("業績予想の修正に関するお知らせ")
         self.assertFalse(is_new)
         self.assertEqual(reason, "")
+        self.assertIsNone(keyword)
 
 
 class TestDetectStockSplitDataFrame(unittest.TestCase):
@@ -128,6 +144,20 @@ class TestDetectStockSplitDataFrame(unittest.TestCase):
         self.assertEqual(row["source_url"], "https://example.com/1")
         self.assertIn("単独で出現", row["match_reason"])
         self.assertEqual(row["event_date"], row["Date"])
+
+    def test_consolidation_gets_separate_rule_from_split(self):
+        # 分割と併合は別ruleとして返す（2026-08-24にユーザーの指定で分離）。
+        df = self._disclosures([
+            {"company_code": "70820", "title": "株式併合に関するお知らせ",
+             "pubdate": "2026-03-01 15:00:00", "document_url": "https://example.com/consolidation"},
+            {"company_code": "74600", "title": "株式分割に関するお知らせ",
+             "pubdate": "2026-03-02 15:00:00", "document_url": "https://example.com/split"},
+        ])
+        result = rules.detect_stock_split(df).set_index("Code")
+        self.assertEqual(result.loc["70820", "rule"], "stock_consolidation")
+        self.assertEqual(result.loc["70820", "event_type"], "stock_consolidation")
+        self.assertEqual(result.loc["74600", "rule"], "stock_split")
+        self.assertEqual(result.loc["74600", "event_type"], "stock_split")
 
     def test_empty_input_returns_empty_with_expected_columns(self):
         result = rules.detect_stock_split(pd.DataFrame())

@@ -104,6 +104,29 @@ class TestDetectSalesGrowth(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["rule"], "sales_growth_major")
 
+    def test_doubling_growth_also_tagged_as_major_and_explosive(self):
+        # +100%以上(1年で2倍)は、数値としてsales_growth_major(+20%以上)・
+        # sales_growth_explosive(+50%以上)も満たすため、3つのruleタグを
+        # すべて持つ行として返す（2026-08-24にユーザーの指定で追加）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%
+        ])
+        result = rules.detect_sales_growth(statements)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(
+            set(result["rule"]),
+            {"sales_growth_major", "sales_growth_explosive", "sales_growth_doubling"},
+        )
+
+    def test_growth_just_under_doubling_not_tagged_as_doubling(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 190, 19),  # +90%
+        ])
+        result = rules.detect_sales_growth(statements)
+        self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+
     def test_excludes_synthetic_rows_from_hits(self):
         # 2026年の実際の開示が一度も取得できず(XBRL保持期限切れ等)、2025年の
         # 実開示(埋め込み前年同期=2024年)と2027年の実開示(埋め込み前年同期=
@@ -145,6 +168,62 @@ class TestDetectEarningsBeat(unittest.TestCase):
         ])
         result = rules.detect_earnings_beat(statements)
         self.assertTrue(result.empty)
+
+
+class TestDetectJpxNikkei400Selection(unittest.TestCase):
+    """「JPX日経インデックス400」構成銘柄への選定・採用の検出（2026-08-24に
+    ユーザーの指定で追加）。実際のTDnet開示タイトル（2021〜2026年、26件）で
+    確認済みの実例と、全角/半角表記ゆれ、無関係な開示（ETF自体の決算短信・
+    「JPX日経中小型株指数」）を使う。
+    """
+
+    def _disclosures(self, rows):
+        return pd.DataFrame(rows, columns=["company_code", "title", "pubdate", "document_url"])
+
+    def test_real_example_selection_notice(self):
+        # 東和薬品 2021-08-06
+        df = self._disclosures([
+            {"company_code": "45050", "title": "「JPX日経インデックス400」構成銘柄への採用に関するお知らせ",
+             "pubdate": "2021-08-06 16:30:00", "document_url": None},
+        ])
+        result = rules.detect_jpx_nikkei_400_selection(df)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["rule"], "jpx_nikkei_400")
+
+    def test_fullwidth_and_spaced_variants_are_matched(self):
+        # アインＨＤ 2021-08-11（全角数字）、フェローテック 2022-08-08（半角スペース入り）
+        df = self._disclosures([
+            {"company_code": "90670", "title": "「JPX日経インデックス４００」構成銘柄選定継続のお知らせ",
+             "pubdate": "2021-08-11 13:00:00", "document_url": None},
+            {"company_code": "63690", "title": "当社株式の「JPX 日経インデックス 400」構成銘柄選定に関するお知らせ",
+             "pubdate": "2022-08-08 12:00:00", "document_url": None},
+        ])
+        result = rules.detect_jpx_nikkei_400_selection(df)
+        self.assertEqual(len(result), 2)
+
+    def test_etf_fund_settlement_report_is_not_matched(self):
+        # ＮＦＪＰＸ４００・ＭＸＳ４００等、指数連動型ETF自身の決算短信は
+        # 「構成銘柄」を含まないため誤検出しない。
+        df = self._disclosures([
+            {"company_code": "13850", "title": "NEXT FUNDS JPX日経インデックス400連動型上場投信 決算短信",
+             "pubdate": "2021-11-17 13:00:00", "document_url": None},
+        ])
+        result = rules.detect_jpx_nikkei_400_selection(df)
+        self.assertTrue(result.empty)
+
+    def test_jpx_nikkei_mid_small_index_alone_is_not_matched(self):
+        # 「JPX日経中小型株指数」は別指数のため、「400」を含まない限り誤検出しない。
+        df = self._disclosures([
+            {"company_code": "99999", "title": "「JPX日経中小型株指数」構成銘柄への選定に関するお知らせ",
+             "pubdate": "2021-08-10 11:30:00", "document_url": None},
+        ])
+        result = rules.detect_jpx_nikkei_400_selection(df)
+        self.assertTrue(result.empty)
+
+    def test_empty_input_returns_empty_with_expected_columns(self):
+        result = rules.detect_jpx_nikkei_400_selection(pd.DataFrame())
+        self.assertTrue(result.empty)
+        self.assertEqual(list(result.columns), ["Code", "Date", "rule", "detail"])
 
 
 if __name__ == "__main__":
