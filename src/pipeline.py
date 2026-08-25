@@ -27,7 +27,7 @@ RULE_LABELS = {
     "stop_high": "ストップ高",
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
-    "sales_growth_doubling": "売上高が1年で2倍以上",
+    "sales_growth_doubling": "売上高が1年で2倍以上（選択期間に関係なく銘柄ごとの最新開示が対象）",
     "earnings_beat": "本決算が会社予想を上回った",
     "stock_split": "株式分割の発表",
     "stock_consolidation": "株式併合の発表",
@@ -221,9 +221,23 @@ def run_screening(
     # いなかった。2026-08-24のCodexレビューで指摘・修正）。end翌日0時未満
     # という排他的な上限にすることで、時刻情報の有無によらずend当日を
     # 正しく含める。
-    result = result.loc[
-        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
-    ]
+    # "sales_growth_doubling"(1年で売上高2倍)は、四半期に1回しか出ない決算
+    # 短信が選択期間(start〜end)にたまたま入っているかという「期間内の
+    # イベント」ではなく、「銘柄が現在2倍成長という状態にあるか」という
+    # 現在の状態を知りたい用途で使われる。UIのデフォルトである「終了日=
+    # 開始日」の1日だけの範囲では、決算のタイミングと一致しない限り
+    # ほとんど何もヒットしない（2026-08-25にユーザー報告・実データで確認：
+    # 実際には多数の該当銘柄があるのに、期間フィルタのせいで0件になって
+    # いた）。このルールだけ選択期間による絞り込みを行わず、銘柄ごとに
+    # 最新の該当開示を常に対象にする（sales_growth_major/explosiveは
+    # 従来通り「期間内のイベント」として使えるよう、この特別扱いは
+    # sales_growth_doublingだけに限定する）。
+    is_doubling = result["Rule"] == "sales_growth_doubling"
+    latest_doubling_per_code = (
+        result.loc[is_doubling].sort_values("Date").groupby("Code", as_index=False).tail(1)
+    )
+    in_range = (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
+    result = pd.concat([result.loc[~is_doubling & in_range], latest_doubling_per_code], ignore_index=True)
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages
 
