@@ -122,44 +122,38 @@ def run_screening(
             )
             valid_codes -= pro_market_codes
 
-    # sales_growth_doublingは下記の通り専用の別軸取得(doubling_statements_df、
-    # "今日"基準)を行い、TDNET_TITLE_BASED_RULES（株式分割等）はTDnet開示
-    # (disclosures_df)のみを使う。それ以外のルールが1つも選択されていない
-    # 場合、ここでのquotes_df・statements_dfの取得自体が丸ごと不要なため
-    # 省略する。省略しないと、sales_growth_doublingだけを選択している
-    # 場合でも使われないデータのためにユーザー選択期間全体（UIのデフォルト
-    # は直近1年）分のAPI呼び出しが走ってしまい、期間がLightプランの
-    # 取得可能期間(5年)を超えていれば400エラーにもなりうる
-    # （2026-08-25の6巡目のCodexレビューで指摘・修正）。
-    legacy_fetch_rules = [
-        r for r in RULE_LABELS if r not in TDNET_TITLE_BASED_RULES and r != "sales_growth_doubling"
-    ]
-    legacy_fetch_needed = selected_rules is None or any(r in legacy_fetch_rules for r in selected_rules)
-    if legacy_fetch_needed:
-        quotes_df = endpoints.get_daily_quotes_range(client, start, end)
-        # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
-        # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
-        # start〜end だけで取得すると比較対象の過去開示がそもそも取得できておらず、
-        # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
-        # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
-        # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
-        # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
-        # start〜endのみに絞って取得を高速化する。sales_growth_doublingは専用の
-        # 別軸取得を持ち、ここでのstatements_dfには使われないため、この遡り取得
-        # の要否判定からは除外する（除外しないと、sales_growth_doublingと
-        # YOY_LOOKBACK_RULES以外のルールだけを組み合わせて選択した場合にも、
-        # 使われないデータのために約4年分遡った開始日を計算してしまう）。
-        legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
-        needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
-        if needs_lookback:
-            comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
-            statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
-        else:
-            statements_fetch_start = start
-        statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
+    # quotes_df・statements_dfは、選択中のイベント/属性ルールだけでなく、
+    # 結果テーブルの常時表示列（ストップ高日付はdetect_stop_high、
+    # 「下方修正歴あり」列はdetect_downward_revisionの出力から作られ、
+    # どちらも選択中のルールに関わらず常に表示・除外フィルターの対象と
+    # なる。app.py参照）のためにも必要なため、selected_rulesの内容に
+    # 関わらず常に取得する（2026-08-25の6巡目のCodexレビューでこの2つの
+    # 取得をsales_growth_doubling/TDnet系ルールのみ選択時に丸ごと省略する
+    # 最適化を入れたが、7巡目のレビューで「下方修正歴あり」列がその
+    # 最適化により常にFalseになり、デフォルトON(exclude_downward)の除外
+    # フィルターが効かなくなる不具合を指摘され、同じ理由でストップ高日付
+    # 列も壊れることが分かったため、この最適化自体を取りやめた）。
+    quotes_df = endpoints.get_daily_quotes_range(client, start, end)
+    # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
+    # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
+    # start〜end だけで取得すると比較対象の過去開示がそもそも取得できておらず、
+    # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
+    # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
+    # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
+    # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
+    # start〜endのみに絞って取得を高速化する。sales_growth_doublingは専用の
+    # 別軸取得を持ち、ここでのstatements_dfには使われないため、この遡り取得
+    # の要否判定からは除外する（除外しないと、sales_growth_doublingと
+    # YOY_LOOKBACK_RULES以外のルールだけを組み合わせて選択した場合にも、
+    # 使われないデータのために約4年分遡った開始日を計算してしまう）。
+    legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
+    needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
+    if needs_lookback:
+        comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     else:
-        quotes_df = pd.DataFrame()
-        statements_df = pd.DataFrame()
+        statements_fetch_start = start
+    statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
         rules.detect_stop_high(quotes_df),

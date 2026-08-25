@@ -58,15 +58,17 @@ class TestSelectedRulesControlsLookback(unittest.TestCase):
         captured = _run_with_capture(selected_rules=["stop_high", "pbr_low"])
         self.assertEqual(captured["start"], dt.date(2026, 8, 1))
 
-    def test_empty_selected_rules_skips_the_fetch_entirely(self):
-        # 選択中のルールが1つも無ければstatements_df・quotes_dfを使う
-        # ルールは1つも動かないため、取得自体を丸ごと省略する
-        # （2026-08-25の6巡目のCodexレビューでのsales_growth_doubling専用
-        # 対応と合わせて、selected_rules=[]（何も選択していない）の場合も
-        # 同じ理由で取得自体を省略するよう修正。以前は範囲を狭めるだけで
-        # 取得自体は毎回行っていた）。
+    def test_empty_selected_rules_uses_narrow_range(self):
+        # 選択中のイベント/属性ルールが1つも無くても、結果テーブルの
+        # 常時表示列（ストップ高日付・「下方修正歴あり」）はselected_rules
+        # に関わらず必要なため、statements_dfの取得自体は省略せず、
+        # 遡り取得（YOY_LOOKBACK_RULES用）だけを省略する
+        # （2026-08-25の6巡目のCodexレビューで取得自体を丸ごと省略する
+        # 最適化を一時追加したが、7巡目のレビューで「下方修正歴あり」列が
+        # 常にFalseになり除外フィルターが効かなくなる不具合を指摘され、
+        # ストップ高日付列も同様に壊れることが分かったため取りやめた）。
         captured = _run_with_capture(selected_rules=[])
-        self.assertEqual(captured, {})
+        self.assertEqual(captured["start"], dt.date(2026, 8, 1))
 
     def test_mixed_selection_including_yoy_rule_uses_wide_lookback(self):
         captured = _run_with_capture(selected_rules=["stop_high", "sales_growth_explosive"])

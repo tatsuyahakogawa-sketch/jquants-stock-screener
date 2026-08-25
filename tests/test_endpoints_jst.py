@@ -138,14 +138,14 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
         date = dt.date(2026, 8, 19)
         fixed_now = dt.datetime(2026, 8, 19, 10, 0, tzinfo=endpoints.JST)
         mock_load, mock_save = self._call_with_fixed_now(date, fixed_now)
-        mock_load.assert_called_once_with("statements", "20260819_am")
+        mock_load.assert_called_once_with("statements_v2", "20260819_am")
         self.assertEqual(mock_save.call_args[0][1], "20260819_am")
 
     def test_pm_bucket_after_1800_on_the_requested_date(self):
         date = dt.date(2026, 8, 19)
         fixed_now = dt.datetime(2026, 8, 19, 20, 0, tzinfo=endpoints.JST)
         mock_load, mock_save = self._call_with_fixed_now(date, fixed_now)
-        mock_load.assert_called_once_with("statements", "20260819_pm")
+        mock_load.assert_called_once_with("statements_v2", "20260819_pm")
         self.assertEqual(mock_save.call_args[0][1], "20260819_pm")
 
     def test_grace_window_the_next_morning_still_shares_the_pm_bucket(self):
@@ -156,7 +156,7 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
         date = dt.date(2026, 8, 25)
         fixed_now = dt.datetime(2026, 8, 26, 0, 15, tzinfo=endpoints.JST)
         mock_load, mock_save = self._call_with_fixed_now(date, fixed_now)
-        mock_load.assert_called_once_with("statements", "20260825_pm")
+        mock_load.assert_called_once_with("statements_v2", "20260825_pm")
         self.assertEqual(mock_save.call_args[0][1], "20260825_pm")
 
     def test_querying_yesterday_during_the_grace_window_does_not_use_the_permanent_key(self):
@@ -178,14 +178,14 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
         date = dt.date(2026, 8, 25)
         fixed_now = dt.datetime(2026, 8, 26, 0, 30, tzinfo=endpoints.JST)
         mock_load, mock_save = self._call_with_fixed_now(date, fixed_now)
-        mock_load.assert_called_once_with("statements", "20260825")
+        mock_load.assert_called_once_with("statements_v2", "20260825")
         self.assertEqual(mock_save.call_args[0][1], "20260825")
 
     def test_far_past_date_uses_plain_date_cache_key(self):
         past_date = dt.date(2026, 8, 10)
         fixed_now = dt.datetime(2026, 8, 19, 12, 0, tzinfo=endpoints.JST)
         mock_load, mock_save = self._call_with_fixed_now(past_date, fixed_now)
-        mock_load.assert_called_once_with("statements", "20260810")
+        mock_load.assert_called_once_with("statements_v2", "20260810")
         self.assertEqual(mock_save.call_args[0][1], "20260810")
 
 

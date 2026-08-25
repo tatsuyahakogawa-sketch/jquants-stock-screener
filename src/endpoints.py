@@ -99,12 +99,22 @@ def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame
         eighteen_oclock = dt.datetime.combine(date, dt.time(18, 0), tzinfo=JST)
         period = "pm" if now >= eighteen_oclock else "am"
         cache_key = f"{date_str}_{period}"
-    cached = cache.load("statements", cache_key)
+    # キャッシュの名前空間を"statements"から"statements_v2"に変更している。
+    # この関数の当日分キャッシュキー方式は本PRで複数回修正されており、
+    # 修正前のコードが「確定済み」と誤判定して日付だけの恒久キーで
+    # キャッシュしてしまった古いエントリが、ローカルキャッシュや
+    # Supabase（再デプロイをまたいで永続化される。src/cache.py参照）に
+    # 既に残っている可能性がある。同じ"statements"名前空間のままだと、
+    # 修正後のコードもその古い（一部・空の）エントリを「確定済みの
+    # 正しいキャッシュ」として誤って読み込み続けてしまう。名前空間を
+    # 変えることで、既存のエントリを全て無効化し、最新の修正済みロジックで
+    # 確実に取り直す（2026-08-25の7巡目のCodexレビューで指摘・修正）。
+    cached = cache.load("statements_v2", cache_key)
     if cached is not None:
         return cached
     records = list(client.get_all_pages("/fins/summary", {"date": date_str}))
     df = pd.DataFrame.from_records(records)
-    cache.save("statements", cache_key, df)
+    cache.save("statements_v2", cache_key, df)
     return df
 
 

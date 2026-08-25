@@ -370,35 +370,22 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
     df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
 
-    # 同一銘柄・同一決算期(CurPerType/CurPerEn)について訂正開示（数値の
-    # 訂正報告）が複数回行われた場合、実際の開示(IsPrimary=True)行が同じ
-    # 決算期に複数残ってしまう。後段のshift(1)は「1決算期=1行」という前提で
-    # 前年同期の行を求めるため、訂正後の開示が同じ決算期の訂正前の行と比較
-    # されてしまい、期間差0日でhas_comparable_prevがFalseになり、本来
-    # 比較可能なはずの最新開示が判定不能になっていた（2026-08-25のCodex
-    # レビューで指摘・修正）。同一決算期の実際の開示が複数ある場合は、
-    # 開示日が最も新しい1件だけを残す。
-    is_primary_all = _is_primary_mask(df)
+    # 同一銘柄・同一決算期(CurPerType/CurPerEn)について複数の行が存在する
+    # ことがある: (a) 実際の開示(IsPrimary=True)の訂正報告、(b) 他の開示に
+    # 埋め込まれた合成行(IsPrimary=False、前年同期実績)がその後の開示で
+    # 遡及的に修正された値を反映している場合。後段のshift(1)は「1決算期=
+    # 1行」という前提で前年同期の行を求めるため、重複が残っていると
+    # どちらと比較されるか不定になる。実際の開示か合成行かに関わらず、
+    # 開示日(DiscDate)が最も新しい1件を優先する（合成行のDiscDateは、
+    # それが埋め込まれていた"親"の開示の開示日を表すため、より新しい
+    # 開示に埋め込まれた合成行の方が、古い実際の開示自体よりも新しい
+    # 情報を反映していることがある。単純に「実際の開示なら常に優先」と
+    # すると、逆にこのケースを取りこぼしてしまう。2026-08-25の6巡目の
+    # Codexレビューで一度「実際の開示を優先」で修正したが、7巡目のレビューで
+    # このケースを指摘され、開示日ベースの比較に修正した）。
     key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
-    primary_df = df.loc[is_primary_all].sort_values(STMT_DISCLOSED_DATE)
-    primary_df = primary_df.drop_duplicates(subset=key_cols, keep="last")
-
-    # 前年同期比較の基準値として使う合成行(IsPrimary=False、他の開示に
-    # 埋め込まれた前年同期実績)についても、同じ決算期の実際の開示
-    # (IsPrimary=True、訂正後を含む)が別途存在する場合はそちらを優先し、
-    # 合成行は捨てる。捨てないと、同じ決算期のPeriodEndが重複したまま
-    # sort_values→shift(1)する際に、たまたま合成行(訂正前の古い数値)が
-    # 直前の行として選ばれてしまい、訂正後の正しい数値ではなく訂正前の
-    # 古い数値と比較してしまうことがある（2026-08-25の6巡目のCodexレビュー
-    # で指摘・修正）。実際の開示が無い決算期の合成行（TDnetの開示添付は
-    # 公開から約1〜1.5ヶ月で取得できなくなり過去分をバックフィルできない
-    # ため、合成行しか無い場合がある。src/tdnet_xbrl.py参照）はそのまま残す。
-    non_primary_df = df.loc[~is_primary_all]
-    primary_keys = pd.MultiIndex.from_frame(primary_df[key_cols])
-    non_primary_keys = pd.MultiIndex.from_frame(non_primary_df[key_cols])
-    non_primary_df = non_primary_df.loc[~non_primary_keys.isin(primary_keys)]
-
-    df = pd.concat([primary_df, non_primary_df], ignore_index=False)
+    df = df.sort_values(STMT_DISCLOSED_DATE)
+    df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
     df["prev_net_sales"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_NET_SALES].shift(1)
