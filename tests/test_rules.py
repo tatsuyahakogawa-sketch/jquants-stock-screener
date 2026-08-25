@@ -167,6 +167,21 @@ class TestDetectCurrentSalesDoubling(unittest.TestCase):
         result = rules.detect_current_sales_doubling(statements)
         self.assertEqual(set(result["Code"]), {"1234"})
 
+    def test_missing_sales_in_latest_period_does_not_fall_back_to_an_older_hit(self):
+        # 直近の決算期(2026年1Q)の開示がSalesを欠いている場合、その1件は
+        # 判定不能（ヒットなし）として扱うべきで、数値が揃っている1つ古い
+        # 決算期(2025年1Q, +110%)にフォールバックして誤ってヒットさせては
+        # いけない。Salesの欠損チェックを「直近の決算期を選ぶ前」に行うと
+        # このフォールバックが起きてしまう（2026-08-25の4巡目のCodex
+        # レビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 210, 21),  # +110%(1つ古い決算期)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", None, 30),  # 直近の決算期、Sales欠損
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
     def test_correction_of_an_older_period_does_not_override_the_latest_period(self):
         # 2026年1Q(直近の決算期)が開示された後に、それより古い2025年1Qの
         # 数値が訂正された場合、訂正開示の開示日(DiscDate)の方が新しいため

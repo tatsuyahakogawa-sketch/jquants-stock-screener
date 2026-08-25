@@ -80,22 +80,31 @@ def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame
     この問題があると「常に最新」のはずの結果が一度キャッシュされた時点で
     実質固定されてしまう（2026-08-25のCodexレビューで指摘・修正）。
 
-    当日分のキャッシュキーには、この関数が受け取ったdate引数の日付
-    (date_str)は必ずそのまま使い、_financials_cache_period()からは
-    am/pmの区分(接尾辞)だけを取り出して付け加える。
-    _financials_cache_period()自身が内部で計算する日付部分は「呼び出した
-    時点の現在時刻」基準であり、0:00〜0:29のJSTでは前日の日付を返す
-    （前日24:30更新がまだ反映されていないため）。そのため
-    _financials_cache_period()の戻り値をキーとして丸ごと使うと、この
-    0:00〜0:29の間にdate=今日を指定して呼び出した場合、実際にAPIへ渡す
-    date_str（今日の日付）とキャッシュキーの日付（前日の日付）が食い違い、
-    前日分のためにキャッシュした結果を今日分として誤って返してしまう
-    （2026-08-25の3巡目のCodexレビューで指摘・修正）。
+    当日分のキャッシュキーの日付部分には、この関数が受け取ったdate引数の
+    日付(date_str)を必ずそのまま使う。区分(grace/am/pm)は
+    _financials_cache_period()を流用せず、この関数専用に計算する。
+    _financials_cache_period()は「日付」と「区分」が一体の戻り値であり、
+    0:00〜0:29のJSTでは前日24:30更新がまだ反映されていないという理由で
+    前日の日付+"pm"を返す設計（get_financials_by_code向け。dateで絞り込ま
+    ずコードの全履歴を返すため、この時間帯は前日18:00時点と内容が同じで
+    共有してよい）。この関数は逆にdateで絞り込むため、日付部分だけ
+    date_strに差し替えて区分("pm")だけ流用すると、0:00〜0:29の区分キー
+    が同日18:00〜23:59の本来の"pm"区分と同じキー（例:
+    "20260826_pm"）になってしまい、0:00〜0:29台の空/一部の結果を
+    18:00以降も誤って使い回してしまう（2026-08-25の4巡目のCodexレビューで
+    指摘・修正）。そのため0:00〜0:29は"am"・"pm"のどちらとも衝突しない
+    専用の区分("grace")を使う。
     """
     date_str = date.strftime("%Y%m%d")
     if date == today_jst():
-        period_suffix = _financials_cache_period().rsplit("_", 1)[-1]
-        cache_key = f"{date_str}_{period_suffix}"
+        now = dt.datetime.now(JST)
+        if now.time() < dt.time(0, 30):
+            period = "grace"
+        elif now.time() < dt.time(18, 0):
+            period = "am"
+        else:
+            period = "pm"
+        cache_key = f"{date_str}_{period}"
     else:
         cache_key = date_str
     cached = cache.load("statements", cache_key)

@@ -116,42 +116,45 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
     （2026-08-25のCodexレビューで指摘・修正）。
     """
 
-    def test_today_uses_am_pm_cache_period_not_plain_date(self):
-        fixed_today = dt.date(2026, 8, 19)
+    def _call_with_fixed_now(self, today: dt.date, fixed_now: dt.datetime):
         mock_client = MagicMock()
         mock_client.get_all_pages.return_value = iter([])
-
-        with patch(f"{_MOD}.today_jst", return_value=fixed_today), \
-                patch(f"{_MOD}._financials_cache_period", return_value="20260819_pm"), \
+        with patch(f"{_MOD}.today_jst", return_value=today), \
+                patch(f"{_MOD}.dt.datetime") as mock_datetime, \
                 patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
                 patch(f"{_MOD}.cache.save") as mock_save:
-            endpoints.get_statements_by_date(mock_client, fixed_today)
+            mock_datetime.now.return_value = fixed_now
+            endpoints.get_statements_by_date(mock_client, today)
+        return mock_load, mock_save
 
+    def test_am_bucket_before_1800(self):
+        today = dt.date(2026, 8, 19)
+        fixed_now = dt.datetime(2026, 8, 19, 10, 0, tzinfo=endpoints.JST)
+        mock_load, mock_save = self._call_with_fixed_now(today, fixed_now)
+        mock_load.assert_called_once_with("statements", "20260819_am")
+        self.assertEqual(mock_save.call_args[0][1], "20260819_am")
+
+    def test_pm_bucket_after_1800(self):
+        today = dt.date(2026, 8, 19)
+        fixed_now = dt.datetime(2026, 8, 19, 20, 0, tzinfo=endpoints.JST)
+        mock_load, mock_save = self._call_with_fixed_now(today, fixed_now)
         mock_load.assert_called_once_with("statements", "20260819_pm")
-        mock_save.assert_called_once()
         self.assertEqual(mock_save.call_args[0][1], "20260819_pm")
 
-    def test_grace_window_keeps_the_requested_date_not_financials_cache_periods_date(self):
-        # 0:00〜0:29 JSTは_financials_cache_period()が「前日24:30更新が
-        # まだ反映されていない」として前日の日付+"pm"を返す
-        # （get_financials_by_code向けの設計）。この日付部分をそのまま
-        # キャッシュキーに使うと、date引数が今日の日付でも前日の日付の
-        # キーになってしまい、前日分としてキャッシュされた結果を今日分と
-        # して誤って返してしまう。date_str自体は必ずdate引数から取り、
-        # _financials_cache_period()からはam/pmの接尾辞だけを使う
-        # （2026-08-25の3巡目のCodexレビューで指摘・修正）。
+    def test_grace_window_uses_a_bucket_distinct_from_pm_and_am(self):
+        # 0:00〜0:29 JSTは前日24:30更新の直後でまだ何も反映されていない
+        # 可能性が高い短命な区分。ここで"pm"を再利用すると、同じ日付の
+        # 18:00〜23:59の本来の"pm"区分と同じキーになってしまい、この
+        # 短命な区分でキャッシュされた空/一部の結果を18:00以降も誤って
+        # 使い回してしまう（2026-08-25の4巡目のCodexレビューで指摘・
+        # 修正）。"am"・"pm"のどちらとも異なる専用キーになることを確認する。
         today = dt.date(2026, 8, 26)
-        mock_client = MagicMock()
-        mock_client.get_all_pages.return_value = iter([])
-
-        with patch(f"{_MOD}.today_jst", return_value=today), \
-                patch(f"{_MOD}._financials_cache_period", return_value="20260825_pm"), \
-                patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
-                patch(f"{_MOD}.cache.save") as mock_save:
-            endpoints.get_statements_by_date(mock_client, today)
-
-        mock_load.assert_called_once_with("statements", "20260826_pm")
-        self.assertEqual(mock_save.call_args[0][1], "20260826_pm")
+        fixed_now = dt.datetime(2026, 8, 26, 0, 15, tzinfo=endpoints.JST)
+        mock_load, mock_save = self._call_with_fixed_now(today, fixed_now)
+        cache_key = mock_load.call_args[0][1]
+        self.assertNotIn(cache_key, {"20260826_am", "20260826_pm"})
+        self.assertEqual(cache_key, "20260826_grace")
+        self.assertEqual(mock_save.call_args[0][1], "20260826_grace")
 
     def test_past_date_still_uses_plain_date_cache_key(self):
         # 過去日は結果が変わらないため、従来通り日付だけのキーのまま

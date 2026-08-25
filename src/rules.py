@@ -358,8 +358,14 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
     df = statements_df.copy()
+    # Sales(売上高)がNaNの行もここではまだ除外しない。もし銘柄の直近の
+    # 決算期の開示がたまたまSalesを欠いている場合、ここで先に除外すると
+    # 後段の「直近の決算期を選ぶ」処理が1つ古い決算期を「最新」として
+    # 誤選択してしまい、古いが数値の揃った開示を"現在"の状態であるかの
+    # ように返してしまう。Sales欠損の有無に関わらずまず直近の決算期を
+    # 選び、その1件についてだけ判定不能（≒ヒットなし）として扱う
+    # （2026-08-25の4巡目のCodexレビューで指摘・修正）。
     df[STMT_NET_SALES] = _to_numeric(df[STMT_NET_SALES])
-    df = df.dropna(subset=[STMT_NET_SALES])
     df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
     df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
     df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
