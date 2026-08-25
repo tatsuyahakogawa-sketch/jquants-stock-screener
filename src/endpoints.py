@@ -71,42 +71,34 @@ def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFra
 def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
     """指定日に開示された決算短信等の財務情報(/v2/fins/summary)を取得する（キャッシュ利用）。
 
-    過去日は結果が変わらないため単純に日付だけをキャッシュキーにできるが、
-    当日分は18:00と24:30の1日2回更新される（CLAUDE.md参照）。単純な日付
-    キーのままだと、更新前（例: 朝〜18:00前）に一度取得して空/一部だけの
-    結果をキャッシュしてしまうと、その日のうちに18:00を過ぎて再取得しても
-    更新前の古いキャッシュを返し続けてしまう。「1年で売上高2倍」の判定
-    (detect_current_sales_doubling)は"今日"を基準に毎回この関数を呼ぶため、
-    この問題があると「常に最新」のはずの結果が一度キャッシュされた時点で
-    実質固定されてしまう（2026-08-25のCodexレビューで指摘・修正）。
+    ある日付dateの財務情報が確定するのは、その翌日0:30 JST（=24:30更新）
+    より後（CLAUDE.md参照。18:00更新分もこの時点で確定に含まれる）。
+    それより前は「未確定」として日付＋区分(am/pm)のキーにし、それ以降は
+    二度と変わらない前提で日付だけの恒久キーにする。
 
-    当日分のキャッシュキーの日付部分には、この関数が受け取ったdate引数の
-    日付(date_str)を必ずそのまま使う。区分(grace/am/pm)は
-    _financials_cache_period()を流用せず、この関数専用に計算する。
-    _financials_cache_period()は「日付」と「区分」が一体の戻り値であり、
-    0:00〜0:29のJSTでは前日24:30更新がまだ反映されていないという理由で
-    前日の日付+"pm"を返す設計（get_financials_by_code向け。dateで絞り込ま
-    ずコードの全履歴を返すため、この時間帯は前日18:00時点と内容が同じで
-    共有してよい）。この関数は逆にdateで絞り込むため、日付部分だけ
-    date_strに差し替えて区分("pm")だけ流用すると、0:00〜0:29の区分キー
-    が同日18:00〜23:59の本来の"pm"区分と同じキー（例:
-    "20260826_pm"）になってしまい、0:00〜0:29台の空/一部の結果を
-    18:00以降も誤って使い回してしまう（2026-08-25の4巡目のCodexレビューで
-    指摘・修正）。そのため0:00〜0:29は"am"・"pm"のどちらとも衝突しない
-    専用の区分("grace")を使う。
+    - date当日18:00より前（date==今日の場合のみ起こりうる）: "{date}_am"
+    - date当日18:00 〜 date翌日0:30より前: "{date}_pm"
+      （date当日の夜だけでなく、date翌日の0:00〜0:29 JST——前日24:30更新は
+      まだ反映されていないグレースウィンドウ——もこの区分に含まれる）
+    - date翌日0:30以降: "{date}"（恒久キー）
+
+    単純にdate==今日かどうかだけで場合分けすると、「昨日」を今日の
+    0:00〜0:29に問い合わせた場合（本来はまだ未確定）を「今日ではない
+    ＝確定済みの過去日」と誤判定し、24:30更新前の一部データを恒久キーで
+    キャッシュしてしまい、その後の更新分が永久に反映されなくなる
+    （2026-08-25の5巡目のCodexレビューで指摘・修正）。「1年で売上高2倍」の
+    判定(detect_current_sales_doubling)は"今日"を基準に毎回この関数を
+    呼ぶため、この問題があると「常に最新」のはずの結果が固定されてしまう。
     """
     date_str = date.strftime("%Y%m%d")
-    if date == today_jst():
-        now = dt.datetime.now(JST)
-        if now.time() < dt.time(0, 30):
-            period = "grace"
-        elif now.time() < dt.time(18, 0):
-            period = "am"
-        else:
-            period = "pm"
-        cache_key = f"{date_str}_{period}"
-    else:
+    now = dt.datetime.now(JST)
+    finalized_at = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(0, 30), tzinfo=JST)
+    if now >= finalized_at:
         cache_key = date_str
+    else:
+        eighteen_oclock = dt.datetime.combine(date, dt.time(18, 0), tzinfo=JST)
+        period = "pm" if now >= eighteen_oclock else "am"
+        cache_key = f"{date_str}_{period}"
     cached = cache.load("statements", cache_key)
     if cached is not None:
         return cached

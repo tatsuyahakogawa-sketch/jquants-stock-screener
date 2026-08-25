@@ -170,7 +170,14 @@ def run_screening(
     doubling_requested = selected_rules is None or "sales_growth_doubling" in selected_rules
     if doubling_requested:
         today = today_jst()
-        doubling_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        # detect_current_sales_doublingは直近の決算期とその前年同期
+        # (330〜400日前)の1回分の比較しか行わないため、PROFIT_DOUBLING_YEARS
+        # (4年)は不要で、1年+バッファ(60日)だけ遡れば十分。
+        # get_statements_rangeは1日ごとに個別リクエストするため、4年分
+        # (約1521日)を遡ると冷えたキャッシュではLightプランの呼び出し制限
+        # (60件/分)だけで約25分以上かかり、このルールを選ぶだけで実用的で
+        # なくなっていた（2026-08-25の5巡目のCodexレビューで指摘・修正）。
+        doubling_lookback_days = 365 + 60
         doubling_statements_df = endpoints.get_statements_range(
             client, today - dt.timedelta(days=doubling_lookback_days), today
         )
