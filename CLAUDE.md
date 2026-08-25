@@ -138,6 +138,14 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 
 - 「オーナー経営」「取引先」は未実装（EDINET有報の自由記述テキスト解析が必要。README.md参照）
 - TDnetの非公式ミラーAPI（やのしん氏運営）が停止した場合の切り替え先（公式スクレイピング or JPX有料API）
+- 複数年遡及が必要なルール（sales_growth_doubling・profit_doubling・two_quarter_growth）は
+  `src/endpoints.get_statements_range`が1日ごとに個別リクエストするバルク取得+キャッシュ方式のため、
+  初回・キャッシュが冷えている場合に遡り日数分（sales_growth_doublingで約790日≒13分、
+  profit_doublingで約1520日≒25分、Lightプランの60件/分制限下）の待ち時間が発生する
+  （2026-08-25の8巡目のCodexレビューで指摘。2回目以降は当日分を除きキャッシュ済みになるため
+  高速。根本解決には`src/regional_stocks.py`の地方株スキャンのような「前回スキャン日以降だけ
+  追加取得」方式の専用ストアへの作り直しが必要だが、他の複数年遡及ルールにも影響する
+  アーキテクチャ変更のため別タスクとする）
 
 ## 注意事項
 
