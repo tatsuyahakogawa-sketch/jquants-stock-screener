@@ -340,8 +340,8 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
-    """銘柄ごとに、実際に開示された(IsPrimary)直近の開示1件だけを見て、
-    前年同期比で売上高が2倍(+100%)以上かどうかを判定する
+    """銘柄ごとに、実際に開示された(IsPrimary)直近の決算期の開示1件だけを
+    見て、前年同期比で売上高が2倍(+100%)以上かどうかを判定する
     （「1年で売上高2倍」を、特定の開示日が選択期間に入っているかという
     イベントとしてではなく、銘柄が"現在"その状態にあるかという状態として
     扱うための専用関数。detect_sales_growthのように閾値を満たす行だけを
@@ -349,9 +349,9 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     過去に一度でも閾値を満たした古い開示がいつまでも残り続けてしまう
     （例: 売上が100→250→260と推移した場合、260の開示時点の前年同期比は
     わずか+4%なのに、250の開示（+150%）がヒットとして残り続ける）。
-    そのため、まず銘柄ごとに直近の開示1件を選んでから、その1件が閾値を
-    満たすかどうかを判定する順序にする。2026-08-25のCodexレビューで指摘・
-    修正）。
+    そのため、まず銘柄ごとに直近の決算期の開示1件を選んでから、その1件が
+    閾値を満たすかどうかを判定する順序にする。2026-08-25のCodexレビューで
+    指摘・修正）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_NET_SALES, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
@@ -392,11 +392,18 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     if not is_primary.any():
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
-    # 銘柄ごとに、実際の開示(IsPrimary)のうち開示日が最新の1件だけを選ぶ
-    # （決算期タイプ(1Q/2Q/3Q/FY)は問わない。単純に「一番新しく分かった
-    # 決算の姿」を現在の状態として扱う）。
+    # 銘柄ごとに、実際の開示(IsPrimary)のうち対象の決算期末日(CurPerEn)が
+    # 最も新しい1件だけを選ぶ（決算期タイプ(1Q/2Q/3Q/FY)は問わない）。
+    # 開示日(DiscDate)ではなく決算期末日で選ぶのは、より新しい決算期が
+    # 既に開示された後に、それより古い決算期の訂正開示が出た場合、
+    # 開示日基準だと訂正開示の方が新しいという理由だけで古い決算期の行が
+    # 「最新」として選ばれてしまい、実際に知りたい直近の決算期の成長率とは
+    # 無関係な、古い決算期同士の比較結果を返してしまうため（例: 2025年
+    # 1Qの数値が2026年1Q開示後に訂正された場合、訂正後の2025年1Q行が
+    # 開示日基準では最新になってしまうが、比較すべきは2026年1Qの成長率。
+    # 2026-08-25の3巡目のCodexレビューで指摘・修正）。
     latest_idx = (
-        df.loc[is_primary].sort_values(STMT_DISCLOSED_DATE).groupby(STMT_CODE).tail(1).index
+        df.loc[is_primary].sort_values(STMT_PERIOD_END).groupby(STMT_CODE).tail(1).index
     )
     latest = df.loc[latest_idx].copy()
     latest["growth_rate"] = growth.loc[latest_idx]

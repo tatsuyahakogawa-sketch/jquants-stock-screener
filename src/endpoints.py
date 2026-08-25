@@ -79,11 +79,25 @@ def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame
     (detect_current_sales_doubling)は"今日"を基準に毎回この関数を呼ぶため、
     この問題があると「常に最新」のはずの結果が一度キャッシュされた時点で
     実質固定されてしまう（2026-08-25のCodexレビューで指摘・修正）。
-    get_financials_by_codeと同じ_financials_cache_period()を当日分にだけ
-    適用し、過去日は従来通りの日付だけのキーのまま変更しない。
+
+    当日分のキャッシュキーには、この関数が受け取ったdate引数の日付
+    (date_str)は必ずそのまま使い、_financials_cache_period()からは
+    am/pmの区分(接尾辞)だけを取り出して付け加える。
+    _financials_cache_period()自身が内部で計算する日付部分は「呼び出した
+    時点の現在時刻」基準であり、0:00〜0:29のJSTでは前日の日付を返す
+    （前日24:30更新がまだ反映されていないため）。そのため
+    _financials_cache_period()の戻り値をキーとして丸ごと使うと、この
+    0:00〜0:29の間にdate=今日を指定して呼び出した場合、実際にAPIへ渡す
+    date_str（今日の日付）とキャッシュキーの日付（前日の日付）が食い違い、
+    前日分のためにキャッシュした結果を今日分として誤って返してしまう
+    （2026-08-25の3巡目のCodexレビューで指摘・修正）。
     """
     date_str = date.strftime("%Y%m%d")
-    cache_key = _financials_cache_period() if date == today_jst() else date_str
+    if date == today_jst():
+        period_suffix = _financials_cache_period().rsplit("_", 1)[-1]
+        cache_key = f"{date_str}_{period_suffix}"
+    else:
+        cache_key = date_str
     cached = cache.load("statements", cache_key)
     if cached is not None:
         return cached

@@ -131,6 +131,28 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
         mock_save.assert_called_once()
         self.assertEqual(mock_save.call_args[0][1], "20260819_pm")
 
+    def test_grace_window_keeps_the_requested_date_not_financials_cache_periods_date(self):
+        # 0:00〜0:29 JSTは_financials_cache_period()が「前日24:30更新が
+        # まだ反映されていない」として前日の日付+"pm"を返す
+        # （get_financials_by_code向けの設計）。この日付部分をそのまま
+        # キャッシュキーに使うと、date引数が今日の日付でも前日の日付の
+        # キーになってしまい、前日分としてキャッシュされた結果を今日分と
+        # して誤って返してしまう。date_str自体は必ずdate引数から取り、
+        # _financials_cache_period()からはam/pmの接尾辞だけを使う
+        # （2026-08-25の3巡目のCodexレビューで指摘・修正）。
+        today = dt.date(2026, 8, 26)
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter([])
+
+        with patch(f"{_MOD}.today_jst", return_value=today), \
+                patch(f"{_MOD}._financials_cache_period", return_value="20260825_pm"), \
+                patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
+                patch(f"{_MOD}.cache.save") as mock_save:
+            endpoints.get_statements_by_date(mock_client, today)
+
+        mock_load.assert_called_once_with("statements", "20260826_pm")
+        self.assertEqual(mock_save.call_args[0][1], "20260826_pm")
+
     def test_past_date_still_uses_plain_date_cache_key(self):
         # 過去日は結果が変わらないため、従来通り日付だけのキーのまま
         # （am/pmで無駄にキャッシュを分けない）。

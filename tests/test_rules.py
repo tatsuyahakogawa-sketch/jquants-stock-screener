@@ -167,6 +167,25 @@ class TestDetectCurrentSalesDoubling(unittest.TestCase):
         result = rules.detect_current_sales_doubling(statements)
         self.assertEqual(set(result["Code"]), {"1234"})
 
+    def test_correction_of_an_older_period_does_not_override_the_latest_period(self):
+        # 2026年1Q(直近の決算期)が開示された後に、それより古い2025年1Qの
+        # 数値が訂正された場合、訂正開示の開示日(DiscDate)の方が新しいため
+        # 開示日基準で「最新」を選ぶと、古い決算期同士(2025 vs 2024)の
+        # 比較結果を返してしまう。今知りたいのはあくまで直近の決算期
+        # (2026年1Q)の成長率であるべき（2026-08-25の3巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),  # 当初開示
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 250, 25),  # 直近の決算期 (vs 訂正後2025: +25%)
+            _row("1234", "1Q", "2025-06-30", "2026-08-20", 200, 20),  # 2025年1Qの訂正開示(開示日は最新)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        # 直近の決算期(2026年1Q)の成長率は250/200-1=25%で閾値未満のためヒットしない
+        # （訂正開示の開示日が最新という理由だけで2025年1Q(vs 2024年1Q, +100%)が
+        # 選ばれてしまうと誤ってヒットしてしまう）。
+        self.assertTrue(result.empty)
+
     def test_amended_disclosure_for_same_period_does_not_break_yoy_comparison(self):
         # 同一決算期(1Q 2026-06-30)について訂正開示が後から出た場合
         # （当初開示と訂正開示の2行が同じ決算期に存在する）、訂正後の行が
