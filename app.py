@@ -437,9 +437,13 @@ if regional_only:
     else:
         render_regional_section({_market_char_by_label[label] for label in selected_market_labels})
 else:
-    max_end = dt.date.today() - dt.timedelta(days=1)
+    # 決算短信・TDnet開示ベースのルール（1年で2倍を除く増収系・株式分割等）は
+    # 四半期に1回等、散発的にしか発生しないため、デフォルトが「前日のみ」の
+    # 1日間だとほとんど何もヒットしない（2026-08-25にユーザーが指定。
+    # 直近1年分を初期表示にすることで、幅広いイベントを見つけやすくする）。
+    max_end = dt.date.today()
     default_end = max_end
-    default_start = default_end
+    default_start = default_end - dt.timedelta(days=365)
 
     col1, col2 = st.columns(2)
     with col1:
