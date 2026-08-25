@@ -282,16 +282,24 @@ def detect_world_first(disclosures_df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一の決算期タイプ(TypeOfCurrentPeriod)の前年同期と比べ、売上高が
-    大幅(+20%以上)・爆発的(+50%以上)・1年で2倍(+100%以上)に増えた開示の一覧。
+    大幅(+20%以上)または爆発的(+50%以上)に増えた開示の一覧。
 
-    +50%以上の増収は「大幅(+20%以上)」の条件も、+100%以上は「爆発的
-    (+50%以上)」の条件も数値としては満たしているため、該当する分だけ複数の
-    ruleタグ(sales_growth_major, sales_growth_explosive, sales_growth_doubling)
-    を持つ行としてそれぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。
-    以前はgrowth_rateに応じて1つのタグだけを選んでいたため、"sales_growth_major"
+    +50%以上の増収は「大幅(+20%以上)」の条件も数値としては満たしているため、
+    両方のruleタグ(sales_growth_major, sales_growth_explosive)を持つ行として
+    それぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。以前は
+    growth_rateに応じて1つのタグだけを選んでいたため、"sales_growth_major"
     （ラベル表記は「+20%以上」）だけを選択したユーザーの絞り込みから、実際には
     +20%以上でもある60%成長の銘柄が漏れていた（2026-08-19のCodexレビューで
     指摘、実データで確認）。
+
+    「1年で2倍(+100%以上)」(sales_growth_doubling)はこの関数では扱わない。
+    この関数は「選択期間内に閾値を超える開示があったか」というイベントとして
+    扱うが、sales_growth_doublingは「銘柄が現在その状態にあるか」という状態
+    として扱う必要があり、両者は選ぶべき開示行が異なる（例: 売上が
+    100→250→260と推移した場合、260時点の前年同期比はわずか+4%なのに、この
+    関数の単純な閾値フィルタだと250の開示(+150%)がいつまでもヒットし続けて
+    しまう）。sales_growth_doublingはdetect_current_sales_doublingで別途
+    判定する（2026-08-25のCodexレビューで指摘・修正）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_NET_SALES, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
@@ -323,14 +331,69 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     hit_major["rule"] = "sales_growth_major"
     hit_explosive = df.loc[valid & (growth >= SALES_GROWTH_EXPLOSIVE_THRESHOLD)].copy()
     hit_explosive["rule"] = "sales_growth_explosive"
-    hit_doubling = df.loc[valid & (growth >= SALES_GROWTH_DOUBLING_THRESHOLD)].copy()
-    hit_doubling["rule"] = "sales_growth_doubling"
 
-    hit = pd.concat([hit_major, hit_explosive, hit_doubling], ignore_index=True)
+    hit = pd.concat([hit_major, hit_explosive], ignore_index=True)
     result = hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
         columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
     )
     return result
+
+
+def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """銘柄ごとに、実際に開示された(IsPrimary)直近の開示1件だけを見て、
+    前年同期比で売上高が2倍(+100%)以上かどうかを判定する
+    （「1年で売上高2倍」を、特定の開示日が選択期間に入っているかという
+    イベントとしてではなく、銘柄が"現在"その状態にあるかという状態として
+    扱うための専用関数。detect_sales_growthのように閾値を満たす行だけを
+    集めて「最新のもの」を選ぶと、閾値を満たさなくなった今の状態ではなく
+    過去に一度でも閾値を満たした古い開示がいつまでも残り続けてしまう
+    （例: 売上が100→250→260と推移した場合、260の開示時点の前年同期比は
+    わずか+4%なのに、250の開示（+150%）がヒットとして残り続ける）。
+    そのため、まず銘柄ごとに直近の開示1件を選んでから、その1件が閾値を
+    満たすかどうかを判定する順序にする。2026-08-25のCodexレビューで指摘・
+    修正）。
+    """
+    required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_NET_SALES, STMT_DISCLOSED_DATE}
+    if statements_df.empty or not required.issubset(statements_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = statements_df.copy()
+    df[STMT_NET_SALES] = _to_numeric(df[STMT_NET_SALES])
+    df = df.dropna(subset=[STMT_NET_SALES])
+    df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
+    df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
+    df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
+    df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
+
+    df["prev_net_sales"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_NET_SALES].shift(1)
+    df["prev_period_end"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_PERIOD_END].shift(1)
+    gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
+    has_comparable_prev = df["prev_net_sales"].notna() & (df["prev_net_sales"] > 0) & gap_days.between(330, 400)
+    growth = (df[STMT_NET_SALES] - df["prev_net_sales"]) / df["prev_net_sales"]
+
+    is_primary = _is_primary_mask(df)
+    if not is_primary.any():
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    # 銘柄ごとに、実際の開示(IsPrimary)のうち開示日が最新の1件だけを選ぶ
+    # （決算期タイプ(1Q/2Q/3Q/FY)は問わない。単純に「一番新しく分かった
+    # 決算の姿」を現在の状態として扱う）。
+    latest_idx = (
+        df.loc[is_primary].sort_values(STMT_DISCLOSED_DATE).groupby(STMT_CODE).tail(1).index
+    )
+    latest = df.loc[latest_idx].copy()
+    latest["growth_rate"] = growth.loc[latest_idx]
+    latest["has_comparable_prev"] = has_comparable_prev.loc[latest_idx]
+
+    hit = latest.loc[latest["has_comparable_prev"] & (latest["growth_rate"] >= SALES_GROWTH_DOUBLING_THRESHOLD)].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "sales_growth_doubling"
+    hit["detail"] = "前年同期比 売上高 " + (hit["growth_rate"] * 100).round(1).astype(str) + "% 増（直近の開示時点）"
+    return hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
+        columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
+    )
 
 
 def detect_earnings_beat(statements_df: pd.DataFrame) -> pd.DataFrame:

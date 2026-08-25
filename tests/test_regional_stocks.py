@@ -526,17 +526,36 @@ class TestScreenRegional(unittest.TestCase):
         disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
 
         hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
-        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)・1年で2倍(+100%以上)の
-        # 3条件すべてを数値として満たす。detect_sales_growthは該当する分だけ
-        # 複数のruleタグを返す（rules.pyのdocstring参照。"sales_growth_major"
-        # だけを選んでも、実際には+20%以上でもある爆発的/倍増成長銘柄が
-        # 漏れないようにするため）。
-        self.assertEqual(len(hits), 3)
+        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)の2条件を数値として
+        # 満たす。detect_sales_growthは該当する分だけ複数のruleタグを返す
+        # （rules.pyのdocstring参照。"sales_growth_major"だけを選んでも、
+        # 実際には+20%以上でもある爆発的成長銘柄が漏れないようにするため）。
+        # "sales_growth_doubling"(1年で2倍)はdetect_current_sales_doublingで
+        # 別途判定され、selected_rulesに含めない限り評価されない
+        # （2026-08-25のCodexレビューで指摘・修正。下のtest_doubling_rule_
+        # uses_current_sales_doubling参照）。
+        self.assertEqual(len(hits), 2)
         self.assertEqual(
-            set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive", "sales_growth_doubling"}
+            set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive"}
         )
         self.assertTrue((hits["Code"] == "33460").all())
         self.assertTrue((hits["CompanyName"] == "ヒロタグループHD").all())
+
+    def test_doubling_rule_uses_current_sales_doubling(self):
+        statements = pd.DataFrame([
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2026-06-30", "2027-03-31", 378_000_000.0, eqar=0.34),
+            _statement_row("33460", dt.date(2026, 8, 13), "1Q", "2025-06-30", "2026-03-31", 100_000_000.0),
+        ])
+        company_status = pd.DataFrame([
+            {"Code": "33460", "CompanyName": "ヒロタグループHD", "MarketsString": "名",
+             "LastSeenDate": pd.Timestamp("2026-08-13")},
+        ])
+        disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_doubling"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Rule"], "sales_growth_doubling")
+        self.assertEqual(hits.iloc[0]["Code"], "33460")
 
     def test_unselected_rule_is_not_evaluated(self):
         statements = pd.DataFrame([

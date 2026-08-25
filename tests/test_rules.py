@@ -106,26 +106,66 @@ class TestDetectSalesGrowth(unittest.TestCase):
 
     def test_doubling_growth_also_tagged_as_major_and_explosive(self):
         # +100%以上(1年で2倍)は、数値としてsales_growth_major(+20%以上)・
-        # sales_growth_explosive(+50%以上)も満たすため、3つのruleタグを
+        # sales_growth_explosive(+50%以上)も満たすため、2つのruleタグを
         # すべて持つ行として返す（2026-08-24にユーザーの指定で追加）。
+        # なお"sales_growth_doubling"自体はこの関数ではなく
+        # detect_current_sales_doublingが別途判定する（2026-08-25のCodex
+        # レビューで指摘・修正。下記TestDetectCurrentSalesDoubling参照）。
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
             _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%
         ])
         result = rules.detect_sales_growth(statements)
-        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result), 2)
         self.assertEqual(
             set(result["rule"]),
-            {"sales_growth_major", "sales_growth_explosive", "sales_growth_doubling"},
+            {"sales_growth_major", "sales_growth_explosive"},
         )
+        self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+
+
+class TestDetectCurrentSalesDoubling(unittest.TestCase):
+    def test_growth_over_threshold_on_latest_disclosure_is_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["rule"], "sales_growth_doubling")
 
     def test_growth_just_under_doubling_not_tagged_as_doubling(self):
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
             _row("1234", "1Q", "2026-06-30", "2026-08-10", 190, 19),  # +90%
         ])
-        result = rules.detect_sales_growth(statements)
-        self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
+    def test_growth_cooled_down_since_a_past_doubling_disclosure_is_not_a_hit(self):
+        # 過去に一度+150%(2倍)を達成していても、最新の開示時点の前年同期比が
+        # 閾値未満まで鈍化していれば、もうヒットしない（銘柄が"現在"2倍成長
+        # という状態にあるかを判定するための関数であり、過去に一度でも
+        # 閾値を満たした開示がいつまでも残り続けるバグの回帰テスト。
+        # 2026-08-25のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 250, 25),  # +150%(過去の開示)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 260, 26),  # +4%(最新の開示)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
+    def test_only_the_latest_disclosure_per_code_is_considered(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%(最新)
+            _row("5678", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("5678", "1Q", "2026-06-30", "2026-08-10", 130, 13),  # +30%(2倍未満)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(set(result["Code"]), {"1234"})
 
     def test_excludes_synthetic_rows_from_hits(self):
         # 2026年の実際の開示が一度も取得できず(XBRL保持期限切れ等)、2025年の

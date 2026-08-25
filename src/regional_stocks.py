@@ -440,8 +440,15 @@ def screen_regional(
         statements_df = statements_df.loc[statements_df["Code"].astype(str).isin(eligible_codes)]
 
     hits = []
-    if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive", "sales_growth_doubling")):
+    if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive")):
         hits.append(rules.detect_sales_growth(statements_df))
+    if "sales_growth_doubling" in selected_rules:
+        # detect_sales_growthとは別に、銘柄ごとの最新開示だけを見て判定する
+        # 専用関数を使う（run_screening側と同じ理由。src/rules.py の
+        # detect_current_sales_doubling docstring参照。screen_regional()は
+        # そもそもstart/end引数を持たず常に蓄積済みの全期間データを使うため、
+        # run_screening側のような"今日"基準の別軸再取得は不要）。
+        hits.append(rules.detect_current_sales_doubling(statements_df))
     if "earnings_beat" in selected_rules:
         hits.append(rules.detect_earnings_beat(statements_df))
     if "equity_ratio_high" in selected_rules:

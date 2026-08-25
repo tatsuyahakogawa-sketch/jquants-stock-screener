@@ -150,6 +150,23 @@ def run_screening(
         rules.detect_downward_revision(statements_df),
     ]
 
+    # "sales_growth_doubling"(1年で売上高2倍)は選択期間(start〜end)内の
+    # イベントではなく「銘柄が現在その状態にあるか」を判定するため、
+    # start〜endに依存しない別軸で"今日"を基準に決算データを取得し直す
+    # （endがユーザーの指定した過去日であっても、この判定だけは常に最新
+    # 開示を見る必要があるため。上のstatements_dfをそのまま使うとendより
+    # 後の開示が判定に使えず「常に最新」にならない）。選択されていない
+    # 場合は無駄なAPI呼び出し・後段のenrich_with_market_data呼び出しを
+    # 避けるためスキップする（2026-08-25のCodexレビューで指摘・修正）。
+    doubling_requested = selected_rules is None or "sales_growth_doubling" in selected_rules
+    if doubling_requested:
+        today = today_jst()
+        doubling_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        doubling_statements_df = endpoints.get_statements_range(
+            client, today - dt.timedelta(days=doubling_lookback_days), today
+        )
+        hits.append(rules.detect_current_sales_doubling(doubling_statements_df))
+
     # ユーザーがTDNET_TITLE_BASED_RULESを1つも選択していない場合（例: ストップ高・
     # PBRのみ選択）、TDnet開示件数がいくら多くても検索結果には反映されないため、
     # 件数上限チェック・警告は行わない（無関係な警告で「期間を絞り込め」と
@@ -228,16 +245,18 @@ def run_screening(
     # 開始日」の1日だけの範囲では、決算のタイミングと一致しない限り
     # ほとんど何もヒットしない（2026-08-25にユーザー報告・実データで確認：
     # 実際には多数の該当銘柄があるのに、期間フィルタのせいで0件になって
-    # いた）。このルールだけ選択期間による絞り込みを行わず、銘柄ごとに
-    # 最新の該当開示を常に対象にする（sales_growth_major/explosiveは
-    # 従来通り「期間内のイベント」として使えるよう、この特別扱いは
-    # sales_growth_doublingだけに限定する）。
+    # いた）。このルールだけ選択期間による絞り込みを行わない
+    # （detect_current_sales_doublingが"今日"基準で銘柄ごとに最新の該当
+    # 開示1件だけを既に返しているため、start〜endでの絞り込みはせずそのまま
+    # 採用する。sales_growth_major/explosiveは従来通り「期間内のイベント」
+    # として使えるよう、この特別扱いはsales_growth_doublingだけに限定する。
+    # 2026-08-25のCodexレビューで、閾値を満たす行を先に集めてから最新を選ぶと
+    # 成長が鈍化した後も古い開示がヒットし続けるバグを指摘され、選択は
+    # detect_current_sales_doubling側（最新1件を選んでから閾値判定）に
+    # 一本化した）。
     is_doubling = result["Rule"] == "sales_growth_doubling"
-    latest_doubling_per_code = (
-        result.loc[is_doubling].sort_values("Date").groupby("Code", as_index=False).tail(1)
-    )
     in_range = (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
-    result = pd.concat([result.loc[~is_doubling & in_range], latest_doubling_per_code], ignore_index=True)
+    result = pd.concat([result.loc[is_doubling], result.loc[~is_doubling & in_range]], ignore_index=True)
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages
 
