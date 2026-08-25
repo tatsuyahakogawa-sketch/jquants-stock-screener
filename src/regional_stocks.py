@@ -42,7 +42,7 @@ from src.pipeline import RULE_LABELS
 # 福証単独上場企業に限り別途対応予定）。財務諸表系はfetch_regional_statements()の
 # statements_df、TDnet開示タイトル系は通常のdisclosures_dfをそのまま使う。
 REGIONAL_STATEMENT_RULES = [
-    "sales_growth_major", "sales_growth_explosive", "equity_ratio_high",
+    "sales_growth_major", "sales_growth_explosive", "sales_growth_doubling", "equity_ratio_high",
     "two_quarter_growth", "earnings_beat",
 ]
 # profit_doubling(経常利益が4年で2倍以上)はscreen_regional()のディスパッチ
@@ -52,7 +52,9 @@ REGIONAL_STATEMENT_RULES = [
 # 判定不能なのに、UI上は「該当なし」としか表示できず「4年間誰も倍増していない」
 # ように誤って読める（2026-08-19の4巡目のCodexレビューで指摘）。十分な年数の
 # データが蓄積されるまでは選択肢として出さない。
-REGIONAL_TITLE_RULES = ["new_facility_or_store", "world_first", "large_order", "stock_split"]
+REGIONAL_TITLE_RULES = [
+    "new_facility_or_store", "world_first", "large_order", "stock_split", "stock_consolidation",
+]
 REGIONAL_NEGATIVE_RULE = "downward_revision"
 REGIONAL_APPLICABLE_RULES = REGIONAL_STATEMENT_RULES + REGIONAL_TITLE_RULES
 
@@ -438,7 +440,7 @@ def screen_regional(
         statements_df = statements_df.loc[statements_df["Code"].astype(str).isin(eligible_codes)]
 
     hits = []
-    if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive")):
+    if any(r in selected_rules for r in ("sales_growth_major", "sales_growth_explosive", "sales_growth_doubling")):
         hits.append(rules.detect_sales_growth(statements_df))
     if "earnings_beat" in selected_rules:
         hits.append(rules.detect_earnings_beat(statements_df))
@@ -456,8 +458,17 @@ def screen_regional(
         hits.append(rules.detect_world_first(disclosures_df))
     if "large_order" in selected_rules:
         hits.append(rules.detect_large_order(disclosures_df))
-    if "stock_split" in selected_rules:
-        hits.append(rules.detect_stock_split(disclosures_df))
+    if any(r in selected_rules for r in ("stock_split", "stock_consolidation")):
+        # detect_stock_splitは"stock_split"と"stock_consolidation"の両方を
+        # 1回の呼び出しで返す。片方だけがselected_rulesに含まれる場合、
+        # 選ばれていない方のruleまで結果に混ざるとscreen_regionalの
+        # 「selected_rulesに含まれる条件だけを判定する」という契約に反する
+        # ため、選択された方だけに絞り込む（2026-08-24のCodexレビューで
+        # 指摘・修正）。
+        split_hits = rules.detect_stock_split(disclosures_df)
+        if not split_hits.empty:
+            split_hits = split_hits.loc[split_hits["rule"].isin(selected_rules)]
+        hits.append(split_hits)
 
     columns = ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
     hits = [h for h in hits if not h.empty]

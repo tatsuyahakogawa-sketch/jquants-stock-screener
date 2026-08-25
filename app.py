@@ -36,11 +36,11 @@ from src.pipeline import (
 
 # EVENT_RULESを画面上の見た目だけ2グループに分ける（判定ロジックは変更しない）。
 _MATERIAL_EVENT_RULES = [
-    "stop_high", "stock_split", "new_facility_or_store", "large_order",
-    "world_first", "market_upgrade_to_prime", "exchange_transfer_to_tokyo",
+    "stop_high", "stock_split", "stock_consolidation", "new_facility_or_store", "large_order",
+    "world_first", "market_upgrade_to_prime", "jpx_nikkei_400", "exchange_transfer_to_tokyo",
 ]
 _PERFORMANCE_EVENT_RULES = [
-    "sales_growth_major", "sales_growth_explosive", "earnings_beat",
+    "sales_growth_major", "sales_growth_explosive", "sales_growth_doubling", "earnings_beat",
     "two_quarter_growth", "profit_doubling",
 ]
 

@@ -14,12 +14,14 @@ https://jpx-jquants.com/en/spec/fin-summary)を確認した上で設定してい
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import pandas as pd
 
 from src.config import (
     SALES_GROWTH_MAJOR_THRESHOLD,
     SALES_GROWTH_EXPLOSIVE_THRESHOLD,
+    SALES_GROWTH_DOUBLING_THRESHOLD,
     EARNINGS_BEAT_THRESHOLD,
     EQUITY_RATIO_THRESHOLD,
     PROFIT_DOUBLING_YEARS,
@@ -57,7 +59,15 @@ STORE_KEYWORDS = ["新店舗", "新規出店", "店舗新設", "新規開設"]
 # 「新工場」「第二工場」等は閉鎖・計画中止のニュースにも一致してしまうため、
 # これらの語を含むタイトルは逆方向（ネガティブ）の話として除外する。
 FACILITY_STORE_EXCLUSION_KEYWORDS = ["閉鎖", "中止", "撤退", "廃止", "休止", "縮小"]
-STOCK_SPLIT_KEYWORDS = ["株式分割", "株式併合"]
+STOCK_SPLIT_KEYWORD = "株式分割"
+STOCK_CONSOLIDATION_KEYWORD = "株式併合"
+STOCK_SPLIT_KEYWORDS = [STOCK_SPLIT_KEYWORD, STOCK_CONSOLIDATION_KEYWORD]
+# キーワード文字列とrule名の対応（分割と併合は逆方向の株価インパクトを持つ
+# 別の事象のため、2026-08-24にユーザーの指定で別ルールに分離した）。
+_STOCK_SPLIT_KEYWORD_TO_RULE = {
+    STOCK_SPLIT_KEYWORD: "stock_split",
+    STOCK_CONSOLIDATION_KEYWORD: "stock_consolidation",
+}
 # 「株式分割に伴う配当予想の修正」のように、分割・併合の決定そのものではなく
 # その後始末（配当予想修正・株主優待変更・新株予約権調整等）だけを知らせる
 # 開示は新規発表として扱わない。タイトル中のSTOCK_SPLIT_KEYWORDSが、常に
@@ -77,6 +87,20 @@ LARGE_ORDER_EXCLUSION_KEYWORDS = ["開示基準", "取消", "中止", "解除"]
 WORLD_FIRST_KEYWORDS = ["世界初"]
 REGIONAL_EXCHANGES = ["札幌証券取引所", "福岡証券取引所", "名古屋証券取引所"]
 TOKYO_EXCHANGE_KEYWORDS = ["東京証券取引所", "東証"]
+# 「JPX日経インデックス400」構成銘柄への選定・採用の発表を検出するキーワード。
+# 実際のTDnet開示タイトルは「JPX」「日経インデックス」「400」の間の全角/半角・
+# スペースの有無にばらつきがある（例:「ＪＰＸ日経インデックス４００」「JPX 日経
+# インデックス 400」）ため、unicodedata.normalize("NFKC", title)で正規化した上で
+# 「日経インデックス」「400」「構成銘柄」の3語がすべて含まれるかで判定する
+# （2026-08-24に実データ26件で確認・ユーザーの指定で追加。「JPX日経中小型株指数」
+# 「NEXT FUNDS...上場投信」等の別指数・別銘柄の決算短信は"400"または"構成銘柄"を
+# 含まないため誤検出しない）。
+JPX_NIKKEI_400_KEYWORDS = ["日経インデックス", "400", "構成銘柄"]
+# 「構成銘柄からの除外に関するお知らせ」のように、選定・採用ではなく逆方向
+# （除外）の発表にも上記3語が一致してしまうため、除外系のタイトルは除く
+# （2026-08-24のCodexレビューで指摘。2021〜2026年の実データでは除外系の
+# 自社開示は確認できなかったが、将来的な発生に備えて防御的に除外する）。
+JPX_NIKKEI_400_EXCLUSION_KEYWORDS = ["除外", "非選定", "解除"]
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
@@ -118,7 +142,7 @@ def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
     return hit.drop(columns=[QUOTES_CLOSE]).rename(columns={QUOTES_CODE: "Code", QUOTES_DATE: "Date"})
 
 
-def _classify_stock_split_title(title: str) -> tuple[bool, str]:
+def _classify_stock_split_title(title: str) -> tuple[bool, str, str | None]:
     """タイトルが株式分割・併合の「新規決定・発表」を主題にしているか判定する。
 
     「株式分割及び定款の一部変更に関するお知らせ」のように、STOCK_SPLIT_KEYWORDS
@@ -126,34 +150,53 @@ def _classify_stock_split_title(title: str) -> tuple[bool, str]:
     発表（後ろに定款変更・配当予想修正等が続いていてもまとめて発表された扱い）
     と判断する。「株式分割に伴う配当予想の修正に関するお知らせ」のように、常に
     接続表現の直後にしか出現しない場合は後日談の開示とみなし、除外する。
-    戻り値: (新規発表とみなすか, 判定理由)
+    戻り値: (新規発表とみなすか, 判定理由, 一致したキーワード「株式分割」/
+    「株式併合」(無ければNone)）。分割と併合は逆方向の株価インパクトを持つ
+    別の事象のため、呼び出し側でこのキーワードを見てrule("stock_split"/
+    "stock_consolidation")を分ける（2026-08-24にユーザーの指定で分離した）。
     """
     matched_keyword = next((k for k in STOCK_SPLIT_KEYWORDS if k in title), None)
     if matched_keyword is None:
-        return False, ""
+        return False, "", None
 
     for keyword in STOCK_SPLIT_KEYWORDS:
         pos = 0
         while (idx := title.find(keyword, pos)) != -1:
             after = title[idx + len(keyword):]
             if not any(after.startswith(c) for c in STOCK_SPLIT_FOLLOWUP_CONNECTORS):
-                return True, f"「{keyword}」が新規決定の主題として単独で出現"
+                return True, f"「{keyword}」が新規決定の主題として単独で出現", keyword
             pos = idx + len(keyword)
 
     followup_topic = next((t for t in STOCK_SPLIT_FOLLOWUP_TOPIC_KEYWORDS if t in title), None)
     if followup_topic is not None:
-        return False, f"「{matched_keyword}に伴う」等の形でのみ出現し、「{followup_topic}」のみを主題とする後日談の開示と判断"
-    return False, f"「{matched_keyword}に伴う」等の形でのみ出現しており新規決定の発表ではないと判断"
+        return (
+            False,
+            f"「{matched_keyword}に伴う」等の形でのみ出現し、「{followup_topic}」のみを主題とする後日談の開示と判断",
+            matched_keyword,
+        )
+    return (
+        False,
+        f"「{matched_keyword}に伴う」等の形でのみ出現しており新規決定の発表ではないと判断",
+        matched_keyword,
+    )
 
 
 def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
-    """TDnet開示タイトルから株式分割・併合の「新規の決定・発表」を検出する。
+    """TDnet開示タイトルから株式分割・株式併合それぞれの「新規の決定・発表」を
+    検出する。
 
-    AdjFactor(株価調整係数)の変化を見る方法は、分割が実際に効力を持つ日（株価
-    調整に反映される日）しか検知できず、発表からかなり遅れる（発表時点では
-    株価がまだ反応していないため、好材料として先取りするには使えない）。
-    株式分割は発表時点で好材料として反応することが多いため、価格が変動する前に
-    検知できるよう、TDnetの開示タイトルから発表日ベースで検出する。
+    AdjFactor(株価調整係数)の変化を見る方法は、分割・併合が実際に効力を持つ日
+    （株価調整に反映される日）しか検知できず、発表からかなり遅れる（発表時点
+    では株価がまだ反応していないため、好材料/悪材料として先取りするには
+    使えない）。株式分割・併合は発表時点で反応することが多いため、価格が
+    変動する前に検知できるよう、TDnetの開示タイトルから発表日ベースで検出する。
+
+    株式分割（1株を複数株に分ける。既存株主にとって好材料と受け取られる
+    ことが多い）と株式併合（複数株を1株にまとめる。既存株主にとって悪材料と
+    受け取られることが多い）は株価インパクトが逆方向の別の事象のため、
+    "stock_split"（株式分割）と"stock_consolidation"（株式併合）の別ruleとして
+    返す（2026-08-24にユーザーの指定で分離。以前は"stock_split"1本にまとめて
+    いた）。
 
     タイトルに「株式分割」「株式併合」を含むだけでは判定しない。配当予想の修正・
     株主優待制度の変更・新株予約権の調整・発行済株式数の変更等、分割・併合の
@@ -174,10 +217,11 @@ def detect_stock_split(disclosures_df: pd.DataFrame) -> pd.DataFrame:
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
-    hit["rule"] = "stock_split"
+    matched_keyword = classified.loc[is_new].apply(lambda c: c[2])
+    hit["rule"] = matched_keyword.map(_STOCK_SPLIT_KEYWORD_TO_RULE)
     hit["detail"] = "開示タイトル: " + hit["title"]
     hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
-    hit["event_type"] = "stock_split"
+    hit["event_type"] = hit["rule"]
     hit["event_date"] = hit["Date"]
     hit["source_title"] = hit["title"]
     hit["source_url"] = df.loc[is_new, "document_url"] if "document_url" in df.columns else None
@@ -238,12 +282,13 @@ def detect_world_first(disclosures_df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     """同一の決算期タイプ(TypeOfCurrentPeriod)の前年同期と比べ、売上高が
-    大幅(+20%以上) または 爆発的(+50%以上) に増えた開示の一覧。
+    大幅(+20%以上)・爆発的(+50%以上)・1年で2倍(+100%以上)に増えた開示の一覧。
 
-    +50%以上の増収は「大幅(+20%以上)」の条件も数値としては満たしているため、
-    両方のruleタグ(sales_growth_major, sales_growth_explosive)を持つ行として
-    それぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。以前は
-    growth_rateに応じて片方のタグだけを選んでいたため、"sales_growth_major"
+    +50%以上の増収は「大幅(+20%以上)」の条件も、+100%以上は「爆発的
+    (+50%以上)」の条件も数値としては満たしているため、該当する分だけ複数の
+    ruleタグ(sales_growth_major, sales_growth_explosive, sales_growth_doubling)
+    を持つ行としてそれぞれ返す（1行に付き1タグではなく、該当する分だけ複数行）。
+    以前はgrowth_rateに応じて1つのタグだけを選んでいたため、"sales_growth_major"
     （ラベル表記は「+20%以上」）だけを選択したユーザーの絞り込みから、実際には
     +20%以上でもある60%成長の銘柄が漏れていた（2026-08-19のCodexレビューで
     指摘、実データで確認）。
@@ -278,8 +323,10 @@ def detect_sales_growth(statements_df: pd.DataFrame) -> pd.DataFrame:
     hit_major["rule"] = "sales_growth_major"
     hit_explosive = df.loc[valid & (growth >= SALES_GROWTH_EXPLOSIVE_THRESHOLD)].copy()
     hit_explosive["rule"] = "sales_growth_explosive"
+    hit_doubling = df.loc[valid & (growth >= SALES_GROWTH_DOUBLING_THRESHOLD)].copy()
+    hit_doubling["rule"] = "sales_growth_doubling"
 
-    hit = pd.concat([hit_major, hit_explosive], ignore_index=True)
+    hit = pd.concat([hit_major, hit_explosive, hit_doubling], ignore_index=True)
     result = hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
         columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
     )
@@ -582,6 +629,37 @@ def detect_market_upgrade_to_prime(disclosures_df: pd.DataFrame) -> pd.DataFrame
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
     hit["rule"] = "market_upgrade_to_prime"
+    hit["detail"] = "開示タイトル: " + hit["title"]
+    hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
+    return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})
+
+
+def detect_jpx_nikkei_400_selection(disclosures_df: pd.DataFrame) -> pd.DataFrame:
+    """TDnet開示タイトルから「JPX日経インデックス400」構成銘柄への選定・採用
+    （継続選定を含む）の発表を検出する。
+
+    「日経225」（日経平均株価）自体の構成銘柄入れ替えは日本経済新聞社側の発表の
+    みで、対象企業自身がTDnet開示するケースが実データ上ほぼ確認できなかった
+    （2026-08-24に2021〜2026年の全開示を確認）。「JPX日経インデックス400」は
+    対象企業自身が例年8月頃に「構成銘柄への選定/採用に関するお知らせ」という
+    定型タイトルで開示しており、確実に検出できるためこちらを対象にする
+    （ユーザーへの確認済み）。
+    """
+    required = {"company_code", "title", "pubdate"}
+    if disclosures_df.empty or not required.issubset(disclosures_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = disclosures_df.copy()
+    normalized_titles = df["title"].fillna("").apply(lambda t: unicodedata.normalize("NFKC", t))
+    mentions_keyword = normalized_titles.apply(lambda t: all(k in t for k in JPX_NIKKEI_400_KEYWORDS))
+    mentions_exclusion = normalized_titles.apply(
+        lambda t: any(k in t for k in JPX_NIKKEI_400_EXCLUSION_KEYWORDS)
+    )
+    hit = df.loc[mentions_keyword & ~mentions_exclusion, ["company_code", "pubdate", "title"]].copy()
+    if hit.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    hit["rule"] = "jpx_nikkei_400"
     hit["detail"] = "開示タイトル: " + hit["title"]
     hit["Date"] = pd.to_datetime(hit["pubdate"], errors="coerce")
     return hit[["company_code", "Date", "rule", "detail"]].rename(columns={"company_code": "Code"})

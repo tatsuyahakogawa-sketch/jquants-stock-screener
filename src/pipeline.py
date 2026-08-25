@@ -27,13 +27,16 @@ RULE_LABELS = {
     "stop_high": "ストップ高",
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
+    "sales_growth_doubling": "売上高が1年で2倍以上",
     "earnings_beat": "本決算が会社予想を上回った",
-    "stock_split": "株式分割・併合の発表",
+    "stock_split": "株式分割の発表",
+    "stock_consolidation": "株式併合の発表",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
     "pbr_low": "PBR1倍以下",
     "two_quarter_growth": "四半期決算2期連続増収増益",
     "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表",
+    "jpx_nikkei_400": "「JPX日経インデックス400」構成銘柄への選定・採用の発表",
     "new_facility_or_store": "新工場・新店舗の開示",
     "exchange_transfer_to_tokyo": "札幌/福岡/名古屋証取から東証への上場",
     "large_order": "大型・大口受注の発表",
@@ -45,7 +48,9 @@ RULE_LABELS = {
 # （detail列・開示タイトルで内容を確認する運用が前提）。
 TDNET_TITLE_BASED_RULES = [
     "stock_split",
+    "stock_consolidation",
     "market_upgrade_to_prime",
+    "jpx_nikkei_400",
     "new_facility_or_store",
     "exchange_transfer_to_tokyo",
     "large_order",
@@ -67,6 +72,7 @@ EVENT_RULES = [r for r in POSITIVE_RULES if r not in ATTRIBUTE_RULES]
 YOY_LOOKBACK_RULES = [
     "sales_growth_major",
     "sales_growth_explosive",
+    "sales_growth_doubling",
     "two_quarter_growth",
     "profit_doubling",
 ]
@@ -156,21 +162,23 @@ def run_screening(
         if tdnet_rule_requested and len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
             # 期間が広すぎる等でTDnet開示が大量に該当する場合、タイトルの
             # キーワード一致で判定するTDNET_TITLE_BASED_RULES（新工場・新店舗・
-            # 東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表）の
-            # 検索は行わない（それ以上の処理を止めてユーザーに知らせ、期間を
-            # 絞り込んでもらう。他のルール(J-Quants由来)の結果はそのまま返す。
-            # 2026-08-24にユーザーが指定）。
+            # 東証移籍・株式分割・株式併合・プライム市場変更・「JPX日経
+            # インデックス400」選定・大型受注・世界初の発表）の検索は行わない
+            # （それ以上の処理を止めてユーザーに知らせ、期間を絞り込んでもらう。
+            # 他のルール(J-Quants由来)の結果はそのまま返す。2026-08-24に
+            # ユーザーが指定）。
             messages.append(
                 f"指定期間のTDnet開示件数が{len(disclosures_df)}件と多く、上限"
                 f"（{MAX_TDNET_DISCLOSURES_FOR_SCREENING}件）を超えたため、新工場・新店舗・"
-                "東証移籍・株式分割・プライム市場変更・大型受注・世界初の発表の検索を"
-                "行いませんでした。期間を絞り込んで再実行してください。"
+                "東証移籍・株式分割・株式併合・プライム市場変更・「JPX日経インデックス400」選定・"
+                "大型受注・世界初の発表の検索を行いませんでした。期間を絞り込んで再実行してください。"
             )
         else:
             hits.append(rules.detect_new_facility_or_store(disclosures_df))
             hits.append(rules.detect_exchange_transfer_to_tokyo(disclosures_df))
             hits.append(rules.detect_stock_split(disclosures_df))
             hits.append(rules.detect_market_upgrade_to_prime(disclosures_df))
+            hits.append(rules.detect_jpx_nikkei_400_selection(disclosures_df))
             hits.append(rules.detect_large_order(disclosures_df))
             hits.append(rules.detect_world_first(disclosures_df))
     except Exception as e:
@@ -182,8 +190,9 @@ def run_screening(
         # 2026-08-24の3巡目のCodexレビューで指摘・修正）。
         if tdnet_rule_requested:
             messages.append(
-                "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・"
-                f"プライム市場変更・大型受注・世界初の発表の検出をスキップします）: {e}"
+                "TDnet開示情報の取得に失敗しました（新工場・新店舗・東証移籍・株式分割・株式併合・"
+                f"プライム市場変更・「JPX日経インデックス400」選定・大型受注・世界初の発表の"
+                f"検出をスキップします）: {e}"
             )
 
     hits = [h for h in hits if not h.empty]
@@ -204,8 +213,16 @@ def run_screening(
     result["Date"] = pd.to_datetime(result["Date"])
     # 比較用に遡って取得した過去開示分がヒットに混ざらないよう、実際の開示日が
     # ユーザーの選択期間(start〜end)に入っているものだけに絞り込む。
+    # TDnet由来のrule（stock_split・new_facility_or_store等）のDateは
+    # pubdateの時刻情報を保持しているため（例: "2026-08-24 16:30:00"）、
+    # pd.Timestamp(end)（=その日の0時0分）とのend<=比較では同日の開示が
+    # ほぼ全て弾かれてしまっていた（UIのデフォルトが「終了日=開始日」の
+    # 1日だけの範囲であるため、この不具合により対象ルールが実質機能して
+    # いなかった。2026-08-24のCodexレビューで指摘・修正）。end翌日0時未満
+    # という排他的な上限にすることで、時刻情報の有無によらずend当日を
+    # 正しく含める。
     result = result.loc[
-        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] <= pd.Timestamp(end))
+        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
     ]
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages

@@ -526,12 +526,15 @@ class TestScreenRegional(unittest.TestCase):
         disclosures = pd.DataFrame(columns=list(_REQUIRED_DISCLOSURE_COLUMNS_FOR_TEST))
 
         hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["sales_growth_major"])
-        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)の両方の条件を数値として
-        # 満たす。detect_sales_growthは両方のruleタグを返す（rules.pyのdocstring
-        # 参照。"sales_growth_major"だけを選んでも、実際には+20%以上でもある
-        # 爆発的成長銘柄が漏れないようにするため）。
-        self.assertEqual(len(hits), 2)
-        self.assertEqual(set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive"})
+        # 278%増のため大幅(+20%以上)・爆発的(+50%以上)・1年で2倍(+100%以上)の
+        # 3条件すべてを数値として満たす。detect_sales_growthは該当する分だけ
+        # 複数のruleタグを返す（rules.pyのdocstring参照。"sales_growth_major"
+        # だけを選んでも、実際には+20%以上でもある爆発的/倍増成長銘柄が
+        # 漏れないようにするため）。
+        self.assertEqual(len(hits), 3)
+        self.assertEqual(
+            set(hits["Rule"]), {"sales_growth_major", "sales_growth_explosive", "sales_growth_doubling"}
+        )
         self.assertTrue((hits["Code"] == "33460").all())
         self.assertTrue((hits["CompanyName"] == "ヒロタグループHD").all())
 
@@ -566,6 +569,36 @@ class TestScreenRegional(unittest.TestCase):
         self.assertListEqual(
             list(hits.columns), ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
         )
+
+    def test_selecting_only_stock_split_excludes_consolidation_hits(self):
+        # detect_stock_splitは"stock_split"と"stock_consolidation"の両方を
+        # 1回の呼び出しで返す。片方だけを選んだ場合、選ばれていない方の
+        # ruleまで結果に混ざってはいけない（2026-08-24のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "分割銘柄", "株式分割に関するお知らせ", "2026-08-13 15:30:00", "福"),
+            _disclosure("2", "50180", "併合銘柄", "株式併合に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["stock_split"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Code"], "40180")
+        self.assertEqual(hits.iloc[0]["Rule"], "stock_split")
+
+    def test_selecting_only_stock_consolidation_excludes_split_hits(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "分割銘柄", "株式分割に関するお知らせ", "2026-08-13 15:30:00", "福"),
+            _disclosure("2", "50180", "併合銘柄", "株式併合に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["stock_consolidation"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Code"], "50180")
+        self.assertEqual(hits.iloc[0]["Rule"], "stock_consolidation")
 
     def test_equity_ratio_uses_latest_statement_only(self):
         # 本決算のprior_row(前年同期)がEqARを持つケース。当期(最新)のEqARが

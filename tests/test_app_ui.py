@@ -27,6 +27,7 @@ APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 _EXPECTED_PERFORMANCE_RULES = {
     "sales_growth_major",
     "sales_growth_explosive",
+    "sales_growth_doubling",
     "earnings_beat",
     "two_quarter_growth",
     "profit_doubling",
