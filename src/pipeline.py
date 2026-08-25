@@ -27,7 +27,7 @@ RULE_LABELS = {
     "stop_high": "ストップ高",
     "sales_growth_major": "売上高が大幅に増加（前年同期比+20%以上）",
     "sales_growth_explosive": "売上高が爆発的に増加（前年同期比+50%以上）",
-    "sales_growth_doubling": "売上高が1年で2倍以上",
+    "sales_growth_doubling": "売上高が1年で2倍以上（選択期間に関係なく銘柄ごとの最新開示が対象）",
     "earnings_beat": "本決算が会社予想を上回った",
     "stock_split": "株式分割の発表",
     "stock_consolidation": "株式併合の発表",
@@ -122,6 +122,17 @@ def run_screening(
             )
             valid_codes -= pro_market_codes
 
+    # quotes_df・statements_dfは、選択中のイベント/属性ルールだけでなく、
+    # 結果テーブルの常時表示列（ストップ高日付はdetect_stop_high、
+    # 「下方修正歴あり」列はdetect_downward_revisionの出力から作られ、
+    # どちらも選択中のルールに関わらず常に表示・除外フィルターの対象と
+    # なる。app.py参照）のためにも必要なため、selected_rulesの内容に
+    # 関わらず常に取得する（2026-08-25の6巡目のCodexレビューでこの2つの
+    # 取得をsales_growth_doubling/TDnet系ルールのみ選択時に丸ごと省略する
+    # 最適化を入れたが、7巡目のレビューで「下方修正歴あり」列がその
+    # 最適化により常にFalseになり、デフォルトON(exclude_downward)の除外
+    # フィルターが効かなくなる不具合を指摘され、同じ理由でストップ高日付
+    # 列も壊れることが分かったため、この最適化自体を取りやめた）。
     quotes_df = endpoints.get_daily_quotes_range(client, start, end)
     # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
     # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
@@ -130,8 +141,13 @@ def run_screening(
     # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
     # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
     # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
-    # start〜endのみに絞って取得を高速化する。
-    needs_lookback = selected_rules is None or any(r in YOY_LOOKBACK_RULES for r in selected_rules)
+    # start〜endのみに絞って取得を高速化する。sales_growth_doublingは専用の
+    # 別軸取得を持ち、ここでのstatements_dfには使われないため、この遡り取得
+    # の要否判定からは除外する（除外しないと、sales_growth_doublingと
+    # YOY_LOOKBACK_RULES以外のルールだけを組み合わせて選択した場合にも、
+    # 使われないデータのために約4年分遡った開始日を計算してしまう）。
+    legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
+    needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
     if needs_lookback:
         comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
@@ -149,6 +165,55 @@ def run_screening(
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
     ]
+
+    # "sales_growth_doubling"(1年で売上高2倍)は選択期間(start〜end)内の
+    # イベントではなく「銘柄が現在その状態にあるか」を判定するため、
+    # start〜endに依存しない別軸で"今日"を基準に決算データを取得し直す
+    # （endがユーザーの指定した過去日であっても、この判定だけは常に最新
+    # 開示を見る必要があるため。上のstatements_dfをそのまま使うとendより
+    # 後の開示が判定に使えず「常に最新」にならない）。選択されていない
+    # 場合は無駄なAPI呼び出し・後段のenrich_with_market_data呼び出しを
+    # 避けるためスキップする（2026-08-25のCodexレビューで指摘・修正）。
+    doubling_requested = selected_rules is None or "sales_growth_doubling" in selected_rules
+    if doubling_requested:
+        today = today_jst()
+        # detect_current_sales_doublingは直近の決算期とその前年同期
+        # (330〜400日前)の1回分の比較しか行わないため、PROFIT_DOUBLING_YEARS
+        # (4年)は不要。ただし単純に1年+バッファ(60日)だけ遡ると、銘柄の
+        # 直近の決算期の開示自体が"今日"から見て古い場合（例: 決算期末から
+        # 開示まで数ヶ月かかる銘柄、開示が遅れがちな銘柄）に、その前年同期
+        # の比較対象がこの遡り範囲より前になってしまい取得できないことが
+        # ある（2026-08-25の6巡目のCodexレビューで指摘・実例: "今日"が
+        # 2026-05-01で直近開示が2026-02-10の場合、その前年同期2025-02-10は
+        # 425日遡っただけでは範囲外になる）。開示自体が最大で1年ほど古い
+        # 場合でも前年同期に届くよう、1年(前年同期比較用)+1年(開示の
+        # 遅延に対する安全マージン)+バッファ(60日)を遡る。
+        # get_statements_rangeは1日ごとに個別リクエストするため、4年分
+        # (約1521日)を遡ると冷えたキャッシュではLightプランの呼び出し制限
+        # (60件/分)だけで約25分以上かかり、このルールを選ぶだけで実用的で
+        # なくなっていた（2026-08-25の5巡目のCodexレビューで指摘・修正）。
+        # 2年+60日(約790日)ならその半分程度(約13分)で済む。この約13分という
+        # 初回・キャッシュが冷えている場合のコストは、8巡目のCodexレビューで
+        # 「一日ごとの個別リクエストという設計自体が非効率」と指摘された。
+        # 理屈上は正しいが、これは本PR固有の問題ではなく、同じ
+        # get_statements_rangeを使うprofit_doubling（経常利益4年倍増、
+        # 遡り日数は本ルールの倍の約1520日）等、既存の複数年遡及ルールが
+        # 以前から共通して持つ制約であり、日付単位バルク取得+ローカル/
+        # Supabaseキャッシュという設計（src/endpoints.py参照）を採用している
+        # 以上、初回だけこの遅さを受け入れる（2回目以降は当日分を除き
+        # キャッシュ済みになるため高速）というのが既存の前提になっている。
+        # 銘柄ごとの決算データを差分更新で蓄積する専用ストア（例:
+        # src/regional_stocks.pyの地方株スキャンが採用している「前回スキャン
+        # 日以降だけ追加取得」方式）に作り直すのがより良い解決策だが、それは
+        # 本PRの範囲(sales_growth_doublingが選択期間を無視する不具合の修正)を
+        # 超えるアーキテクチャ変更であり、他の複数年遡及ルールにも影響する
+        # ため別タスクとして扱う（2026-08-25、ユーザーとの合意なくClaude Code
+        # の判断でスコープ外とした）。
+        doubling_lookback_days = 365 * 2 + 60
+        doubling_statements_df = endpoints.get_statements_range(
+            client, today - dt.timedelta(days=doubling_lookback_days), today
+        )
+        hits.append(rules.detect_current_sales_doubling(doubling_statements_df))
 
     # ユーザーがTDNET_TITLE_BASED_RULESを1つも選択していない場合（例: ストップ高・
     # PBRのみ選択）、TDnet開示件数がいくら多くても検索結果には反映されないため、
@@ -221,9 +286,25 @@ def run_screening(
     # いなかった。2026-08-24のCodexレビューで指摘・修正）。end翌日0時未満
     # という排他的な上限にすることで、時刻情報の有無によらずend当日を
     # 正しく含める。
-    result = result.loc[
-        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
-    ]
+    # "sales_growth_doubling"(1年で売上高2倍)は、四半期に1回しか出ない決算
+    # 短信が選択期間(start〜end)にたまたま入っているかという「期間内の
+    # イベント」ではなく、「銘柄が現在2倍成長という状態にあるか」という
+    # 現在の状態を知りたい用途で使われる。UIのデフォルトである「終了日=
+    # 開始日」の1日だけの範囲では、決算のタイミングと一致しない限り
+    # ほとんど何もヒットしない（2026-08-25にユーザー報告・実データで確認：
+    # 実際には多数の該当銘柄があるのに、期間フィルタのせいで0件になって
+    # いた）。このルールだけ選択期間による絞り込みを行わない
+    # （detect_current_sales_doublingが"今日"基準で銘柄ごとに最新の該当
+    # 開示1件だけを既に返しているため、start〜endでの絞り込みはせずそのまま
+    # 採用する。sales_growth_major/explosiveは従来通り「期間内のイベント」
+    # として使えるよう、この特別扱いはsales_growth_doublingだけに限定する。
+    # 2026-08-25のCodexレビューで、閾値を満たす行を先に集めてから最新を選ぶと
+    # 成長が鈍化した後も古い開示がヒットし続けるバグを指摘され、選択は
+    # detect_current_sales_doubling側（最新1件を選んでから閾値判定）に
+    # 一本化した）。
+    is_doubling = result["Rule"] == "sales_growth_doubling"
+    in_range = (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
+    result = pd.concat([result.loc[is_doubling], result.loc[~is_doubling & in_range]], ignore_index=True)
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages
 

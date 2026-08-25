@@ -106,26 +106,154 @@ class TestDetectSalesGrowth(unittest.TestCase):
 
     def test_doubling_growth_also_tagged_as_major_and_explosive(self):
         # +100%以上(1年で2倍)は、数値としてsales_growth_major(+20%以上)・
-        # sales_growth_explosive(+50%以上)も満たすため、3つのruleタグを
+        # sales_growth_explosive(+50%以上)も満たすため、2つのruleタグを
         # すべて持つ行として返す（2026-08-24にユーザーの指定で追加）。
+        # なお"sales_growth_doubling"自体はこの関数ではなく
+        # detect_current_sales_doublingが別途判定する（2026-08-25のCodex
+        # レビューで指摘・修正。下記TestDetectCurrentSalesDoubling参照）。
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
             _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%
         ])
         result = rules.detect_sales_growth(statements)
-        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result), 2)
         self.assertEqual(
             set(result["rule"]),
-            {"sales_growth_major", "sales_growth_explosive", "sales_growth_doubling"},
+            {"sales_growth_major", "sales_growth_explosive"},
         )
+        self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+
+
+class TestDetectCurrentSalesDoubling(unittest.TestCase):
+    def test_growth_over_threshold_on_latest_disclosure_is_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["rule"], "sales_growth_doubling")
 
     def test_growth_just_under_doubling_not_tagged_as_doubling(self):
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
             _row("1234", "1Q", "2026-06-30", "2026-08-10", 190, 19),  # +90%
         ])
-        result = rules.detect_sales_growth(statements)
-        self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
+    def test_growth_cooled_down_since_a_past_doubling_disclosure_is_not_a_hit(self):
+        # 過去に一度+150%(2倍)を達成していても、最新の開示時点の前年同期比が
+        # 閾値未満まで鈍化していれば、もうヒットしない（銘柄が"現在"2倍成長
+        # という状態にあるかを判定するための関数であり、過去に一度でも
+        # 閾値を満たした開示がいつまでも残り続けるバグの回帰テスト。
+        # 2026-08-25のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 250, 25),  # +150%(過去の開示)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 260, 26),  # +4%(最新の開示)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
+    def test_only_the_latest_disclosure_per_code_is_considered(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 210, 21),  # +110%(最新)
+            _row("5678", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("5678", "1Q", "2026-06-30", "2026-08-10", 130, 13),  # +30%(2倍未満)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(set(result["Code"]), {"1234"})
+
+    def test_missing_sales_in_latest_period_does_not_fall_back_to_an_older_hit(self):
+        # 直近の決算期(2026年1Q)の開示がSalesを欠いている場合、その1件は
+        # 判定不能（ヒットなし）として扱うべきで、数値が揃っている1つ古い
+        # 決算期(2025年1Q, +110%)にフォールバックして誤ってヒットさせては
+        # いけない。Salesの欠損チェックを「直近の決算期を選ぶ前」に行うと
+        # このフォールバックが起きてしまう（2026-08-25の4巡目のCodex
+        # レビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 210, 21),  # +110%(1つ古い決算期)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", None, 30),  # 直近の決算期、Sales欠損
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertTrue(result.empty)
+
+    def test_correction_of_an_older_period_does_not_override_the_latest_period(self):
+        # 2026年1Q(直近の決算期)が開示された後に、それより古い2025年1Qの
+        # 数値が訂正された場合、訂正開示の開示日(DiscDate)の方が新しいため
+        # 開示日基準で「最新」を選ぶと、古い決算期同士(2025 vs 2024)の
+        # 比較結果を返してしまう。今知りたいのはあくまで直近の決算期
+        # (2026年1Q)の成長率であるべき（2026-08-25の3巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2024-06-30", "2024-08-10", 100, 10),
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),  # 当初開示
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 250, 25),  # 直近の決算期 (vs 訂正後2025: +25%)
+            _row("1234", "1Q", "2025-06-30", "2026-08-20", 200, 20),  # 2025年1Qの訂正開示(開示日は最新)
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        # 直近の決算期(2026年1Q)の成長率は250/200-1=25%で閾値未満のためヒットしない
+        # （訂正開示の開示日が最新という理由だけで2025年1Q(vs 2024年1Q, +100%)が
+        # 選ばれてしまうと誤ってヒットしてしまう）。
+        self.assertTrue(result.empty)
+
+    def test_stale_synthetic_comparator_is_superseded_by_a_corrected_primary_disclosure(self):
+        # 2026年1Qの前年同期比較の基準となる2025年1Qについて、2026年1Q開示に
+        # 埋め込まれた合成行(IsPrimary=False、訂正前の100)と、別途出た
+        # 2025年1Q自体の訂正開示(IsPrimary=True、訂正後の200)の両方が
+        # 存在する場合、実際の開示である訂正後の200を優先すべき。合成行を
+        # 残したままだと、同じ決算期(PeriodEnd)が重複したままshift(1)する
+        # 際にたまたま古い合成行の方が直前の行として選ばれてしまい、訂正後
+        # の正しい成長率(25%)ではなく訂正前の古い数値と比較した誤った
+        # 成長率(150%)でヒットしてしまう（2026-08-25の6巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),  # 2026年1Q開示の合成行(訂正前)
+            _row("1234", "1Q", "2025-06-30", "2026-08-20", 200, 20, is_primary=True),  # 2025年1Qの訂正開示(実際の開示)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 250, 25, is_primary=True),  # 2026年1Qの実際の開示
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        # 訂正後の200と比較した成長率は25%で閾値未満のためヒットしない
+        self.assertTrue(result.empty)
+
+    def test_restated_synthetic_comparator_supersedes_an_older_primary_disclosure(self):
+        # 上のテストとは逆に、2025年1Qの実際の開示(当初の100)よりも、
+        # 2026年1Q開示に埋め込まれた合成行(遡及的に修正された200)の方が
+        # 開示日が新しい場合、この合成行の方を比較対象として優先すべき。
+        # 合成行のDiscDateは、それが埋め込まれていた親の開示（この場合は
+        # 2026年1Q開示）の開示日を表すため、実際の開示より新しい情報を
+        # 反映していることがある。「実際の開示なら常に優先」という単純な
+        # ルールだと、この場合は逆に古い当初の100を使ってしまい、
+        # 誤って+150%(2倍)と判定してしまう（2026-08-25の7巡目のCodexレビュー
+        # で指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10, is_primary=True),  # 2025年1Qの当初開示
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 200, 20, is_primary=False),  # 2026年1Q開示に埋め込まれた合成行(遡及修正後)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 250, 25, is_primary=True),  # 2026年1Qの実際の開示
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        # 遡及修正後の200と比較した成長率は25%で閾値未満のためヒットしない
+        self.assertTrue(result.empty)
+
+    def test_amended_disclosure_for_same_period_does_not_break_yoy_comparison(self):
+        # 同一決算期(1Q 2026-06-30)について訂正開示が後から出た場合
+        # （当初開示と訂正開示の2行が同じ決算期に存在する）、訂正後の行が
+        # 「同じ決算期の当初開示行」と比較されてしまい期間差0日になり、
+        # 本来比較可能なはずの前年同期比較が不能と判定されるバグの回帰
+        # テスト（2026-08-25のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 200, 20),  # 当初開示 +100%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 220, 22),  # 訂正開示 +120%
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-20"))
 
     def test_excludes_synthetic_rows_from_hits(self):
         # 2026年の実際の開示が一度も取得できず(XBRL保持期限切れ等)、2025年の

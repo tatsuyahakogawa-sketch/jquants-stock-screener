@@ -69,14 +69,52 @@ def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFra
 
 
 def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
-    """指定日に開示された決算短信等の財務情報(/v2/fins/summary)を取得する（キャッシュ利用）。"""
+    """指定日に開示された決算短信等の財務情報(/v2/fins/summary)を取得する（キャッシュ利用）。
+
+    ある日付dateの財務情報が確定するのは、その翌日0:30 JST（=24:30更新）
+    より後（CLAUDE.md参照。18:00更新分もこの時点で確定に含まれる）。
+    それより前は「未確定」として日付＋区分(am/pm)のキーにし、それ以降は
+    二度と変わらない前提で日付だけの恒久キーにする。
+
+    - date当日18:00より前（date==今日の場合のみ起こりうる）: "{date}_am"
+    - date当日18:00 〜 date翌日0:30より前: "{date}_pm"
+      （date当日の夜だけでなく、date翌日の0:00〜0:29 JST——前日24:30更新は
+      まだ反映されていないグレースウィンドウ——もこの区分に含まれる）
+    - date翌日0:30以降: "{date}"（恒久キー）
+
+    単純にdate==今日かどうかだけで場合分けすると、「昨日」を今日の
+    0:00〜0:29に問い合わせた場合（本来はまだ未確定）を「今日ではない
+    ＝確定済みの過去日」と誤判定し、24:30更新前の一部データを恒久キーで
+    キャッシュしてしまい、その後の更新分が永久に反映されなくなる
+    （2026-08-25の5巡目のCodexレビューで指摘・修正）。「1年で売上高2倍」の
+    判定(detect_current_sales_doubling)は"今日"を基準に毎回この関数を
+    呼ぶため、この問題があると「常に最新」のはずの結果が固定されてしまう。
+    """
     date_str = date.strftime("%Y%m%d")
-    cached = cache.load("statements", date_str)
+    now = dt.datetime.now(JST)
+    finalized_at = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(0, 30), tzinfo=JST)
+    if now >= finalized_at:
+        cache_key = date_str
+    else:
+        eighteen_oclock = dt.datetime.combine(date, dt.time(18, 0), tzinfo=JST)
+        period = "pm" if now >= eighteen_oclock else "am"
+        cache_key = f"{date_str}_{period}"
+    # キャッシュの名前空間を"statements"から"statements_v2"に変更している。
+    # この関数の当日分キャッシュキー方式は本PRで複数回修正されており、
+    # 修正前のコードが「確定済み」と誤判定して日付だけの恒久キーで
+    # キャッシュしてしまった古いエントリが、ローカルキャッシュや
+    # Supabase（再デプロイをまたいで永続化される。src/cache.py参照）に
+    # 既に残っている可能性がある。同じ"statements"名前空間のままだと、
+    # 修正後のコードもその古い（一部・空の）エントリを「確定済みの
+    # 正しいキャッシュ」として誤って読み込み続けてしまう。名前空間を
+    # 変えることで、既存のエントリを全て無効化し、最新の修正済みロジックで
+    # 確実に取り直す（2026-08-25の7巡目のCodexレビューで指摘・修正）。
+    cached = cache.load("statements_v2", cache_key)
     if cached is not None:
         return cached
     records = list(client.get_all_pages("/fins/summary", {"date": date_str}))
     df = pd.DataFrame.from_records(records)
-    cache.save("statements", date_str, df)
+    cache.save("statements_v2", cache_key, df)
     return df
 
 
