@@ -131,7 +131,16 @@ def run_screening(
     # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
     # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
     # start〜endのみに絞って取得を高速化する。
-    needs_lookback = selected_rules is None or any(r in YOY_LOOKBACK_RULES for r in selected_rules)
+    # "sales_growth_doubling"は下記の通り専用の別軸取得(doubling_statements_df、
+    # "今日"基準)を常に行うため、ここで取得するstatements_df（start〜end基準）は
+    # 使われない。YOY_LOOKBACK_RULES自体には残す（UI側の「業績条件」のfast/slow
+    # グループ分け表示に使っているため）が、この遡り取得の要否判定からだけは
+    # 除外する。除外しないと、sales_growth_doublingだけを選択している場合でも
+    # 使われないデータのために約4年分遡った開始日を計算してしまい、startが
+    # 数ヶ月前後であればLightプランの取得可能期間(5年)を超えてJ-Quantsに
+    # 400エラーで拒否されうる（2026-08-25のCodexレビューで指摘・修正）。
+    legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
+    needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
     if needs_lookback:
         comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)

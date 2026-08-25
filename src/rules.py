@@ -363,6 +363,23 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
     df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
     df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
+
+    # 同一銘柄・同一決算期(CurPerType/CurPerEn)について訂正開示（数値の
+    # 訂正報告）が複数回行われた場合、実際の開示(IsPrimary=True)行が同じ
+    # 決算期に複数残ってしまう。後段のshift(1)は「1決算期=1行」という前提で
+    # 前年同期の行を求めるため、訂正後の開示が同じ決算期の訂正前の行と比較
+    # されてしまい、期間差0日でhas_comparable_prevがFalseになり、本来
+    # 比較可能なはずの最新開示が判定不能になっていた（2026-08-25のCodex
+    # レビューで指摘・修正）。同一決算期の実際の開示が複数ある場合は、
+    # 開示日が最も新しい1件だけを残す（前年同期比較の基準値として使う
+    # 合成行(IsPrimary=False)はこの重複排除の対象にしない。前年同期実績は
+    # 通常異なる決算期になるため重複しない）。
+    is_primary_all = _is_primary_mask(df)
+    primary_df = df.loc[is_primary_all].sort_values(STMT_DISCLOSED_DATE)
+    primary_df = primary_df.drop_duplicates(
+        subset=[STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END], keep="last"
+    )
+    df = pd.concat([primary_df, df.loc[~is_primary_all]], ignore_index=False)
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
     df["prev_net_sales"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_NET_SALES].shift(1)

@@ -167,6 +167,22 @@ class TestDetectCurrentSalesDoubling(unittest.TestCase):
         result = rules.detect_current_sales_doubling(statements)
         self.assertEqual(set(result["Code"]), {"1234"})
 
+    def test_amended_disclosure_for_same_period_does_not_break_yoy_comparison(self):
+        # 同一決算期(1Q 2026-06-30)について訂正開示が後から出た場合
+        # （当初開示と訂正開示の2行が同じ決算期に存在する）、訂正後の行が
+        # 「同じ決算期の当初開示行」と比較されてしまい期間差0日になり、
+        # 本来比較可能なはずの前年同期比較が不能と判定されるバグの回帰
+        # テスト（2026-08-25のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 200, 20),  # 当初開示 +100%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 220, 22),  # 訂正開示 +120%
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-20"))
+
     def test_excludes_synthetic_rows_from_hits(self):
         # 2026年の実際の開示が一度も取得できず(XBRL保持期限切れ等)、2025年の
         # 実開示(埋め込み前年同期=2024年)と2027年の実開示(埋め込み前年同期=

@@ -105,5 +105,48 @@ class TestFinancialsCachePeriod(unittest.TestCase):
         self.assertEqual(result, "20260819_pm")
 
 
+class TestGetStatementsByDateCacheKey(unittest.TestCase):
+    """get_statements_by_date()の当日分キャッシュキーの回帰テスト。
+
+    単純な日付だけをキャッシュキーにすると、18:00更新の前に一度取得して
+    しまった場合、その日のうちに18:00を過ぎて再取得しても更新前の古い
+    キャッシュを返し続けてしまう。「1年で売上高2倍」(sales_growth_doubling)
+    の判定は"今日"を基準に毎回この関数を呼ぶため、この問題があると
+    「常に最新」のはずの結果が固定されてしまう
+    （2026-08-25のCodexレビューで指摘・修正）。
+    """
+
+    def test_today_uses_am_pm_cache_period_not_plain_date(self):
+        fixed_today = dt.date(2026, 8, 19)
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter([])
+
+        with patch(f"{_MOD}.today_jst", return_value=fixed_today), \
+                patch(f"{_MOD}._financials_cache_period", return_value="20260819_pm"), \
+                patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
+                patch(f"{_MOD}.cache.save") as mock_save:
+            endpoints.get_statements_by_date(mock_client, fixed_today)
+
+        mock_load.assert_called_once_with("statements", "20260819_pm")
+        mock_save.assert_called_once()
+        self.assertEqual(mock_save.call_args[0][1], "20260819_pm")
+
+    def test_past_date_still_uses_plain_date_cache_key(self):
+        # 過去日は結果が変わらないため、従来通り日付だけのキーのまま
+        # （am/pmで無駄にキャッシュを分けない）。
+        fixed_today = dt.date(2026, 8, 19)
+        past_date = dt.date(2026, 8, 10)
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter([])
+
+        with patch(f"{_MOD}.today_jst", return_value=fixed_today), \
+                patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
+                patch(f"{_MOD}.cache.save") as mock_save:
+            endpoints.get_statements_by_date(mock_client, past_date)
+
+        mock_load.assert_called_once_with("statements", "20260810")
+        self.assertEqual(mock_save.call_args[0][1], "20260810")
+
+
 if __name__ == "__main__":
     unittest.main()

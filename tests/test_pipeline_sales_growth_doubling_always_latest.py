@@ -99,5 +99,43 @@ class TestSalesGrowthDoublingIgnoresSelectedPeriod(unittest.TestCase):
         self.assertTrue(hits.empty)
 
 
+class TestSalesGrowthDoublingDoesNotWidenLegacyLookback(unittest.TestCase):
+    def test_selecting_only_doubling_does_not_widen_the_start_bounded_fetch(self):
+        # sales_growth_doublingは専用の別軸取得(今日基準)を行うため、
+        # 従来のstart〜end基準のstatements_df取得（他ルール用）は
+        # このルールのためには不要。この遡り取得の要否判定から
+        # sales_growth_doublingを除外していないと、これだけを選択した
+        # 状態でstartが数ヶ月〜1年前でも約4年分遡った開始日を計算して
+        # しまい、使われないデータのためにLightプランの取得可能期間
+        # (5年)を超えるリクエストを送ってHTTP 400になりうる
+        # （2026-08-25のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _statement_row("10000", "1Q", "2025-06-30", "2025-08-10", 100),
+            _statement_row("10000", "1Q", "2026-06-30", "2026-08-10", 250),
+        ])
+        start = dt.date(2026, 1, 1)
+        end = dt.date(2026, 8, 25)
+        calls = []
+
+        def _record(client, fetch_start, fetch_end):
+            calls.append((fetch_start, fetch_end))
+            return statements
+
+        with (
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", side_effect=_record),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            pipeline.run_screening(
+                client=object(), start=start, end=end, selected_rules=["sales_growth_doubling"],
+            )
+
+        # 1回目(通常のstatements_df用)の呼び出しはstartをそのまま使う
+        # （数年分遡らない）。
+        legacy_call = calls[0]
+        self.assertEqual(legacy_call[0], start)
+
+
 if __name__ == "__main__":
     unittest.main()

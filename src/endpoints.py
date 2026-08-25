@@ -69,14 +69,27 @@ def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFra
 
 
 def get_statements_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
-    """指定日に開示された決算短信等の財務情報(/v2/fins/summary)を取得する（キャッシュ利用）。"""
+    """指定日に開示された決算短信等の財務情報(/v2/fins/summary)を取得する（キャッシュ利用）。
+
+    過去日は結果が変わらないため単純に日付だけをキャッシュキーにできるが、
+    当日分は18:00と24:30の1日2回更新される（CLAUDE.md参照）。単純な日付
+    キーのままだと、更新前（例: 朝〜18:00前）に一度取得して空/一部だけの
+    結果をキャッシュしてしまうと、その日のうちに18:00を過ぎて再取得しても
+    更新前の古いキャッシュを返し続けてしまう。「1年で売上高2倍」の判定
+    (detect_current_sales_doubling)は"今日"を基準に毎回この関数を呼ぶため、
+    この問題があると「常に最新」のはずの結果が一度キャッシュされた時点で
+    実質固定されてしまう（2026-08-25のCodexレビューで指摘・修正）。
+    get_financials_by_codeと同じ_financials_cache_period()を当日分にだけ
+    適用し、過去日は従来通りの日付だけのキーのまま変更しない。
+    """
     date_str = date.strftime("%Y%m%d")
-    cached = cache.load("statements", date_str)
+    cache_key = _financials_cache_period() if date == today_jst() else date_str
+    cached = cache.load("statements", cache_key)
     if cached is not None:
         return cached
     records = list(client.get_all_pages("/fins/summary", {"date": date_str}))
     df = pd.DataFrame.from_records(records)
-    cache.save("statements", date_str, df)
+    cache.save("statements", cache_key, df)
     return df
 
 
