@@ -459,7 +459,16 @@ def screen_regional(
     if "large_order" in selected_rules:
         hits.append(rules.detect_large_order(disclosures_df))
     if any(r in selected_rules for r in ("stock_split", "stock_consolidation")):
-        hits.append(rules.detect_stock_split(disclosures_df))
+        # detect_stock_splitは"stock_split"と"stock_consolidation"の両方を
+        # 1回の呼び出しで返す。片方だけがselected_rulesに含まれる場合、
+        # 選ばれていない方のruleまで結果に混ざるとscreen_regionalの
+        # 「selected_rulesに含まれる条件だけを判定する」という契約に反する
+        # ため、選択された方だけに絞り込む（2026-08-24のCodexレビューで
+        # 指摘・修正）。
+        split_hits = rules.detect_stock_split(disclosures_df)
+        if not split_hits.empty:
+            split_hits = split_hits.loc[split_hits["rule"].isin(selected_rules)]
+        hits.append(split_hits)
 
     columns = ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
     hits = [h for h in hits if not h.empty]

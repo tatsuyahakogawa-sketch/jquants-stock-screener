@@ -213,8 +213,16 @@ def run_screening(
     result["Date"] = pd.to_datetime(result["Date"])
     # 比較用に遡って取得した過去開示分がヒットに混ざらないよう、実際の開示日が
     # ユーザーの選択期間(start〜end)に入っているものだけに絞り込む。
+    # TDnet由来のrule（stock_split・new_facility_or_store等）のDateは
+    # pubdateの時刻情報を保持しているため（例: "2026-08-24 16:30:00"）、
+    # pd.Timestamp(end)（=その日の0時0分）とのend<=比較では同日の開示が
+    # ほぼ全て弾かれてしまっていた（UIのデフォルトが「終了日=開始日」の
+    # 1日だけの範囲であるため、この不具合により対象ルールが実質機能して
+    # いなかった。2026-08-24のCodexレビューで指摘・修正）。end翌日0時未満
+    # という排他的な上限にすることで、時刻情報の有無によらずend当日を
+    # 正しく含める。
     result = result.loc[
-        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] <= pd.Timestamp(end))
+        (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(end) + pd.Timedelta(days=1))
     ]
     result = result.sort_values(["Date", "Code"]).reset_index(drop=True)
     return result[["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]], messages

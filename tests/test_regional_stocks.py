@@ -570,6 +570,36 @@ class TestScreenRegional(unittest.TestCase):
             list(hits.columns), ["Code", "CompanyName", "Sector", "Rule", "RuleLabel", "Date", "Detail"]
         )
 
+    def test_selecting_only_stock_split_excludes_consolidation_hits(self):
+        # detect_stock_splitは"stock_split"と"stock_consolidation"の両方を
+        # 1回の呼び出しで返す。片方だけを選んだ場合、選ばれていない方の
+        # ruleまで結果に混ざってはいけない（2026-08-24のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "分割銘柄", "株式分割に関するお知らせ", "2026-08-13 15:30:00", "福"),
+            _disclosure("2", "50180", "併合銘柄", "株式併合に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["stock_split"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Code"], "40180")
+        self.assertEqual(hits.iloc[0]["Rule"], "stock_split")
+
+    def test_selecting_only_stock_consolidation_excludes_split_hits(self):
+        statements = pd.DataFrame(columns=regional_stocks._STATEMENTS_COLUMNS)
+        company_status = pd.DataFrame(columns=["Code", "CompanyName", "MarketsString", "LastSeenDate"])
+        disclosures = pd.DataFrame([
+            _disclosure("1", "40180", "分割銘柄", "株式分割に関するお知らせ", "2026-08-13 15:30:00", "福"),
+            _disclosure("2", "50180", "併合銘柄", "株式併合に関するお知らせ", "2026-08-13 15:30:00", "福"),
+        ])
+
+        hits = regional_stocks.screen_regional(disclosures, statements, company_status, ["stock_consolidation"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits.iloc[0]["Code"], "50180")
+        self.assertEqual(hits.iloc[0]["Rule"], "stock_consolidation")
+
     def test_equity_ratio_uses_latest_statement_only(self):
         # 本決算のprior_row(前年同期)がEqARを持つケース。当期(最新)のEqARが
         # 閾値未満でも、古いprior_rowが閾値以上だと誤ってヒットしていた回帰

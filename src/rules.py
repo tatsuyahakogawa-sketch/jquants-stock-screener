@@ -96,6 +96,11 @@ TOKYO_EXCHANGE_KEYWORDS = ["東京証券取引所", "東証"]
 # 「NEXT FUNDS...上場投信」等の別指数・別銘柄の決算短信は"400"または"構成銘柄"を
 # 含まないため誤検出しない）。
 JPX_NIKKEI_400_KEYWORDS = ["日経インデックス", "400", "構成銘柄"]
+# 「構成銘柄からの除外に関するお知らせ」のように、選定・採用ではなく逆方向
+# （除外）の発表にも上記3語が一致してしまうため、除外系のタイトルは除く
+# （2026-08-24のCodexレビューで指摘。2021〜2026年の実データでは除外系の
+# 自社開示は確認できなかったが、将来的な発生に備えて防御的に除外する）。
+JPX_NIKKEI_400_EXCLUSION_KEYWORDS = ["除外", "非選定", "解除"]
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
@@ -647,7 +652,10 @@ def detect_jpx_nikkei_400_selection(disclosures_df: pd.DataFrame) -> pd.DataFram
     df = disclosures_df.copy()
     normalized_titles = df["title"].fillna("").apply(lambda t: unicodedata.normalize("NFKC", t))
     mentions_keyword = normalized_titles.apply(lambda t: all(k in t for k in JPX_NIKKEI_400_KEYWORDS))
-    hit = df.loc[mentions_keyword, ["company_code", "pubdate", "title"]].copy()
+    mentions_exclusion = normalized_titles.apply(
+        lambda t: any(k in t for k in JPX_NIKKEI_400_EXCLUSION_KEYWORDS)
+    )
+    hit = df.loc[mentions_keyword & ~mentions_exclusion, ["company_code", "pubdate", "title"]].copy()
     if hit.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 

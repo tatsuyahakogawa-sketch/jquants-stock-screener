@@ -225,6 +225,17 @@ class TestDetectJpxNikkei400Selection(unittest.TestCase):
         self.assertTrue(result.empty)
         self.assertEqual(list(result.columns), ["Code", "Date", "rule", "detail"])
 
+    def test_removal_notice_is_not_matched_as_selection(self):
+        # 「構成銘柄からの除外」のように選定と逆方向の発表は誤検出しない
+        # （2026-08-24のCodexレビューで指摘・修正。実データでは除外系の自社
+        # 開示は確認できなかったが、将来的な発生に備えて防御的に除外する）。
+        df = self._disclosures([
+            {"company_code": "10000", "title": "「JPX日経インデックス400」構成銘柄からの除外に関するお知らせ",
+             "pubdate": "2026-08-01 15:00:00", "document_url": None},
+        ])
+        result = rules.detect_jpx_nikkei_400_selection(df)
+        self.assertTrue(result.empty)
+
 
 if __name__ == "__main__":
     unittest.main()
