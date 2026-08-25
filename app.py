@@ -189,7 +189,7 @@ def render_regional_section(selected_market_chars: set[str]) -> None:
         selected_statement_rules = st.pills(
             "対象にする財務条件",
             options=regional_stocks.REGIONAL_STATEMENT_RULES,
-            format_func=lambda k: RULE_LABELS[k],
+            format_func=lambda k: RULE_LABELS.get(k, k),
             selection_mode="multi",
             default=[],
             key="regional_statement_rules_pills",
@@ -460,7 +460,7 @@ else:
         material_events = st.pills(
             "対象にするイベント・材料条件",
             options=_MATERIAL_EVENT_RULES,
-            format_func=lambda k: RULE_LABELS[k],
+            format_func=lambda k: RULE_LABELS.get(k, k),
             selection_mode="multi",
             default=[],
             key="material_events_pills",
@@ -480,7 +480,7 @@ else:
         fast_performance_events = st.pills(
             "対象にする業績条件",
             options=_FAST_PERFORMANCE_RULES,
-            format_func=lambda k: RULE_LABELS[k],
+            format_func=lambda k: RULE_LABELS.get(k, k),
             selection_mode="multi",
             default=[],
             key="fast_performance_events_pills",
@@ -490,7 +490,7 @@ else:
             slow_performance_events = st.pills(
                 "対象にする業績条件（前年同期比較のため時間がかかるもの）",
                 options=_SLOW_PERFORMANCE_RULES,
-                format_func=lambda k: RULE_LABELS[k],
+                format_func=lambda k: RULE_LABELS.get(k, k),
                 selection_mode="multi",
                 default=[],
                 key="slow_performance_events_pills",
