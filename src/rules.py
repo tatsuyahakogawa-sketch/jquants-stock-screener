@@ -377,15 +377,28 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     # されてしまい、期間差0日でhas_comparable_prevがFalseになり、本来
     # 比較可能なはずの最新開示が判定不能になっていた（2026-08-25のCodex
     # レビューで指摘・修正）。同一決算期の実際の開示が複数ある場合は、
-    # 開示日が最も新しい1件だけを残す（前年同期比較の基準値として使う
-    # 合成行(IsPrimary=False)はこの重複排除の対象にしない。前年同期実績は
-    # 通常異なる決算期になるため重複しない）。
+    # 開示日が最も新しい1件だけを残す。
     is_primary_all = _is_primary_mask(df)
+    key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
     primary_df = df.loc[is_primary_all].sort_values(STMT_DISCLOSED_DATE)
-    primary_df = primary_df.drop_duplicates(
-        subset=[STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END], keep="last"
-    )
-    df = pd.concat([primary_df, df.loc[~is_primary_all]], ignore_index=False)
+    primary_df = primary_df.drop_duplicates(subset=key_cols, keep="last")
+
+    # 前年同期比較の基準値として使う合成行(IsPrimary=False、他の開示に
+    # 埋め込まれた前年同期実績)についても、同じ決算期の実際の開示
+    # (IsPrimary=True、訂正後を含む)が別途存在する場合はそちらを優先し、
+    # 合成行は捨てる。捨てないと、同じ決算期のPeriodEndが重複したまま
+    # sort_values→shift(1)する際に、たまたま合成行(訂正前の古い数値)が
+    # 直前の行として選ばれてしまい、訂正後の正しい数値ではなく訂正前の
+    # 古い数値と比較してしまうことがある（2026-08-25の6巡目のCodexレビュー
+    # で指摘・修正）。実際の開示が無い決算期の合成行（TDnetの開示添付は
+    # 公開から約1〜1.5ヶ月で取得できなくなり過去分をバックフィルできない
+    # ため、合成行しか無い場合がある。src/tdnet_xbrl.py参照）はそのまま残す。
+    non_primary_df = df.loc[~is_primary_all]
+    primary_keys = pd.MultiIndex.from_frame(primary_df[key_cols])
+    non_primary_keys = pd.MultiIndex.from_frame(non_primary_df[key_cols])
+    non_primary_df = non_primary_df.loc[~non_primary_keys.isin(primary_keys)]
+
+    df = pd.concat([primary_df, non_primary_df], ignore_index=False)
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
     df["prev_net_sales"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_NET_SALES].shift(1)

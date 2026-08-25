@@ -100,15 +100,16 @@ class TestSalesGrowthDoublingIgnoresSelectedPeriod(unittest.TestCase):
 
 
 class TestSalesGrowthDoublingDoesNotWidenLegacyLookback(unittest.TestCase):
-    def test_selecting_only_doubling_does_not_widen_the_start_bounded_fetch(self):
+    def test_selecting_only_doubling_skips_the_legacy_start_bounded_fetch_entirely(self):
         # sales_growth_doublingは専用の別軸取得(今日基準)を行うため、
-        # 従来のstart〜end基準のstatements_df取得（他ルール用）は
-        # このルールのためには不要。この遡り取得の要否判定から
-        # sales_growth_doublingを除外していないと、これだけを選択した
-        # 状態でstartが数ヶ月〜1年前でも約4年分遡った開始日を計算して
-        # しまい、使われないデータのためにLightプランの取得可能期間
-        # (5年)を超えるリクエストを送ってHTTP 400になりうる
-        # （2026-08-25のCodexレビューで指摘・修正）。
+        # 従来のstart〜end基準のquotes_df・statements_df取得（他ルール用）は
+        # このルールだけを選択している場合は完全に不要。取得自体を省略
+        # しないと、使われないデータのために無駄なAPI呼び出しが発生し、
+        # startが数ヶ月〜1年前でも約4年分遡った開始日を計算してLightプラン
+        # の取得可能期間(5年)を超えるリクエストを送りHTTP 400になりうる
+        # （2026-08-25の6巡目のCodexレビューで指摘・修正: 当初は遡り計算
+        # からsales_growth_doublingを除外しただけだったが、それだけでは
+        # start〜end基準の取得自体は依然として発生してしまっていた）。
         statements = pd.DataFrame([
             _statement_row("10000", "1Q", "2025-06-30", "2025-08-10", 100),
             _statement_row("10000", "1Q", "2026-06-30", "2026-08-10", 250),
@@ -123,7 +124,7 @@ class TestSalesGrowthDoublingDoesNotWidenLegacyLookback(unittest.TestCase):
 
         with (
             patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
-            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()) as mock_quotes,
             patch(f"{_MOD}.endpoints.get_statements_range", side_effect=_record),
             patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
         ):
@@ -131,10 +132,11 @@ class TestSalesGrowthDoublingDoesNotWidenLegacyLookback(unittest.TestCase):
                 client=object(), start=start, end=end, selected_rules=["sales_growth_doubling"],
             )
 
-        # 1回目(通常のstatements_df用)の呼び出しはstartをそのまま使う
-        # （数年分遡らない）。
-        legacy_call = calls[0]
-        self.assertEqual(legacy_call[0], start)
+        # get_statements_rangeの呼び出しはsales_growth_doubling専用の
+        # 別軸取得(今日基準)の1回だけ。startを基準にした従来の呼び出しは
+        # 発生しない。
+        self.assertEqual(len(calls), 1)
+        mock_quotes.assert_not_called()
 
 
 if __name__ == "__main__":

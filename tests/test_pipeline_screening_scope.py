@@ -58,9 +58,15 @@ class TestSelectedRulesControlsLookback(unittest.TestCase):
         captured = _run_with_capture(selected_rules=["stop_high", "pbr_low"])
         self.assertEqual(captured["start"], dt.date(2026, 8, 1))
 
-    def test_empty_selected_rules_uses_narrow_range(self):
+    def test_empty_selected_rules_skips_the_fetch_entirely(self):
+        # 選択中のルールが1つも無ければstatements_df・quotes_dfを使う
+        # ルールは1つも動かないため、取得自体を丸ごと省略する
+        # （2026-08-25の6巡目のCodexレビューでのsales_growth_doubling専用
+        # 対応と合わせて、selected_rules=[]（何も選択していない）の場合も
+        # 同じ理由で取得自体を省略するよう修正。以前は範囲を狭めるだけで
+        # 取得自体は毎回行っていた）。
         captured = _run_with_capture(selected_rules=[])
-        self.assertEqual(captured["start"], dt.date(2026, 8, 1))
+        self.assertEqual(captured, {})
 
     def test_mixed_selection_including_yoy_rule_uses_wide_lookback(self):
         captured = _run_with_capture(selected_rules=["stop_high", "sales_growth_explosive"])

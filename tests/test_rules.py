@@ -201,6 +201,25 @@ class TestDetectCurrentSalesDoubling(unittest.TestCase):
         # 選ばれてしまうと誤ってヒットしてしまう）。
         self.assertTrue(result.empty)
 
+    def test_stale_synthetic_comparator_is_superseded_by_a_corrected_primary_disclosure(self):
+        # 2026年1Qの前年同期比較の基準となる2025年1Qについて、2026年1Q開示に
+        # 埋め込まれた合成行(IsPrimary=False、訂正前の100)と、別途出た
+        # 2025年1Q自体の訂正開示(IsPrimary=True、訂正後の200)の両方が
+        # 存在する場合、実際の開示である訂正後の200を優先すべき。合成行を
+        # 残したままだと、同じ決算期(PeriodEnd)が重複したままshift(1)する
+        # 際にたまたま古い合成行の方が直前の行として選ばれてしまい、訂正後
+        # の正しい成長率(25%)ではなく訂正前の古い数値と比較した誤った
+        # 成長率(150%)でヒットしてしまう（2026-08-25の6巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),  # 2026年1Q開示の合成行(訂正前)
+            _row("1234", "1Q", "2025-06-30", "2026-08-20", 200, 20, is_primary=True),  # 2025年1Qの訂正開示(実際の開示)
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 250, 25, is_primary=True),  # 2026年1Qの実際の開示
+        ])
+        result = rules.detect_current_sales_doubling(statements)
+        # 訂正後の200と比較した成長率は25%で閾値未満のためヒットしない
+        self.assertTrue(result.empty)
+
     def test_amended_disclosure_for_same_period_does_not_break_yoy_comparison(self):
         # 同一決算期(1Q 2026-06-30)について訂正開示が後から出た場合
         # （当初開示と訂正開示の2行が同じ決算期に存在する）、訂正後の行が

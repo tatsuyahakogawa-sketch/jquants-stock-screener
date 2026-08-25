@@ -122,31 +122,44 @@ def run_screening(
             )
             valid_codes -= pro_market_codes
 
-    quotes_df = endpoints.get_daily_quotes_range(client, start, end)
-    # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
-    # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
-    # start〜end だけで取得すると比較対象の過去開示がそもそも取得できておらず、
-    # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
-    # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
-    # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
-    # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
-    # start〜endのみに絞って取得を高速化する。
-    # "sales_growth_doubling"は下記の通り専用の別軸取得(doubling_statements_df、
-    # "今日"基準)を常に行うため、ここで取得するstatements_df（start〜end基準）は
-    # 使われない。YOY_LOOKBACK_RULES自体には残す（UI側の「業績条件」のfast/slow
-    # グループ分け表示に使っているため）が、この遡り取得の要否判定からだけは
-    # 除外する。除外しないと、sales_growth_doublingだけを選択している場合でも
-    # 使われないデータのために約4年分遡った開始日を計算してしまい、startが
-    # 数ヶ月前後であればLightプランの取得可能期間(5年)を超えてJ-Quantsに
-    # 400エラーで拒否されうる（2026-08-25のCodexレビューで指摘・修正）。
-    legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
-    needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
-    if needs_lookback:
-        comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
-        statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    # sales_growth_doublingは下記の通り専用の別軸取得(doubling_statements_df、
+    # "今日"基準)を行い、TDNET_TITLE_BASED_RULES（株式分割等）はTDnet開示
+    # (disclosures_df)のみを使う。それ以外のルールが1つも選択されていない
+    # 場合、ここでのquotes_df・statements_dfの取得自体が丸ごと不要なため
+    # 省略する。省略しないと、sales_growth_doublingだけを選択している
+    # 場合でも使われないデータのためにユーザー選択期間全体（UIのデフォルト
+    # は直近1年）分のAPI呼び出しが走ってしまい、期間がLightプランの
+    # 取得可能期間(5年)を超えていれば400エラーにもなりうる
+    # （2026-08-25の6巡目のCodexレビューで指摘・修正）。
+    legacy_fetch_rules = [
+        r for r in RULE_LABELS if r not in TDNET_TITLE_BASED_RULES and r != "sales_growth_doubling"
+    ]
+    legacy_fetch_needed = selected_rules is None or any(r in legacy_fetch_rules for r in selected_rules)
+    if legacy_fetch_needed:
+        quotes_df = endpoints.get_daily_quotes_range(client, start, end)
+        # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
+        # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
+        # start〜end だけで取得すると比較対象の過去開示がそもそも取得できておらず、
+        # 前年同期比較が常にNaNになってヒットが極端に少なくなってしまう
+        # （選択期間が1年以上にならない限り比較不能）。比較用に必要な分だけ遡って
+        # 取得し、実際のヒットは後段でstart〜end開示分に絞り込む。
+        # YOY_LOOKBACK_RULESが選択されていない場合はこの遡り取得自体が不要なため、
+        # start〜endのみに絞って取得を高速化する。sales_growth_doublingは専用の
+        # 別軸取得を持ち、ここでのstatements_dfには使われないため、この遡り取得
+        # の要否判定からは除外する（除外しないと、sales_growth_doublingと
+        # YOY_LOOKBACK_RULES以外のルールだけを組み合わせて選択した場合にも、
+        # 使われないデータのために約4年分遡った開始日を計算してしまう）。
+        legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
+        needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
+        if needs_lookback:
+            comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+            statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+        else:
+            statements_fetch_start = start
+        statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
     else:
-        statements_fetch_start = start
-    statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
+        quotes_df = pd.DataFrame()
+        statements_df = pd.DataFrame()
 
     hits = [
         rules.detect_stop_high(quotes_df),
@@ -172,12 +185,21 @@ def run_screening(
         today = today_jst()
         # detect_current_sales_doublingは直近の決算期とその前年同期
         # (330〜400日前)の1回分の比較しか行わないため、PROFIT_DOUBLING_YEARS
-        # (4年)は不要で、1年+バッファ(60日)だけ遡れば十分。
+        # (4年)は不要。ただし単純に1年+バッファ(60日)だけ遡ると、銘柄の
+        # 直近の決算期の開示自体が"今日"から見て古い場合（例: 決算期末から
+        # 開示まで数ヶ月かかる銘柄、開示が遅れがちな銘柄）に、その前年同期
+        # の比較対象がこの遡り範囲より前になってしまい取得できないことが
+        # ある（2026-08-25の6巡目のCodexレビューで指摘・実例: "今日"が
+        # 2026-05-01で直近開示が2026-02-10の場合、その前年同期2025-02-10は
+        # 425日遡っただけでは範囲外になる）。開示自体が最大で1年ほど古い
+        # 場合でも前年同期に届くよう、1年(前年同期比較用)+1年(開示の
+        # 遅延に対する安全マージン)+バッファ(60日)を遡る。
         # get_statements_rangeは1日ごとに個別リクエストするため、4年分
         # (約1521日)を遡ると冷えたキャッシュではLightプランの呼び出し制限
         # (60件/分)だけで約25分以上かかり、このルールを選ぶだけで実用的で
         # なくなっていた（2026-08-25の5巡目のCodexレビューで指摘・修正）。
-        doubling_lookback_days = 365 + 60
+        # 2年+60日(約790日)ならその半分程度で済む。
+        doubling_lookback_days = 365 * 2 + 60
         doubling_statements_df = endpoints.get_statements_range(
             client, today - dt.timedelta(days=doubling_lookback_days), today
         )
