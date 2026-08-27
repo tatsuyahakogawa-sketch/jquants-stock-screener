@@ -133,6 +133,7 @@ def run_screening(
     # 最適化により常にFalseになり、デフォルトON(exclude_downward)の除外
     # フィルターが効かなくなる不具合を指摘され、同じ理由でストップ高日付
     # 列も壊れることが分かったため、この最適化自体を取りやめた）。
+    messages: list[str] = []
     quotes_df = endpoints.get_daily_quotes_range(client, start, end)
     # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
     # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
@@ -162,14 +163,38 @@ def run_screening(
     # 関わらずスクリーニングが全く実行できなくなる（実機で確認: 2026-08-27に
     # 開始日を2年前(2024-08-27)に設定しsales_growth_explosiveを選択した
     # ところ、遡り取得後の開始日が2020-06-29相当になり、5年の境界
-    # (2021-08-27頃)を超えて拒否された）。遡り取得後の開始日を契約プランの
-    # 実際の取得可能期間の下限でクランプする（30日の安全マージン込み。
-    # 5年の境界計算はsrc/jst.pyのtoday_jst()と同じ簡易な365日単位のため、
-    # うるう年のズレ等に対する余裕を持たせる）。
-    earliest_available_statements_date = (
-        today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS) + dt.timedelta(days=30)
-    )
-    statements_fetch_start = max(statements_fetch_start, earliest_available_statements_date)
+    # (2021-08-27頃)を超えて拒否された）。
+    # 365*5日という単純計算は、うるう年の分だけ実際の「5年前」の暦日より
+    # 1〜2日新しい（＝5年の枠に確実に収まる）側にずれるため、安全マージンを
+    # 別途足す必要は無い（足すと逆に、本来は取得できるはずの直近1ヶ月弱を
+    # 誤って除外し、その期間のprofit_doubling等が本来ヒットすべきなのに
+    # ヒットしなくなる。2026-08-27の2巡目のCodexレビューで指摘・修正:
+    # 当初は30日の安全マージンを加えていた）。
+    earliest_available_statements_date = today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS)
+    if statements_fetch_start < earliest_available_statements_date:
+        # クランプによって、比較用に遡って取得したかった一部の決算データが
+        # 実際には取得できていない。この状態でもAPI呼び出し自体は成功して
+        # しまうため、対象のYOY_LOOKBACK_RULES（売上高の大幅/爆発的増加・
+        # 四半期決算2期連続増収増益・経常利益4年倍増）は、選択期間のうち
+        # 開始日に近い側で前年（〜PROFIT_DOUBLING_YEARS年前）同期データが
+        # 無く、本来ヒットすべき銘柄が「合致なし」として静かに扱われて
+        # しまう可能性がある。データが揃わず判定できなかったことを
+        # ユーザーに明示する（2026-08-27の2巡目のCodexレビューで指摘・修正）。
+        if needs_lookback:
+            messages.append(
+                "選択期間の一部（開始日に近い側）は、比較に必要な前年"
+                f"（〜{PROFIT_DOUBLING_YEARS}年前）の決算データがLightプランの"
+                f"取得可能期間（{earliest_available_statements_date:%Y-%m-%d}以降）を"
+                "超えるため取得できませんでした。売上高の大幅/爆発的増加・"
+                "四半期決算2期連続増収増益・経常利益4年倍増の各条件は、この"
+                "期間の一部で正しく判定できていない可能性があります。"
+            )
+        else:
+            messages.append(
+                f"開始日がLightプランの取得可能期間（{earliest_available_statements_date:%Y-%m-%d}"
+                "以降）より前のため、それより前の決算データは取得できませんでした。"
+            )
+        statements_fetch_start = earliest_available_statements_date
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
@@ -238,7 +263,6 @@ def run_screening(
     # 誤って促してしまうことを防ぐ。2026-08-24のCodexレビューで指摘・修正）。
     tdnet_rule_requested = selected_rules is None or any(r in TDNET_TITLE_BASED_RULES for r in selected_rules)
 
-    messages: list[str] = []
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
         if tdnet_rule_requested and len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
@@ -1020,10 +1044,10 @@ def compute_tenx_scores(
     statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     # run_screeningと同じ理由でLightプランの取得可能期間（過去5年）の下限で
     # クランプする（startが既に1〜2年以上前だと、遡り取得後の開始日が
-    # 5年の境界を超えてJ-Quantsに400エラーで拒否されるため）。
-    earliest_available_statements_date = (
-        today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS) + dt.timedelta(days=30)
-    )
+    # 5年の境界を超えてJ-Quantsに400エラーで拒否されるため）。365*5日という
+    # 単純計算はうるう年の分だけ実際の「5年前」の暦日より1〜2日新しい側に
+    # ずれるため安全マージンは不要（run_screening参照）。
+    earliest_available_statements_date = today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS)
     statements_fetch_start = max(statements_fetch_start, earliest_available_statements_date)
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 

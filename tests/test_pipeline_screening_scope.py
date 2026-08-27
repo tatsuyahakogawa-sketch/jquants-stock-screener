@@ -26,7 +26,15 @@ _MOD = "src.pipeline"
 
 
 def _run_with_capture(selected_rules):
-    """statements_range呼び出しの引数を捕捉しつつrun_screeningを実行するヘルパー。"""
+    """statements_range呼び出しの引数を捕捉しつつrun_screeningを実行するヘルパー。
+
+    今日の日付はtoday_jstを固定でモックする。run_screeningがLightプランの
+    取得可能期間（過去5年、today_jst()基準）で遡り取得をクランプするように
+    なったため、モックしないと実行するたびの実際の日付に依存してしまい、
+    「5年前」の境界がテストの固定start(2026-08-01)を追い越す将来（2031年頃）に
+    このテストの各アサーションが実行タイミングだけで失敗するようになる
+    （2026-08-27の2巡目のCodexレビューで指摘・修正）。
+    """
     captured = {}
 
     def _fake_get_statements_range(client, start, end):
@@ -35,6 +43,7 @@ def _run_with_capture(selected_rules):
         return pd.DataFrame()
 
     with (
+        patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 8, 5)),
         patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
         patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
         patch(f"{_MOD}.endpoints.get_statements_range", side_effect=_fake_get_statements_range),
@@ -109,6 +118,44 @@ class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
 
         five_years_back = today - dt.timedelta(days=365 * 5)
         self.assertGreaterEqual(captured["start"], five_years_back)
+
+    def test_clamped_lookback_warns_that_some_comparison_data_is_missing(self):
+        # クランプによってAPI呼び出し自体は成功するが、比較用に遡って
+        # 取得したかった一部の決算データは実際には取得できていない。
+        # 黙って「合致なし」を返すと、本来ヒットすべき銘柄が見逃されている
+        # ことにユーザーが気づけないため、メッセージで明示する
+        # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
+        today = dt.date(2026, 8, 27)
+        start = today - dt.timedelta(days=365 * 2)
+        end = today
+
+        with (
+            patch(f"{_MOD}.today_jst", return_value=today),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            _hits, messages = pipeline.run_screening(
+                client=object(), start=start, end=end, selected_rules=["sales_growth_explosive"],
+            )
+
+        self.assertTrue(any("Lightプラン" in m for m in messages))
+
+    def test_narrow_range_does_not_warn(self):
+        with (
+            patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 8, 5)),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            _hits, messages = pipeline.run_screening(
+                client=object(), start=dt.date(2026, 8, 1), end=dt.date(2026, 8, 5),
+                selected_rules=["stop_high"],
+            )
+
+        self.assertFalse(any("Lightプラン" in m for m in messages))
 
 
 if __name__ == "__main__":
