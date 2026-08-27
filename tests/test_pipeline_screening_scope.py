@@ -116,15 +116,49 @@ class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
                 client=object(), start=start, end=end, selected_rules=["sales_growth_explosive"],
             )
 
-        five_years_back = today - dt.timedelta(days=365 * 5)
+        # 境界は日数の近似(365*5日)ではなく実際の暦日で計算される
+        # （うるう年を挟むと1〜2日ずれるため。2026-08-27の2巡目の
+        # Codexレビューで指摘・修正）。
+        five_years_back = today.replace(year=today.year - 5)
         self.assertGreaterEqual(captured["start"], five_years_back)
 
-    def test_clamped_lookback_warns_that_some_comparison_data_is_missing(self):
+    def test_clamped_lookback_warns_only_for_rules_whose_history_was_actually_truncated(self):
         # クランプによってAPI呼び出し自体は成功するが、比較用に遡って
         # 取得したかった一部の決算データは実際には取得できていない。
         # 黙って「合致なし」を返すと、本来ヒットすべき銘柄が見逃されている
         # ことにユーザーが気づけないため、メッセージで明示する
         # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
+        # ただし開始日が2年前で影響を受けるのはprofit_doubling（4年分の
+        # 比較が必要）だけで、sales_growth_explosive（1年分で足りる）は
+        # 2年前のstartから見て前年同期データが十分手前にあるため無関係。
+        # 全YOY_LOOKBACK_RULESを一律に警告すると、選択していない・影響も
+        # 受けていないルールについてまで不要な警告が出てしまう
+        # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
+        today = dt.date(2026, 8, 27)
+        start = today - dt.timedelta(days=365 * 2)
+        end = today
+
+        with (
+            patch(f"{_MOD}.today_jst", return_value=today),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            _hits, messages = pipeline.run_screening(
+                client=object(), start=start, end=end,
+                selected_rules=["sales_growth_explosive", "profit_doubling"],
+            )
+
+        matching = [m for m in messages if "Lightプラン" in m]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("経常利益が4年で2倍以上", matching[0])
+        self.assertNotIn("売上高が爆発的に増加", matching[0])
+
+    def test_narrow_lookback_rule_alone_does_not_warn_with_a_two_year_start(self):
+        # profit_doublingを選択していなければ、開始日が2年前でも
+        # sales_growth_explosive自身の前年同期データは十分手前にあり、
+        # クランプの影響を受けないため警告は出ない。
         today = dt.date(2026, 8, 27)
         start = today - dt.timedelta(days=365 * 2)
         end = today
@@ -140,7 +174,7 @@ class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
                 client=object(), start=start, end=end, selected_rules=["sales_growth_explosive"],
             )
 
-        self.assertTrue(any("Lightプラン" in m for m in messages))
+        self.assertFalse(any("Lightプラン" in m for m in messages))
 
     def test_narrow_range_does_not_warn(self):
         with (
@@ -156,6 +190,25 @@ class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
             )
 
         self.assertFalse(any("Lightプラン" in m for m in messages))
+
+
+class TestYearsBefore(unittest.TestCase):
+    def test_ordinary_date_subtracts_calendar_years_exactly(self):
+        self.assertEqual(
+            pipeline._years_before(dt.date(2026, 8, 27), 5), dt.date(2021, 8, 27)
+        )
+
+    def test_leap_day_falls_back_to_feb_28_when_target_year_is_not_leap(self):
+        # 2024年は うるう年だが5年前の2019年は うるう年ではないため、
+        # 2/29はそのまま存在しない。2/28にフォールバックする。
+        self.assertEqual(
+            pipeline._years_before(dt.date(2024, 2, 29), 5), dt.date(2019, 2, 28)
+        )
+
+    def test_leap_day_maps_to_leap_day_when_target_year_is_also_leap(self):
+        self.assertEqual(
+            pipeline._years_before(dt.date(2024, 2, 29), 4), dt.date(2020, 2, 29)
+        )
 
 
 if __name__ == "__main__":
