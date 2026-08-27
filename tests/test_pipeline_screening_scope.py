@@ -75,5 +75,41 @@ class TestSelectedRulesControlsLookback(unittest.TestCase):
         self.assertLess(captured["start"], dt.date(2026, 8, 1))
 
 
+class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
+    def test_two_year_start_with_yoy_rule_does_not_request_beyond_five_years_back(self):
+        # ユーザーが開始日を2年前に設定してsales_growth_explosive
+        # （YOY_LOOKBACK_RULES）を選択すると、遡り取得(約4年+60日)により
+        # 取得開始日が「2年前からさらに約4年」=約6年前になり、Lightプランの
+        # 契約プランの取得可能期間（過去5年）を超えてJ-Quantsに400エラーで
+        # 拒否されていた（実機で確認: 2026-08-27に開始日2024-08-27で
+        # sales_growth_explosiveを選択し"Your subscription covers the
+        # following dates: 2021-08-27 ~"で拒否された）。ユーザー自身が
+        # 選んだstart〜end自体は取得可能な範囲内であるにも関わらず
+        # スクリーニングが実行できなくなるバグの回帰テスト。
+        today = dt.date(2026, 8, 27)
+        start = today - dt.timedelta(days=365 * 2)
+        end = today
+        captured = {}
+
+        def _fake_get_statements_range(client, fetch_start, fetch_end):
+            captured["start"] = fetch_start
+            captured["end"] = fetch_end
+            return pd.DataFrame()
+
+        with (
+            patch(f"{_MOD}.today_jst", return_value=today),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", side_effect=_fake_get_statements_range),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            pipeline.run_screening(
+                client=object(), start=start, end=end, selected_rules=["sales_growth_explosive"],
+            )
+
+        five_years_back = today - dt.timedelta(days=365 * 5)
+        self.assertGreaterEqual(captured["start"], five_years_back)
+
+
 if __name__ == "__main__":
     unittest.main()

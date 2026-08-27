@@ -153,6 +153,23 @@ def run_screening(
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     else:
         statements_fetch_start = start
+    # startがユーザー選択で既に1〜2年以上前の場合、そこからさらに約4年+60日
+    # (comparison_lookback_days)遡ると、Lightプランの契約プランの取得可能
+    # 期間（過去5年、LISTING_LOOKBACK_YEARS）を超えてしまうことがある。
+    # 超えた状態でget_statements_rangeを呼ぶとJ-Quantsから400エラー
+    # （"Your subscription covers the following dates: ..."）で拒否され、
+    # ユーザー自身が選んだstart〜end自体は取得可能な範囲内であるにも
+    # 関わらずスクリーニングが全く実行できなくなる（実機で確認: 2026-08-27に
+    # 開始日を2年前(2024-08-27)に設定しsales_growth_explosiveを選択した
+    # ところ、遡り取得後の開始日が2020-06-29相当になり、5年の境界
+    # (2021-08-27頃)を超えて拒否された）。遡り取得後の開始日を契約プランの
+    # 実際の取得可能期間の下限でクランプする（30日の安全マージン込み。
+    # 5年の境界計算はsrc/jst.pyのtoday_jst()と同じ簡易な365日単位のため、
+    # うるう年のズレ等に対する余裕を持たせる）。
+    earliest_available_statements_date = (
+        today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS) + dt.timedelta(days=30)
+    )
+    statements_fetch_start = max(statements_fetch_start, earliest_available_statements_date)
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
@@ -1001,6 +1018,13 @@ def compute_tenx_scores(
 
     comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
     statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    # run_screeningと同じ理由でLightプランの取得可能期間（過去5年）の下限で
+    # クランプする（startが既に1〜2年以上前だと、遡り取得後の開始日が
+    # 5年の境界を超えてJ-Quantsに400エラーで拒否されるため）。
+    earliest_available_statements_date = (
+        today_jst() - dt.timedelta(days=365 * LISTING_LOOKBACK_YEARS) + dt.timedelta(days=30)
+    )
+    statements_fetch_start = max(statements_fetch_start, earliest_available_statements_date)
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     codes = summary["Code"].astype(str).tolist()
