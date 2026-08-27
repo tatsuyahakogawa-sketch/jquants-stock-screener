@@ -77,6 +77,37 @@ YOY_LOOKBACK_RULES = [
     "profit_doubling",
 ]
 
+# YOY_LOOKBACK_RULES（sales_growth_doublingを除く。専用の別軸取得を持つため）の
+# 各ルールが実際に必要とする比較用の遡り日数。profit_doublingだけが
+# PROFIT_DOUBLING_YEARS(4年)前まで必要で、それ以外は前年同期
+# (330〜400日前、各detect_*のgap_days.between参照)の比較で足りる。
+# run_screeningの決算データ取得は全ルール共通でこの中の最大値
+# (profit_doubling向け)を遡り日数として1回だけ取得するため、Lightプランの
+# 取得可能期間の下限でクランプされた際に「実際にどのルールが影響を
+# 受けたか」を判定するために使う（2026-08-27の2巡目のCodexレビューで
+# 指摘・修正: 修正前はクランプが発生した時点で無条件に全YOY_LOOKBACK_RULES
+# 分の警告を出しており、1年分の比較で足りるルールしか選択していない
+# 場合でも不要な警告が出ていた）。
+_LEGACY_LOOKBACK_RULE_REQUIRED_DAYS = {
+    "sales_growth_major": 365 + 60,
+    "sales_growth_explosive": 365 + 60,
+    "two_quarter_growth": 365 + 60,
+    "profit_doubling": 365 * PROFIT_DOUBLING_YEARS + 60,
+}
+
+
+def _years_before(date: dt.date, years: int) -> dt.date:
+    """dateのちょうどyears年前の暦日を返す（うるう年の2/29はその年に
+    2/29が無ければ2/28にする）。単純な365*years日での近似は、5年間に
+    含まれるうるう日の数だけ実際の暦日と1〜2日ずれる（2026-08-27の
+    Codexレビューで指摘: J-Quantsの契約プラン取得可能期間の起点は暦日
+    ベースのため、日数での近似では境界ちょうどの開示を取りこぼしうる）。
+    """
+    try:
+        return date.replace(year=date.year - years)
+    except ValueError:
+        return date.replace(month=2, day=28, year=date.year - years)
+
 
 def run_screening(
     client: JQuantsClient,
@@ -133,6 +164,7 @@ def run_screening(
     # 最適化により常にFalseになり、デフォルトON(exclude_downward)の除外
     # フィルターが効かなくなる不具合を指摘され、同じ理由でストップ高日付
     # 列も壊れることが分かったため、この最適化自体を取りやめた）。
+    messages: list[str] = []
     quotes_df = endpoints.get_daily_quotes_range(client, start, end)
     # 増収率(YoY)・増収増益2期連続・経常利益4年倍増の各ルールは、対象開示より
     # 1〜4年前の同期(同じCurPerType)の開示と比較する必要がある。statements_df を
@@ -153,6 +185,58 @@ def run_screening(
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     else:
         statements_fetch_start = start
+    # startがユーザー選択で既に1〜2年以上前の場合、そこからさらに約4年+60日
+    # (comparison_lookback_days)遡ると、Lightプランの契約プランの取得可能
+    # 期間（過去5年、LISTING_LOOKBACK_YEARS）を超えてしまうことがある。
+    # 超えた状態でget_statements_rangeを呼ぶとJ-Quantsから400エラー
+    # （"Your subscription covers the following dates: ..."）で拒否され、
+    # ユーザー自身が選んだstart〜end自体は取得可能な範囲内であるにも
+    # 関わらずスクリーニングが全く実行できなくなる（実機で確認: 2026-08-27に
+    # 開始日を2年前(2024-08-27)に設定しsales_growth_explosiveを選択した
+    # ところ、遡り取得後の開始日が2020-06-29相当になり、5年の境界
+    # (2021-08-27頃)を超えて拒否された）。
+    # 365*5日での近似ではなく、実際の「5年前」の暦日で境界を計算する
+    # （うるう年を含む場合、日数での近似は実際の境界より1〜2日新しい側に
+    # ずれ、その1〜2日にちょうど該当する比較用開示だけを取りこぼしうる。
+    # 2026-08-27の2巡目のCodexレビューで指摘・修正）。
+    earliest_available_statements_date = _years_before(today_jst(), LISTING_LOOKBACK_YEARS)
+    if statements_fetch_start < earliest_available_statements_date:
+        # クランプによって、比較用に遡って取得したかった一部の決算データが
+        # 実際には取得できていない。この状態でもAPI呼び出し自体は成功して
+        # しまうため、本来ヒットすべき銘柄が「合致なし」として静かに扱われて
+        # しまう可能性がある。データが揃わず判定できなかったことを
+        # ユーザーに明示する（2026-08-27の2巡目のCodexレビューで指摘・修正）。
+        if needs_lookback:
+            # ただし影響があるのは、実際に必要とする遡り日数が今回
+            # クランプされた範囲を超えているルールだけ（例: 1年分の比較で
+            # 足りるsales_growth_major/explosive/two_quarter_growthは、
+            # startが1年程度前までならクランプが発生していても無関係）。
+            # 選択中の全YOY_LOOKBACK_RULESを一律に警告すると、影響を受けて
+            # いないルールしか選んでいない場合にも不要な警告が出てしまう
+            # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
+            selected_legacy_rules = (
+                legacy_lookback_rules if selected_rules is None
+                else [r for r in legacy_lookback_rules if r in selected_rules]
+            )
+            available_days_from_start = (start - earliest_available_statements_date).days
+            affected_rules = [
+                r for r in selected_legacy_rules
+                if _LEGACY_LOOKBACK_RULE_REQUIRED_DAYS[r] > available_days_from_start
+            ]
+            if affected_rules:
+                affected_labels = "、".join(RULE_LABELS[r] for r in affected_rules)
+                messages.append(
+                    "選択期間の一部（開始日に近い側）は、比較に必要な前年同期以前の"
+                    f"決算データがLightプランの取得可能期間（{earliest_available_statements_date:%Y-%m-%d}"
+                    f"以降）を超えるため取得できませんでした。次の条件は、この期間の"
+                    f"一部で正しく判定できていない可能性があります: {affected_labels}"
+                )
+        else:
+            messages.append(
+                f"開始日がLightプランの取得可能期間（{earliest_available_statements_date:%Y-%m-%d}"
+                "以降）より前のため、それより前の決算データは取得できませんでした。"
+            )
+        statements_fetch_start = earliest_available_statements_date
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
@@ -221,7 +305,6 @@ def run_screening(
     # 誤って促してしまうことを防ぐ。2026-08-24のCodexレビューで指摘・修正）。
     tdnet_rule_requested = selected_rules is None or any(r in TDNET_TITLE_BASED_RULES for r in selected_rules)
 
-    messages: list[str] = []
     try:
         disclosures_df = tdnet_client.get_disclosures_range(start, end)
         if tdnet_rule_requested and len(disclosures_df) > MAX_TDNET_DISCLOSURES_FOR_SCREENING:
@@ -1001,6 +1084,12 @@ def compute_tenx_scores(
 
     comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
     statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
+    # run_screeningと同じ理由でLightプランの取得可能期間（過去5年）の下限で
+    # クランプする（startが既に1〜2年以上前だと、遡り取得後の開始日が
+    # 5年の境界を超えてJ-Quantsに400エラーで拒否されるため）。境界は
+    # 日数での近似ではなく実際の「5年前」の暦日で計算する（run_screening参照）。
+    earliest_available_statements_date = _years_before(today_jst(), LISTING_LOOKBACK_YEARS)
+    statements_fetch_start = max(statements_fetch_start, earliest_available_statements_date)
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     codes = summary["Code"].astype(str).tolist()
