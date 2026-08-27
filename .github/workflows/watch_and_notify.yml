@@ -1,0 +1,72 @@
+name: watch-and-notify
+
+# 平日10:00・13:00 JSTに実行する（UTC 01:00/04:00。JSTはUTC+9で日付を
+# またがないため、UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
+# 日本の祝日はcronでは表現できないため、scripts/watch_and_notify.py内で
+# src.market_calendar.is_market_holiday()により実行時にスキップする。
+on:
+  schedule:
+    - cron: "0 1 * * 1-5"
+    - cron: "0 4 * * 1-5"
+  workflow_dispatch: {}
+
+# 通知済み状態(data/notify_state.json)の変更をリポジトリにコミットして
+# 永続化するために書き込み権限が必要（GitHub Actionsのスケジュール実行は
+# 常にデフォルトブランチ(main)を対象にするため、この自動コミットもmainに
+# 直接行われる。手動でのコード変更ではなく機械的な状態ファイル更新のみのため、
+# CLAUDE.mdのdevelop経由の運用ルールの対象外とする）。
+permissions:
+  contents: write
+
+jobs:
+  watch-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # J-Quants/TDnetの日付単位バルク取得結果のローカルキャッシュ(data/cache/)を
+      # 実行間で永続化する。初回は過去分キャッシュが無いため経常利益比較用の
+      # 遡り取得(約425日分)に時間がかかるが、2回目以降は当日分だけ取得すれば
+      # よくなる（CLAUDE.md「未決事項」参照。同じ日付単位バルク取得+ローカル
+      # キャッシュという設計を使っている）。exactキーは常にmissさせて
+      # 毎回新しいキャッシュを保存し、restore-keysで直前の内容を復元する。
+      - uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: jquants-data-cache-${{ github.run_id }}
+          restore-keys: |
+            jquants-data-cache-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # watch_and_notify.pyは、Discord送信自体は成功したが一部のチェック
+      # （JPX新規上場情報の取得等）が失敗した場合、その旨をDiscordに送った
+      # 上で非ゼロ終了する（CI上でエラーに気付けるようにするため）。
+      # ここでジョブを即失敗させるとこの後の状態コミットがスキップされ、
+      # 成功した分の通知まで次回再送されてしまうため、いったん
+      # continue-on-errorで先に進め、状態コミット後に改めて失敗させる。
+      - name: Run watch_and_notify
+        id: run
+        continue-on-error: true
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scripts/watch_and_notify.py
+
+      - name: Commit updated notify state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/notify_state.json
+          git diff --staged --quiet || git commit -m "chore: update notify state"
+          git push
+
+      - name: Fail job if watch_and_notify reported an error
+        if: steps.run.outcome == 'failure'
+        run: exit 1

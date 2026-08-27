@@ -33,6 +33,7 @@ RULE_LABELS = {
     "stock_consolidation": "株式併合の発表",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
+    "profit_growth_major": "経常利益が前年同期比+50%以上（1.5倍以上）",
     "pbr_low": "PBR1倍以下",
     "two_quarter_growth": "四半期決算2期連続増収増益",
     "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表",
@@ -75,6 +76,7 @@ YOY_LOOKBACK_RULES = [
     "sales_growth_doubling",
     "two_quarter_growth",
     "profit_doubling",
+    "profit_growth_major",
 ]
 
 # YOY_LOOKBACK_RULES（sales_growth_doublingを除く。専用の別軸取得を持つため）の
@@ -93,6 +95,7 @@ _LEGACY_LOOKBACK_RULE_REQUIRED_DAYS = {
     "sales_growth_explosive": 365 + 60,
     "two_quarter_growth": 365 + 60,
     "profit_doubling": 365 * PROFIT_DOUBLING_YEARS + 60,
+    "profit_growth_major": 365 + 60,
 }
 
 
@@ -245,6 +248,7 @@ def run_screening(
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
         rules.detect_profit_doubling(statements_df),
+        rules.detect_profit_growth_major(statements_df),
         rules.detect_low_pbr(statements_df, quotes_df),
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),

@@ -26,6 +26,7 @@ from src.config import (
     EQUITY_RATIO_THRESHOLD,
     PROFIT_DOUBLING_YEARS,
     PROFIT_DOUBLING_MULTIPLE,
+    PROFIT_GROWTH_MAJOR_THRESHOLD,
     DOWNWARD_REVISION_THRESHOLD,
     PBR_LOW_THRESHOLD,
 )
@@ -529,6 +530,46 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
                     ),
                 })
     return pd.DataFrame(hits, columns=["Code", "Date", "rule", "detail"])
+
+
+def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """同一の決算期タイプ(CurPerType)の前年同期と比べ、経常利益(OdP)が
+    +50%以上(1.5倍以上)に増えた開示の一覧。scripts/watch_and_notify.py専用
+    （比較期間が前年同期(1年)である点がPROFIT_DOUBLING_YEARS(4年)比較の
+    profit_doublingと異なる。detect_sales_growthと同じ考え方で、売上高の
+    代わりに経常利益で判定する）。
+
+    前年同期が赤字（0以下）の場合は「何倍」という比率に意味が無いため対象外
+    とする（黒字転換はdetect_downward_revisionの逆で別軸の話であり、この
+    ルールでは扱わない）。
+    """
+    required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_ORDINARY_PROFIT, STMT_DISCLOSED_DATE}
+    if statements_df.empty or not required.issubset(statements_df.columns):
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+
+    df = statements_df.copy()
+    df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
+    df = df.dropna(subset=[STMT_ORDINARY_PROFIT])
+    df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
+    df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
+
+    df["prev_ordinary_profit"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_ORDINARY_PROFIT].shift(1)
+    df["prev_period_end"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_PERIOD_END].shift(1)
+
+    valid = df["prev_ordinary_profit"].notna() & (df["prev_ordinary_profit"] > 0)
+    gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
+    valid &= gap_days.between(330, 400)
+    valid &= _is_primary_mask(df)
+
+    growth = (df[STMT_ORDINARY_PROFIT] - df["prev_ordinary_profit"]) / df["prev_ordinary_profit"]
+    df["growth_rate"] = growth
+    df["detail"] = "前年同期比 経常利益 " + (df["growth_rate"] * 100).round(1).astype(str) + "% 増"
+
+    hit = df.loc[valid & (growth >= PROFIT_GROWTH_MAJOR_THRESHOLD)].copy()
+    hit["rule"] = "profit_growth_major"
+    return hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
+        columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
+    )
 
 
 def detect_downward_revision(statements_df: pd.DataFrame) -> pd.DataFrame:

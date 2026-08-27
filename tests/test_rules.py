@@ -124,6 +124,46 @@ class TestDetectSalesGrowth(unittest.TestCase):
         self.assertNotIn("sales_growth_doubling", set(result["rule"]))
 
 
+class TestDetectProfitGrowthMajor(unittest.TestCase):
+    def test_growth_over_threshold_is_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 経常利益 +60%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["rule"], "profit_growth_major")
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-10"))
+
+    def test_growth_under_threshold_not_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 13),  # 経常利益 +30%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_previous_year_loss_is_not_hit(self):
+        # 前年同期が赤字（0以下）の場合、「何倍」という比率に意味が無いため対象外
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, -10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_hit_uses_only_primary_rows(self):
+        # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16, is_primary=True),
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-10"))
+
+
 class TestDetectCurrentSalesDoubling(unittest.TestCase):
     def test_growth_over_threshold_on_latest_disclosure_is_hit(self):
         statements = pd.DataFrame([

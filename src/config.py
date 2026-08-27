@@ -29,6 +29,11 @@ EQUITY_RATIO_THRESHOLD = 0.6
 PROFIT_DOUBLING_YEARS = 4
 PROFIT_DOUBLING_MULTIPLE = 2.0
 
+# 経常利益の前年同期比増加率のしきい値（scripts/watch_and_notify.py向け。
+# 「1.5倍以上」= +50%以上。sales_growth_major/explosiveと同じ考え方で、
+# 比較期間はPROFIT_DOUBLING_YEARSの4年ではなく前年同期(1年)）
+PROFIT_GROWTH_MAJOR_THRESHOLD = 0.50
+
 # 業績予想の下方修正を検知するしきい値（前回予想からどれだけ下がったら「下方修正」とみなすか）
 DOWNWARD_REVISION_THRESHOLD = 0.0  # 0 = 1円でも下がったら対象
 

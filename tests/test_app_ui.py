@@ -31,6 +31,7 @@ _EXPECTED_PERFORMANCE_RULES = {
     "earnings_beat",
     "two_quarter_growth",
     "profit_doubling",
+    "profit_growth_major",
 }
 
 
