@@ -163,6 +163,29 @@ class TestDetectProfitGrowthMajor(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-10"))
 
+    def test_correction_below_threshold_supersedes_original_hit(self):
+        # 同一期(Code, CurPerType, CurPerEn)が訂正決算短信で再度開示された
+        # 場合、開示日が最新の行(訂正後の値)だけを比較対象にする。訂正前の
+        # 値がgroupby().shift(1)の並び順次第でヒットに残ってしまわないことを
+        # 確認する（2026-08-27のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 訂正前 +60%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, 11),  # 訂正後 +10%（閾値未満）
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_correction_above_threshold_is_hit_with_corrected_date(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 12),  # 訂正前 +20%（閾値未満）
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, 16),  # 訂正後 +60%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-20"))
+
 
 class TestDetectCurrentSalesDoubling(unittest.TestCase):
     def test_growth_over_threshold_on_latest_disclosure_is_hit(self):

@@ -542,6 +542,16 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     前年同期が赤字（0以下）の場合は「何倍」という比率に意味が無いため対象外
     とする（黒字転換はdetect_downward_revisionの逆で別軸の話であり、この
     ルールでは扱わない）。
+
+    J-Quantsは「1開示=1行」だが、同一期(Code, CurPerType, CurPerEn)について
+    訂正決算短信等で後から再度開示されることがあり、その場合は同じ期の行が
+    複数行存在する。愚直にgroupby().shift(1)すると、どちらが「前の期」に
+    なるかがAPIの返却順（実質的には元データの並び順）に依存してしまい、
+    訂正で閾値を下回った後でも訂正前の値でヒットし続けたり、同一期の重複行
+    同士が0日ギャップで前後関係にされたりする不具合になる
+    （detect_current_sales_doublingと同じ問題。2026-08-27のCodexレビューで
+    指摘）。比較の計算に入る前に、同一期内は最新の開示日(DiscDate)の行だけに
+    絞る。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_ORDINARY_PROFIT, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
@@ -551,6 +561,12 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
     df = df.dropna(subset=[STMT_ORDINARY_PROFIT])
     df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
+    df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
+    df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
+
+    key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
+    df = df.sort_values(STMT_DISCLOSED_DATE)
+    df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
     df["prev_ordinary_profit"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_ORDINARY_PROFIT].shift(1)

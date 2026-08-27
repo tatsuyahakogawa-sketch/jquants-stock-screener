@@ -8,7 +8,9 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock, patch
 
-from src.discord_notify import send_discord_message
+import requests
+
+from src.discord_notify import DiscordNotifyError, send_discord_message
 
 _MOD = "src.discord_notify"
 
@@ -45,6 +47,23 @@ class TestSendDiscordMessage(unittest.TestCase):
         with patch(f"{_MOD}.requests.post", return_value=mock_resp):
             with self.assertRaises(RuntimeError):
                 send_discord_message("https://example.com/webhook", "hello")
+
+    def test_http_error_does_not_leak_webhook_url(self):
+        # requests.HTTPErrorの既定メッセージにはWebhook URL（秘密のトークンを
+        # 含む）がそのまま入るため、呼び出し側に伝播する例外からは除去する
+        # （2026-08-27のCodexレビューで指摘・修正）。
+        secret_url = "https://discord.com/api/webhooks/123/super-secret-token"
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            f"401 Client Error: Unauthorized for url: {secret_url}"
+        )
+        with patch(f"{_MOD}.requests.post", return_value=mock_resp):
+            with self.assertRaises(DiscordNotifyError) as ctx:
+                send_discord_message(secret_url, "hello")
+
+        self.assertNotIn("super-secret-token", str(ctx.exception))
+        self.assertIn("401", str(ctx.exception))
 
 
 if __name__ == "__main__":

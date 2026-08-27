@@ -83,6 +83,23 @@ class TestParseNewListingTable(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_new_listing_table("<html><body><p>no table here</p></body></html>")
 
+    def test_rows_present_but_all_unparseable_raises(self):
+        # rowspanを持つtrは見つかるが、セル構成の変更等で日付・コードが
+        # 1件も取れなかった場合、空のDataFrameを「新規上場0件」として黙って
+        # 返すと実際にある上場承認・本日上場を見逃す（2026-08-27のCodexレビューで
+        # 指摘・修正）。
+        html = """
+        <html><body><table><tbody>
+        <tr>
+          <td rowspan="2">日付形式が変わって取れない</td>
+          <td rowspan="2"><a href="https://example.com">何かの会社</a></td>
+        </tr>
+        <tr><td>スタンダード</td></tr>
+        </tbody></table></body></html>
+        """
+        with self.assertRaises(ValueError):
+            parse_new_listing_table(html)
+
 
 class TestDetectNewListingApprovals(unittest.TestCase):
     def test_approval_on_or_after_since_is_included(self):

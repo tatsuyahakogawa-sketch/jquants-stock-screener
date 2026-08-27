@@ -36,10 +36,26 @@ def _split_into_chunks(text: str, limit: int) -> list[str]:
     return chunks
 
 
+class DiscordNotifyError(RuntimeError):
+    pass
+
+
 def send_discord_message(webhook_url: str, content: str) -> None:
     """Discord Webhookにメッセージを送信する。2000文字を超える場合は
     複数メッセージに分割して順に送信する。
     """
     for chunk in _split_into_chunks(content, _DISCORD_CONTENT_LIMIT):
         resp = requests.post(webhook_url, json={"content": chunk}, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            # requests.HTTPErrorの既定のメッセージにはリクエストURL全体
+            # （Webhookのトークンを含む）がそのまま入るため、そのまま送出すると
+            # 呼び出し側のログ・トレースバックに秘密情報が残ってしまう
+            # （GitHub Actions上は登録済みシークレットの値をログから自動マスク
+            # するが、ローカル実行等その仕組みが無い環境では平文で出力される。
+            # 2026-08-27のCodexレビューで指摘・修正）。URLを含まない
+            # メッセージだけの例外に置き換える。
+            raise DiscordNotifyError(
+                f"Discord Webhookへの送信に失敗しました（HTTP {resp.status_code}）"
+            ) from None

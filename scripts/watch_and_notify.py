@@ -119,53 +119,44 @@ def _to_date(value) -> dt.date:
     return value
 
 
-def _fetch_market_wide_hits(client: JQuantsClient, today: dt.date) -> tuple[pd.DataFrame, dict[str, str]]:
-    """ストップ高・株式分割/併合・経常利益急増の候補を、直近LOOKBACK_DAYS分まとめて取得する。
+def _hits_to_candidates(
+    hits: list[pd.DataFrame],
+    name_map: dict[str, str],
+    window_start: dt.date,
+    today: dt.date,
+    state: dict,
+    seen_keys: set[str],
+) -> list[Candidate]:
+    """検出結果のDataFrame群を、まだ通知していないCandidateのリストに変換する。
 
-    重複排除は呼び出し側(main)が通知済み状態と突き合わせて行うため、ここでは
-    LOOKBACK_DAYS window内のヒットをそのまま返す。
+    重複排除は、前回までに通知済みの状態(state)に加えて、今回の実行内で
+    既に候補になったキー(seen_keys)も見る。同一銘柄・同一ルールで日付が
+    同じ複数行（例: 同日中に original disclosure と訂正が両方出た場合）が
+    1回のhits集合の中に混ざっていても、stateへの反映はDiscord送信成功後まで
+    行わないため、seen_keysが無いとstate側のチェックだけでは二重に候補へ
+    入ってしまう（2026-08-27のCodexレビューで指摘・修正）。
     """
-    start = today - dt.timedelta(days=LOOKBACK_DAYS)
-
-    listed_info = endpoints.get_listed_info(client)
-    name_map: dict[str, str] = {}
-    if not listed_info.empty and "Code" in listed_info.columns and "CoName" in listed_info.columns:
-        name_map = dict(zip(listed_info["Code"].astype(str), listed_info["CoName"]))
-
-    quotes_df = endpoints.get_daily_quotes_range(client, start, today)
-    disclosures_df = tdnet_client.get_disclosures_range(start, today)
-    statements_df = endpoints.get_statements_range(
-        client, today - dt.timedelta(days=PROFIT_GROWTH_LOOKBACK_DAYS), today
-    )
-
-    hits = [
-        rules.detect_stop_high(quotes_df),
-        rules.detect_stock_split(disclosures_df),
-        rules.detect_profit_growth_major(statements_df),
-    ]
     hits = [h for h in hits if not h.empty]
     if not hits:
-        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"]), name_map
+        return []
 
     result = pd.concat(hits, ignore_index=True)
     result["Date"] = pd.to_datetime(result["Date"])
-    # 経常利益急増の比較用に広く取得したstatements_dfの過去分のヒットが
-    # そのまま混ざらないよう、実際の開示・イベント日がLOOKBACK_DAYS以内の
-    # ものだけに絞る。
-    in_range = (result["Date"] >= pd.Timestamp(start)) & (result["Date"] < pd.Timestamp(today) + pd.Timedelta(days=1))
-    return result.loc[in_range].reset_index(drop=True), name_map
+    in_range = (
+        (result["Date"] >= pd.Timestamp(window_start))
+        & (result["Date"] < pd.Timestamp(today) + pd.Timedelta(days=1))
+    )
+    result = result.loc[in_range]
 
-
-def _market_wide_candidates(client: JQuantsClient, today: dt.date, state: dict) -> list[Candidate]:
-    hits, name_map = _fetch_market_wide_hits(client, today)
     candidates = []
-    for _, row in hits.sort_values(["Date", "Code"]).iterrows():
+    for _, row in result.sort_values(["Date", "Code"]).iterrows():
         code = str(row["Code"])
         date = _to_date(row["Date"])
         rule = row["rule"]
         key = f"{rule}|{code}|{date.isoformat()}"
-        if key in state["notified"]:
+        if key in state["notified"] or key in seen_keys:
             continue
+        seen_keys.add(key)
         label = MARKET_RULE_LABELS.get(rule, rule)
         name = name_map.get(code, "")
         message = f"{label}\n{code} {name}\n{row['detail']}（{date:%Y-%m-%d}）"
@@ -173,7 +164,76 @@ def _market_wide_candidates(client: JQuantsClient, today: dt.date, state: dict) 
     return candidates
 
 
-def _ipo_candidates(today: dt.date, state: dict) -> tuple[list[Candidate], str | None]:
+def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
+    """J-Quants由来: ストップ高・経常利益急増。TDnetとは独立して失敗しうる
+    （TDnetの非公式ミラーは個人運営で不安定なことがある。CLAUDE.md参照）ため、
+    このチェック全体を専用のtry/exceptで囲み、TDnet側の失敗と互いに
+    影響しないようにする（2026-08-27のCodexレビューで指摘・修正）。
+    """
+    start = today - dt.timedelta(days=LOOKBACK_DAYS)
+    try:
+        client = JQuantsClient()
+
+        name_map: dict[str, str] = {}
+        try:
+            listed_info = endpoints.get_listed_info(client)
+            if not listed_info.empty and "Code" in listed_info.columns and "CoName" in listed_info.columns:
+                name_map = dict(zip(listed_info["Code"].astype(str), listed_info["CoName"]))
+        except Exception:
+            logger.warning("上場銘柄マスタの取得に失敗しました（会社名なしで続行します）", exc_info=True)
+
+        # 株価四本値は営業日の大引け後にしか当日分が更新されない
+        # (CLAUDE.md参照)。10:00/13:00 JSTはどちらも大引け(15:00頃)より前で、
+        # 当日を含めて取得すると空のレスポンスが返る。get_daily_quotes_by_date
+        # は日付だけの恒久キーでキャッシュし、get_statements_by_dateのような
+        # 当日限定のam/pm一時キーを持たないため、この空レスポンスがそのまま
+        # 恒久的にキャッシュされてしまい、大引け後に実際のデータが揃っても
+        # 二度と取得されずストップ高を取りこぼす（2026-08-27のCodexレビューで
+        # 指摘）。当日はそもそもデータが存在しないため、最初から対象に含めない。
+        quotes_df = endpoints.get_daily_quotes_range(client, start, today - dt.timedelta(days=1))
+        statements_df = endpoints.get_statements_range(
+            client, today - dt.timedelta(days=PROFIT_GROWTH_LOOKBACK_DAYS), today
+        )
+        hits = [
+            rules.detect_stop_high(quotes_df),
+            rules.detect_profit_growth_major(statements_df),
+        ]
+    except Exception as e:
+        logger.exception("J-Quants由来の条件チェックに失敗しました")
+        return [], f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}"
+
+    candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
+    return candidates, None
+
+
+def _tdnet_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
+    """TDnet由来: 株式分割・株式併合。J-Quantsとは独立したtry/exceptで囲む
+    （_jquants_candidates docstring参照）。
+    """
+    start = today - dt.timedelta(days=LOOKBACK_DAYS)
+    try:
+        # force_refresh=True: 当日分の開示はまだ全件公開されていない可能性が
+        # あり、一度キャッシュされると同じ(start, today)の範囲指定では
+        # その不完全な結果を返し続けてしまう（tdnet_client.get_disclosures_range
+        # のdocstring参照）。このバッチは同じ(start, today)を平日10:00と13:00の
+        # 2回呼ぶため、force_refreshしないと13:00の実行が10:00時点の結果を
+        # 再利用してしまい、その間に出た分割・併合の発表を取りこぼす
+        # （2026-08-27のCodexレビューで指摘・修正）。
+        disclosures_df = tdnet_client.get_disclosures_range(start, today, force_refresh=True)
+        hits = [rules.detect_stock_split(disclosures_df)]
+
+        name_map: dict[str, str] = {}
+        if not disclosures_df.empty and {"company_code", "company_name"}.issubset(disclosures_df.columns):
+            name_map = dict(zip(disclosures_df["company_code"].astype(str), disclosures_df["company_name"]))
+    except Exception as e:
+        logger.exception("TDnet由来の条件チェックに失敗しました")
+        return [], f"⚠️ 株式分割/併合のチェックに失敗しました（TDnet取得エラー）: {e}"
+
+    candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
+    return candidates, None
+
+
+def _ipo_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
     """(候補一覧, エラーメッセージ or None) を返す。"""
     try:
         listings = jpx_new_listings.fetch_new_listing_table()
@@ -187,8 +247,9 @@ def _ipo_candidates(today: dt.date, state: dict) -> tuple[list[Candidate], str |
     )
     for _, row in approvals.iterrows():
         key = f"ipo_approval|{row['Code']}|{row['ApprovalDate'].isoformat()}"
-        if key in state["notified"]:
+        if key in state["notified"] or key in seen_keys:
             continue
+        seen_keys.add(key)
         message = (
             f"🆕 新規上場承認\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場承認日: {row['ApprovalDate']:%Y-%m-%d} / 上場予定日: {row['ListingDate']:%Y-%m-%d}"
@@ -198,8 +259,9 @@ def _ipo_candidates(today: dt.date, state: dict) -> tuple[list[Candidate], str |
     listed_today = jpx_new_listings.detect_listings_today(listings, today)
     for _, row in listed_today.iterrows():
         key = f"ipo_listed|{row['Code']}|{row['ListingDate'].isoformat()}"
-        if key in state["notified"]:
+        if key in state["notified"] or key in seen_keys:
             continue
+        seen_keys.add(key)
         message = f"🎉 本日新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）"
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
 
@@ -221,22 +283,24 @@ def main() -> int:
     state = _load_state()
     had_error = False
     error_messages: list[str] = []
+    seen_keys: set[str] = set()
 
-    market_candidates: list[Candidate] = []
-    try:
-        client = JQuantsClient()
-        market_candidates = _market_wide_candidates(client, today, state)
-    except Exception as e:
-        logger.exception("市場全体の条件チェックに失敗しました")
+    jquants_candidates, jquants_error = _jquants_candidates(today, state, seen_keys)
+    if jquants_error:
         had_error = True
-        error_messages.append(f"⚠️ ストップ高・株式分割/併合・経常利益急増のチェックに失敗しました: {e}")
+        error_messages.append(jquants_error)
 
-    ipo_candidates, ipo_error = _ipo_candidates(today, state)
+    tdnet_candidates, tdnet_error = _tdnet_candidates(today, state, seen_keys)
+    if tdnet_error:
+        had_error = True
+        error_messages.append(tdnet_error)
+
+    ipo_candidates, ipo_error = _ipo_candidates(today, state, seen_keys)
     if ipo_error:
         had_error = True
         error_messages.append(ipo_error)
 
-    all_candidates = market_candidates + ipo_candidates
+    all_candidates = jquants_candidates + tdnet_candidates + ipo_candidates
     body_messages = [c.message for c in all_candidates] + error_messages
 
     if not body_messages:

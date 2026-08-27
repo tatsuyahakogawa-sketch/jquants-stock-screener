@@ -131,6 +131,16 @@ def parse_new_listing_table(html_text: str) -> pd.DataFrame:
             "ApprovalDate": approval_date,
         })
 
+    if not records:
+        # rows自体は見つかったが、セル構成の変更等で1件も抽出できなかった
+        # 場合。ここで空のDataFrameを黙って返すと「新規上場0件」と区別が
+        # つかず、実際には上場承認・本日上場があるのに気付けなくなる
+        # （2026-08-27のCodexレビューで指摘）。
+        raise ValueError(
+            "JPX新規上場会社情報ページの表から1件も抽出できませんでした"
+            "（ページのHTML構造が変更された可能性があります）。"
+        )
+
     return pd.DataFrame(records, columns=NEW_LISTINGS_COLUMNS)
 
 
