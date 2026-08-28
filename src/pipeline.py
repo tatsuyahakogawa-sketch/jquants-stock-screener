@@ -183,8 +183,21 @@ def run_screening(
     # 使われないデータのために約4年分遡った開始日を計算してしまう）。
     legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
     needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
+    # 選択中の legacy_lookback_rules だけを見て、実際に必要な遡り日数の最大値
+    # だけ遡る。以前は選択内容に関わらず一律でprofit_doubling向けの
+    # 365*PROFIT_DOUBLING_YEARS+60日(約4年)を遡っていたため、1年分の比較で
+    # 足りるsales_growth_major/explosive/two_quarter_growth/profit_growth_major
+    # だけを選んだ場合でも、使われない3年分のデータのために大幅に余計な
+    # 取得時間（冷えたキャッシュでLightプランの60件/分の制限下、数十分単位）が
+    # かかっていた（2026-08-27の3巡目のCodexレビューで指摘・修正。
+    # affected_rulesの判定でも同じ選択集合を使うため、後段で再計算せず
+    # ここで求めた値を使い回す）。
+    selected_legacy_rules = (
+        legacy_lookback_rules if selected_rules is None
+        else [r for r in legacy_lookback_rules if r in selected_rules]
+    )
     if needs_lookback:
-        comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        comparison_lookback_days = max(_LEGACY_LOOKBACK_RULE_REQUIRED_DAYS[r] for r in selected_legacy_rules)
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     else:
         statements_fetch_start = start
@@ -216,11 +229,9 @@ def run_screening(
             # startが1年程度前までならクランプが発生していても無関係）。
             # 選択中の全YOY_LOOKBACK_RULESを一律に警告すると、影響を受けて
             # いないルールしか選んでいない場合にも不要な警告が出てしまう
-            # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
-            selected_legacy_rules = (
-                legacy_lookback_rules if selected_rules is None
-                else [r for r in legacy_lookback_rules if r in selected_rules]
-            )
+            # （2026-08-27の2巡目のCodexレビューで指摘・修正。
+            # selected_legacy_rulesは上のcomparison_lookback_days計算と
+            # 同じものを使い回す）。
             available_days_from_start = (start - earliest_available_statements_date).days
             affected_rules = [
                 r for r in selected_legacy_rules

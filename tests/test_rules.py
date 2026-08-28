@@ -176,6 +176,21 @@ class TestDetectProfitGrowthMajor(unittest.TestCase):
         result = rules.detect_profit_growth_major(statements)
         self.assertTrue(result.empty)
 
+    def test_same_day_tie_breaks_deterministically_by_input_order(self):
+        # 同一期(Code, CurPerType, CurPerEn)が同一日に複数回開示された場合
+        # （同日中の訂正等）、DiscDateだけではタイになる。安定ソート
+        # (kind="stable")により、取得元が返した順序で最後に並んでいる行
+        # （＝APIの返却順で後に処理された、より新しい情報とみなせる行）が
+        # 決定的に優先されることを確認する（2026-08-27の3巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 12),  # 同日1件目 +20%（閾値未満）
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 同日2件目 +60%（入力順で後）
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+
     def test_correction_above_threshold_is_hit_with_corrected_date(self):
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),

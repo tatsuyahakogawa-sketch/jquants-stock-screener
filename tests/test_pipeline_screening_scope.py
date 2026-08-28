@@ -83,6 +83,16 @@ class TestSelectedRulesControlsLookback(unittest.TestCase):
         captured = _run_with_capture(selected_rules=["stop_high", "sales_growth_explosive"])
         self.assertLess(captured["start"], dt.date(2026, 8, 1))
 
+    def test_selecting_only_a_one_year_rule_does_not_fetch_four_years(self):
+        # 以前は選択内容に関わらず一律でprofit_doubling向けの約4年分を
+        # 遡っていたため、1年分の比較で足りるsales_growth_explosive等だけを
+        # 選んだ場合でも、使われない約3年分のデータのために大幅に余計な
+        # 取得時間がかかっていた（2026-08-27の3巡目のCodexレビューで
+        # 指摘・修正）。
+        captured = _run_with_capture(selected_rules=["sales_growth_explosive"])
+        expected_start = dt.date(2026, 8, 1) - dt.timedelta(days=365 + 60)
+        self.assertEqual(captured["start"], expected_start)
+
 
 class TestWideLookbackDoesNotExceedLightPlanRetention(unittest.TestCase):
     def test_two_year_start_with_yoy_rule_does_not_request_beyond_five_years_back(self):

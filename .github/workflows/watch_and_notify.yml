@@ -10,11 +10,7 @@ on:
     - cron: "0 4 * * 1-5"
   workflow_dispatch: {}
 
-# 通知済み状態(data/notify_state.json)の変更をリポジトリにコミットして
-# 永続化するために書き込み権限が必要（GitHub Actionsのスケジュール実行は
-# 常にデフォルトブランチ(main)を対象にするため、この自動コミットもmainに
-# 直接行われる。手動でのコード変更ではなく機械的な状態ファイル更新のみのため、
-# CLAUDE.mdのdevelop経由の運用ルールの対象外とする）。
+# 通知済み状態を別ブランチ(notify-state)にpushするために書き込み権限が必要。
 permissions:
   contents: write
 
@@ -44,12 +40,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 通知済み状態・ウォーターマーク(data/notify_state.json)はmainには
+      # 置かない。このリポジトリはmainへのpushでStreamlit Community Cloudが
+      # 自動再デプロイされるため、機械的な状態更新のたびにmainへコミットすると
+      # 平日10:00/13:00に無関係な再デプロイが繰り返し走ってしまう
+      # （2026-08-27の3巡目のCodexレビューで指摘・修正）。代わりに
+      # notify-stateという専用ブランチだけに保存する（初回はブランチが
+      # 存在しないため、その場合は空の状態から開始する）。
+      - name: Restore notify state from the notify-state branch
+        run: |
+          mkdir -p data
+          # FETCH_HEADは一時的な参照で、fetchが失敗しても以前の(actions/checkout
+          # による)内容が残ってしまい「ブランチが存在するか」の判定に使えない。
+          # refs/remotes/origin/notify-state という名前付きの参照へ明示的に
+          # fetchし、後段のpushステップでも同じ参照で存在確認する。
+          if git fetch origin notify-state:refs/remotes/origin/notify-state; then
+            git show origin/notify-state:notify_state.json > data/notify_state.json
+          else
+            echo '{"notified": {}}' > data/notify_state.json
+          fi
+
       # watch_and_notify.pyは、Discord送信自体は成功したが一部のチェック
       # （JPX新規上場情報の取得等）が失敗した場合、その旨をDiscordに送った
       # 上で非ゼロ終了する（CI上でエラーに気付けるようにするため）。
-      # ここでジョブを即失敗させるとこの後の状態コミットがスキップされ、
+      # ここでジョブを即失敗させるとこの後の状態push がスキップされ、
       # 成功した分の通知まで次回再送されてしまうため、いったん
-      # continue-on-errorで先に進め、状態コミット後に改めて失敗させる。
+      # continue-on-errorで先に進め、状態push後に改めて失敗させる。
       - name: Run watch_and_notify
         id: run
         continue-on-error: true
@@ -58,14 +74,29 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python scripts/watch_and_notify.py
 
-      - name: Commit updated notify state
+      # notify-stateブランチには常にnotify_state.json 1個だけを含むコミットを
+      # 積む（gitのプラミングコマンドでツリー・コミットを直接組み立てることで、
+      # mainのファイル一式をチェックアウトし直す必要が無い）。
+      - name: Push updated notify state to the notify-state branch (never to main)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/notify_state.json
-          git diff --staged --quiet || git commit -m "chore: update notify state"
-          git push
+          BLOB=$(git hash-object -w data/notify_state.json)
+          if git rev-parse --verify -q origin/notify-state >/dev/null; then
+            PARENT=$(git rev-parse origin/notify-state)
+            OLD_BLOB=$(git rev-parse "origin/notify-state:notify_state.json" 2>/dev/null || true)
+            if [ "$BLOB" = "$OLD_BLOB" ]; then
+              echo "notify state unchanged, skipping push"
+              exit 0
+            fi
+            TREE=$(printf '100644 blob %s\tnotify_state.json\n' "$BLOB" | git mktree)
+            COMMIT=$(git commit-tree "$TREE" -p "$PARENT" -m "chore: update notify state")
+          else
+            TREE=$(printf '100644 blob %s\tnotify_state.json\n' "$BLOB" | git mktree)
+            COMMIT=$(git commit-tree "$TREE" -m "chore: initialize notify state")
+          fi
+          git push origin "$COMMIT:refs/heads/notify-state"
 
       - name: Fail job if watch_and_notify reported an error
         if: steps.run.outcome == 'failure'

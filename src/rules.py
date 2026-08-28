@@ -384,8 +384,16 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     # すると、逆にこのケースを取りこぼしてしまう。2026-08-25の6巡目の
     # Codexレビューで一度「実際の開示を優先」で修正したが、7巡目のレビューで
     # このケースを指摘され、開示日ベースの比較に修正した）。
+    # 同一日に複数回開示された場合（同日中の訂正等）、DiscDateだけでは
+    # タイになる。pandasのsort_values既定のquicksortはタイの並び順を
+    # 保証しないため、kind="stable"で明示的に安定ソートし、取得元
+    # (get_all_pages)が返した順序（実務上はより後に処理された開示ほど
+    # 後ろに来ると期待できる）をタイブレークとして使う。J-Quantsの
+    # /fins/summaryにはDiscDateより細かい時刻・通番の列が無いため、
+    # これが現状得られる最善のタイブレークになる（2026-08-27の3巡目の
+    # Codexレビューで指摘・修正）。
     key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
-    df = df.sort_values(STMT_DISCLOSED_DATE)
+    df = df.sort_values(STMT_DISCLOSED_DATE, kind="stable")
     df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
@@ -564,8 +572,13 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
     df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
 
+    # 同一日に複数回開示された場合（同日中の訂正等）、DiscDateだけではタイに
+    # なる。pandasのsort_values既定のquicksortはタイの並び順を保証しない
+    # ため、kind="stable"で明示的に安定ソートし、取得元(get_all_pages)が
+    # 返した順序をタイブレークとして使う（detect_current_sales_doublingと
+    # 同じ対応。2026-08-27の3巡目のCodexレビューで指摘・修正）。
     key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
-    df = df.sort_values(STMT_DISCLOSED_DATE)
+    df = df.sort_values(STMT_DISCLOSED_DATE, kind="stable")
     df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 

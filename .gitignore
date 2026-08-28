@@ -3,6 +3,10 @@
 __pycache__/
 *.pyc
 data/cache/
+# scripts/watch_and_notify.pyの通知済み状態。GitHub Actionsのワークフロー
+# (.github/workflows/watch_and_notify.yml)がnotify-stateブランチだけに保存する
+# （mainへのpushはStreamlit Community Cloudの不要な再デプロイを招くため）。
+data/notify_state.json
 .streamlit/secrets.toml
 
 # 本プロジェクトと無関係な個人ファイル（コードベースに含めない）

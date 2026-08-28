@@ -28,12 +28,25 @@ GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
     ため、run_screening()を経由せずrules.py・endpoints.pyの関数を直接
     呼び出す。
   - Discord送信が失敗した場合に「送信済みとして記録されたのに実際には
-    届いていない」状態を避けるため、通知済み状態(data/notify_state.json)への
-    書き込みはDiscordへの送信が成功した後にだけ行う。
+    届いていない」状態を避けるため、通知(候補)は1件ずつ個別のメッセージで
+    送信し、成功するたびに直ちに通知済みとして記録・保存する（まとめて1通に
+    送ると、2000文字超で複数リクエストに分割された際、途中で失敗した時点で
+    それ以前に届いた分もまとめて未記録のままになり、次回実行で二重に届いて
+    しまう。2026-08-27のCodexレビューで指摘・修正）。
   - GitHub Actionsの各実行は使い捨てのコンテナで、data/以下の変更は
     ワークフロー側でリポジトリにコミットしない限り次回実行時に残らない。
-    通知済み状態は日を跨いで重複通知を防ぐために必須のため、
-    ワークフロー側でこのファイルの変更をコミット・pushする。
+    通知済み状態・ウォーターマーク（state["jquants_watermark"]等。前回
+    成功した走査の開始日。_scan_start参照）は日を跨いで重複通知・取りこぼしを
+    防ぐために必須のため、ワークフロー側でこの変更をコミット・pushする
+    （mainに直接コミットするとStreamlit Cloudの自動デプロイが不要にトリガー
+    されるため、mainとは別のnotify-stateブランチに保存する。
+    .github/workflows/watch_and_notify.yml参照。2026-08-27のCodexレビューで
+    指摘・修正）。
+  - 固定のLOOKBACK_DAYS(初回実行時のみ使用)だけに頼ると、ゴールデンウィーク
+    等で市場休場日が実行間隔を超えて連続した場合にデータを取りこぼす
+    （2026-08-27のCodexレビューで指摘）。次回はウォーターマーク
+    （前回成功した走査の開始日）から走査することで、実行間隔が空いても
+    （MAX_CATCH_UP_DAYSの上限まで）取りこぼさないようにする(_scan_start参照)。
 """
 from __future__ import annotations
 
@@ -57,14 +70,15 @@ logger = logging.getLogger(__name__)
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "notify_state.json"
 
-# 実行が数日空いても取りこぼさないための固定の再走査窓（土日・祝日連続や
-# 一時的な実行失敗を想定した余裕）。重複通知は通知済み状態(STATE_PATH)で
-# 防ぐため、ここを広めに取っても再通知にはならない。
+# 初回実行時（まだウォーターマークが無い場合）の再走査窓。2回目以降は
+# state["jquants_watermark"]/state["tdnet_watermark"]（前回成功した走査の
+# 開始日）を使うため、この値は初回のみ意味を持つ。
 LOOKBACK_DAYS = 5
+# ウォーターマークを使っても、ゴールデンウィーク等の長期休場明けに大きく
+# 遡りすぎないための上限（それより前の欠落は「取りこぼし」として許容する）。
+MAX_CATCH_UP_DAYS = 30
 # 経常利益の前年同期比較に必要な遡り日数（前年同期(330〜400日)+バッファ60日）。
 PROFIT_GROWTH_LOOKBACK_DAYS = 365 + 60
-# JPX新規上場情報を「見た」とみなす遡り日数（承認発表の通知漏れ防止用）。
-IPO_APPROVAL_LOOKBACK_DAYS = 5
 # 通知済み状態を何日分保持するか（これより古いキーは削除してファイル肥大化を防ぐ）。
 STATE_RETENTION_DAYS = 60
 
@@ -119,6 +133,27 @@ def _to_date(value) -> dt.date:
     return value
 
 
+def _scan_start(state: dict, watermark_key: str, today: dt.date) -> dt.date:
+    """このソースを今回どこから走査するかを決める。
+
+    固定のLOOKBACK_DAYSだけだと、ゴールデンウィーク等で市場休場日が
+    連続した場合（例: 金曜の後、月〜木が祝日で次の実行が木曜になる等）に
+    実際の実行間隔がLOOKBACK_DAYSを超え、その間に確定した株価・開示が
+    一度も走査されないまま欠落しうる（2026-08-27のCodexレビューで指摘）。
+    前回成功した走査の開始日をウォーターマークとして保存しておき、次回は
+    そこから走査することで、実行間隔がどれだけ空いても（MAX_CATCH_UP_DAYSの
+    上限まで）取りこぼさないようにする。
+    """
+    raw = state.get(watermark_key)
+    if raw:
+        try:
+            watermark = dt.date.fromisoformat(raw)
+            return max(watermark, today - dt.timedelta(days=MAX_CATCH_UP_DAYS))
+        except ValueError:
+            logger.warning("%sの値が不正なため無視します: %r", watermark_key, raw)
+    return today - dt.timedelta(days=LOOKBACK_DAYS)
+
+
 def _hits_to_candidates(
     hits: list[pd.DataFrame],
     name_map: dict[str, str],
@@ -170,7 +205,7 @@ def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tup
     このチェック全体を専用のtry/exceptで囲み、TDnet側の失敗と互いに
     影響しないようにする（2026-08-27のCodexレビューで指摘・修正）。
     """
-    start = today - dt.timedelta(days=LOOKBACK_DAYS)
+    start = _scan_start(state, "jquants_watermark", today)
     try:
         client = JQuantsClient()
 
@@ -203,6 +238,11 @@ def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tup
         return [], f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}"
 
     candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
+    # ここまで到達した時点でこの範囲の走査自体は成功しているため、次回の
+    # 開始日を進める（Discordへの通知が後で失敗しても、再走査で無駄な
+    # API呼び出しが増えるだけで正しさには影響しないため、送信結果を待たずに
+    # ここで更新してよい）。
+    state["jquants_watermark"] = today.isoformat()
     return candidates, None
 
 
@@ -210,7 +250,7 @@ def _tdnet_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple
     """TDnet由来: 株式分割・株式併合。J-Quantsとは独立したtry/exceptで囲む
     （_jquants_candidates docstring参照）。
     """
-    start = today - dt.timedelta(days=LOOKBACK_DAYS)
+    start = _scan_start(state, "tdnet_watermark", today)
     try:
         # force_refresh=True: 当日分の開示はまだ全件公開されていない可能性が
         # あり、一度キャッシュされると同じ(start, today)の範囲指定では
@@ -230,6 +270,7 @@ def _tdnet_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple
         return [], f"⚠️ 株式分割/併合のチェックに失敗しました（TDnet取得エラー）: {e}"
 
     candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
+    state["tdnet_watermark"] = today.isoformat()  # _jquants_candidatesと同じ理由
     return candidates, None
 
 
@@ -242,9 +283,11 @@ def _ipo_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[l
         return [], f"⚠️ JPX新規上場会社情報の取得に失敗しました: {e}"
 
     candidates = []
-    approvals = jpx_new_listings.detect_new_listing_approvals(
-        listings, since=today - dt.timedelta(days=IPO_APPROVAL_LOOKBACK_DAYS)
-    )
+    # 実行間隔が長期休場等で空いても承認発表を取りこぼさないよう、
+    # _jquants_candidates/_tdnet_candidatesと同じウォーターマーク方式にする
+    # （2026-08-27のCodexレビューで指摘・修正）。
+    since = _scan_start(state, "ipo_watermark", today)
+    approvals = jpx_new_listings.detect_new_listing_approvals(listings, since=since)
     for _, row in approvals.iterrows():
         key = f"ipo_approval|{row['Code']}|{row['ApprovalDate'].isoformat()}"
         if key in state["notified"] or key in seen_keys:
@@ -265,6 +308,7 @@ def _ipo_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[l
         message = f"🎉 本日新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）"
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
 
+    state["ipo_watermark"] = today.isoformat()  # _jquants_candidatesと同じ理由
     return candidates, None
 
 
@@ -301,21 +345,31 @@ def main() -> int:
         error_messages.append(ipo_error)
 
     all_candidates = jquants_candidates + tdnet_candidates + ipo_candidates
-    body_messages = [c.message for c in all_candidates] + error_messages
 
-    if not body_messages:
+    if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
+        # ヒットが無くてもウォーターマーク(state["*_watermark"])の更新は
+        # 保存する必要があるため、このまま返さずstateを保存してから終える。
+        _prune_state(state, today)
+        _save_state(state)
         return 1 if had_error else 0
 
-    header = f"📅 {today:%Y-%m-%d} のスクリーニング結果（{len(all_candidates)}件）"
-    discord_notify.send_discord_message(webhook_url, f"{header}\n\n" + "\n\n".join(body_messages))
+    # 1件ずつ個別のメッセージとして送信し、成功するたびに直ちに通知済みとして
+    # 記録・保存する。全件をまとめて1通に送っていると、2000文字超で複数の
+    # Discordリクエストに分割された際、途中のリクエストが失敗した時点で
+    # それ以前に届いた分もまとめて未記録のままになり、次回実行で届いた分まで
+    # 再送してしまっていた（2026-08-27のCodexレビューで指摘・修正）。
+    if all_candidates:
+        header = f"📅 {today:%Y-%m-%d} のスクリーニング結果（{len(all_candidates)}件）"
+        discord_notify.send_discord_message(webhook_url, header)
+        for candidate in all_candidates:
+            discord_notify.send_discord_message(webhook_url, candidate.message)
+            state["notified"][candidate.state_key] = True
+            _prune_state(state, today)
+            _save_state(state)
 
-    # 通知済み状態への書き込みはDiscordへの送信が成功した後にだけ行う
-    # （送信が例外を送出した場合はここに到達せず、次回実行時に再送を試みる）。
-    for candidate in all_candidates:
-        state["notified"][candidate.state_key] = True
-    _prune_state(state, today)
-    _save_state(state)
+    if error_messages:
+        discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
 
     return 1 if had_error else 0
 

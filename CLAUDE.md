@@ -108,7 +108,7 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `src/regional_stocks.py`: 「地方株」モード用。地方取引所（札幌・福岡・名古屋）単独上場企業をTDnet開示の`markets_string`列（東/福/名/札）で特定し、新規上場・東証関連イベント・M&A等大型イベントを検出する。J-Quantsは地方取引所単独上場企業を対象としないため使用しない。株価（現在値のみ、時価総額は算出不可）は福証単独上場企業のみyfinanceの`.F`サフィックスで取得可（名証・札証・新規英数字コード銘柄は取得不可）。前回スキャン済み日付をキャッシュに保存し、次回はその翌日からだけ追加取得する。`fetch_regional_statements()`で決算短信からsrc/tdnet_xbrl.py経由の財務データを蓄積し、`screen_regional()`でsrc/rules.pyの各`detect_*`（売上高増加・自己資本比率等、株価不要の条件のみ）をそのまま適用する（`REGIONAL_STATEMENT_RULES`/`REGIONAL_TITLE_RULES`参照。PBR・ストップ高は株価データが必要なため未対応）
 - `src/tdnet_xbrl.py`: TDnet決算短信の「サマリー情報」XBRL(`url_xbrl`)を、J-Quants(`/fins/summary`)互換の列名(Sales/OP/OdP/NP/EqAR等)にパースする。東証以外の取引所単独上場企業の決算短信も同一の標準タクソノミ(`tse-ed-t:...`)を使うことを実機確認済み。iXBRLの`scale`/`sign`属性を正しく反映しないと単位・符号を誤る（2026-08-19に前年同期の赤字をsign属性なしで正の値と誤読するバグを実機データで発見・修正した経緯あり）。TDnetの開示添付ファイルは公開から約1〜1.5ヶ月で取得できなくなり過去分をバックフィルできないため、決算短信本文に埋め込まれている前年同期実績も1行として一緒に抽出し、初回スキャンの時点から前年同期比較を可能にしている
 - `src/auth.py`: パスワード認証（元はapp.py内にあったものを切り出し）
-- `scripts/watch_and_notify.py`: ストップ高・株式分割/併合・経常利益急増（前年同期比+50%以上）・東証新規上場（承認発表・当日上場）を平日10:00/13:00 JSTに定期チェックしDiscordへ通知するバッチ（2026-08-27にユーザー指定、README「Discord通知」参照）。GitHub Actions(`.github/workflows/watch_and_notify.yml`)から実行され、`app.py`のUI安全弁（TDnet開示件数上限）を経由せずrules.py/endpoints.pyを直接呼ぶ。通知済み状態は`data/notify_state.json`にJSONで保存し、ワークフロー側でリポジトリにコミットして実行間（使い捨てコンテナ）をまたいで永続化する
+- `scripts/watch_and_notify.py`: ストップ高・株式分割/併合・経常利益急増（前年同期比+50%以上）・東証新規上場（承認発表・当日上場）を平日10:00/13:00 JSTに定期チェックしDiscordへ通知するバッチ（2026-08-27にユーザー指定、README「Discord通知」参照）。GitHub Actions(`.github/workflows/watch_and_notify.yml`)から実行され、`app.py`のUI安全弁（TDnet開示件数上限）を経由せずrules.py/endpoints.pyを直接呼ぶ。通知済み状態・各データ源のウォーターマーク（前回成功した走査開始日。長期休場明けの取りこぼし防止用）は`data/notify_state.json`にJSONで保存し、ワークフロー側で`notify-state`という専用ブランチにコミットして実行間（使い捨てコンテナ）をまたいで永続化する（`main`にコミットするとStreamlit Cloudの不要な再デプロイを招くため専用ブランチに分離。2026-08-27のCodexレビューで指摘・修正）
 - `src/jpx_new_listings.py`: JPX公式サイトの「新規上場会社情報」ページ（東証本体のみ。UTF-8）をスクレイピングし、銘柄コード単位で上場日・上場承認日・市場区分を取得する。上場前の会社はTDnetアカウントを持たないため、TDnet開示だけでは東証新規上場の「上場承認」を網羅的に検出できないことを実データで確認した上で採用したデータ源（watch_and_notify.py専用）
 - `src/discord_notify.py`: Discord Webhookへのメッセージ送信（2000文字上限を超える場合は分割送信）
 - `src/market_calendar.py`: 土日・日本の祝日（`jpholiday`パッケージ）判定。watch_and_notify.py専用
@@ -142,14 +142,19 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 
 - 「オーナー経営」「取引先」は未実装（EDINET有報の自由記述テキスト解析が必要。README.md参照）
 - TDnetの非公式ミラーAPI（やのしん氏運営）が停止した場合の切り替え先（公式スクレイピング or JPX有料API）
-- 複数年遡及が必要なルール（sales_growth_doubling・profit_doubling・two_quarter_growth）は
+- 複数年遡及が必要なルール（sales_growth_doubling・profit_doubling）は
   `src/endpoints.get_statements_range`が1日ごとに個別リクエストするバルク取得+キャッシュ方式のため、
   初回・キャッシュが冷えている場合に遡り日数分（sales_growth_doublingで約790日≒13分、
   profit_doublingで約1520日≒25分、Lightプランの60件/分制限下）の待ち時間が発生する
   （2026-08-25の8巡目のCodexレビューで指摘。2回目以降は当日分を除きキャッシュ済みになるため
   高速。根本解決には`src/regional_stocks.py`の地方株スキャンのような「前回スキャン日以降だけ
   追加取得」方式の専用ストアへの作り直しが必要だが、他の複数年遡及ルールにも影響する
-  アーキテクチャ変更のため別タスクとする）
+  アーキテクチャ変更のため別タスクとする）。sales_growth_major/explosive・two_quarter_growth・
+  profit_growth_majorは前年同期比較(約425日)で足りるため、これらのうちprofit_doublingを
+  含まない組み合わせを選んだ場合は約425日分の遡りで済む（2026-08-27のCodexレビューで、
+  以前は選択内容に関わらず一律でprofit_doubling相当の約4年分を遡っていたため
+  profit_growth_major単独選択時にも無駄な待ち時間が発生する不具合を指摘され、選択中の
+  ルールが実際に必要とする日数の最大値だけ遡るよう修正した）
 
 ## 注意事項
 
