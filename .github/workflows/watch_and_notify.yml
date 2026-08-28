@@ -74,7 +74,17 @@ jobs:
           # 中断する（fail closed）。
           if git ls-remote --exit-code origin notify-state >/dev/null 2>&1; then
             git fetch origin notify-state:refs/remotes/origin/notify-state
-            git show origin/notify-state:notify_state.json > data/notify_state.json
+            # シェルのリダイレクト(>)は、コマンドの成否に関わらず出力先を
+            # 先に作成・空にする。data/notify_state.jsonへ直接リダイレクトすると、
+            # git showが何らかの理由で失敗した場合でも空ファイルが残ってしまい、
+            # 後段のpushステップ(if: always())がその空ファイルを「復元成功」と
+            # 誤認してnotify-stateブランチへそのままpushし、ブランチを破壊して
+            # しまう（以降の全実行がJSONパースに失敗し続ける）。一時ファイルに
+            # 出力し、内容を検証できてから初めて本来のパスへ配置する
+            # （2026-08-28のCodexレビューで指摘・修正）。
+            git show origin/notify-state:notify_state.json > data/notify_state.json.tmp
+            python -c "import json; json.load(open('data/notify_state.json.tmp', encoding='utf-8'))"
+            mv data/notify_state.json.tmp data/notify_state.json
           else
             code=$?
             if [ "$code" -eq 2 ]; then
