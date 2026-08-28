@@ -372,7 +372,14 @@ def _ipo_candidates(
         if key in state["notified"] or key in seen_keys:
             continue
         seen_keys.add(key)
-        message = f"🎉 本日新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）"
+        # 「本日」ではなく実際の上場日を明記する。取得・送信の一時的な失敗で
+        # 上場日当日に送れず後日リトライされた場合、「本日新規上場」のままだと
+        # 実際にはtodayより前の日付なのに今日上場したかのように誤った内容を
+        # 伝えてしまう（2026-08-28のCodexレビューで指摘・修正）。
+        message = (
+            f"🎉 新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
+            f"上場日: {row['ListingDate']:%Y-%m-%d}"
+        )
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
 
     return candidates, ("ipo_watermark", today.isoformat()), None  # _stop_high_candidatesと同じ理由
