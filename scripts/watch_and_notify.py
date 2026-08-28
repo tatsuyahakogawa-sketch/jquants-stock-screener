@@ -112,15 +112,12 @@ MARKET_RULE_LABELS = {
 
 
 class Candidate:
-    def __init__(self, rule: str, code: str, date: dt.date, message: str):
+    def __init__(self, rule: str, code: str, date: dt.date, message: str, key: str):
         self.rule = rule
         self.code = code
-        self.date = date
+        self.date = date  # 表示用（メッセージの日付表記等）。重複排除にはkeyを使う。
         self.message = message
-
-    @property
-    def state_key(self) -> str:
-        return f"{self.rule}|{self.code}|{self.date.isoformat()}"
+        self.state_key = key
 
 
 def _load_state() -> dict:
@@ -191,6 +188,17 @@ def _hits_to_candidates(
     1回のhits集合の中に混ざっていても、stateへの反映はDiscord送信成功後まで
     行わないため、seen_keysが無いとstate側のチェックだけでは二重に候補へ
     入ってしまう（2026-08-27のCodexレビューで指摘・修正）。
+
+    重複排除キーの日時部分は、rowのDateが真夜中(00:00:00)ちょうどでなければ
+    （＝時刻情報を持つ、TDnet由来のrule等）その時刻まで含めた値を使い、
+    真夜中ちょうどなら（＝J-Quants由来のstop_high/profit_growth_major等、
+    元々日付単位の情報しか無いrule）従来通り日付だけを使う。TDnetの
+    pubdateは時刻を保持しているため、同一銘柄・同一ルールで同じ暦日に
+    original発表とその後の訂正・取り下げが両方出た場合でも、日付だけを
+    キーにすると2件目が「既に通知済みの日付」として永久に握りつぶされて
+    しまう（10:00の実行で1件目を通知した後、13:00までに2件目が出た場合等。
+    2026-08-28のCodexレビューで指摘・修正。J-Quants由来のrule群は決算・株価
+    ともに元から日付単位のデータしか無く、この区別による影響を受けない）。
     """
     hits = [h for h in hits if not h.empty]
     if not hits:
@@ -207,16 +215,19 @@ def _hits_to_candidates(
     candidates = []
     for _, row in result.sort_values(["Date", "Code"]).iterrows():
         code = str(row["Code"])
-        date = _to_date(row["Date"])
+        timestamp = row["Date"]
+        date = _to_date(timestamp)
         rule = row["rule"]
-        key = f"{rule}|{code}|{date.isoformat()}"
+        has_time_of_day = isinstance(timestamp, pd.Timestamp) and timestamp.time() != dt.time(0, 0)
+        key_date_part = timestamp.isoformat() if has_time_of_day else date.isoformat()
+        key = f"{rule}|{code}|{key_date_part}"
         if key in state["notified"] or key in seen_keys:
             continue
         seen_keys.add(key)
         label = MARKET_RULE_LABELS.get(rule, rule)
         name = name_map.get(code, "")
         message = f"{label}\n{code} {name}\n{row['detail']}（{date:%Y-%m-%d}）"
-        candidates.append(Candidate(rule, code, date, message))
+        candidates.append(Candidate(rule, code, date, message, key))
     return candidates
 
 
@@ -360,7 +371,7 @@ def _ipo_candidates(
             f"🆕 新規上場承認\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場承認日: {row['ApprovalDate']:%Y-%m-%d} / 上場予定日: {row['ListingDate']:%Y-%m-%d}"
         )
-        candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message))
+        candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message, key))
 
     # 完全一致(==today)ではなくsince以降の範囲で見る。JPXの取得やDiscordへの
     # 送信が上場日当日に一時的に失敗した場合、翌日には「今日」が進んでしまい
@@ -380,7 +391,7 @@ def _ipo_candidates(
             f"🎉 新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場日: {row['ListingDate']:%Y-%m-%d}"
         )
-        candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
+        candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message, key))
 
     return candidates, ("ipo_watermark", today.isoformat()), None  # _stop_high_candidatesと同じ理由
 

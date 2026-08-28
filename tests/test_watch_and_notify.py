@@ -430,6 +430,51 @@ class TestSameRunDeduplication(_WatchAndNotifyTestCase):
         self.assertEqual(sent_text.count("1234"), 1)
 
 
+class TestTdnetSameDayCorrectionIsNotDiscarded(_WatchAndNotifyTestCase):
+    # TDnet由来のrule(stock_split等)はpubdateの時刻情報を保持しているため、
+    # 同一銘柄・同一暦日でも時刻が異なれば別の開示として扱う。J-Quants由来の
+    # rule(stop_high・profit_growth_major)は元々日付単位の情報しか無いため
+    # 真夜中(00:00:00)ちょうどになり、この区別の影響を受けない
+    # （2026-08-28のCodexレビューで指摘・修正。以前は日付だけをキーにしており、
+    # 10:00の実行で朝の発表を通知した後、13:00までに同日中の訂正・取り下げが
+    # 出ても「既に通知済みの日付」として永久に握りつぶされていた）。
+    def _split_hit(self, hour: int, detail: str):
+        return pd.DataFrame([
+            {
+                "Code": "1234",
+                "Date": pd.Timestamp(_TODAY.year, _TODAY.month, _TODAY.day, hour, 0, 0),
+                "rule": "stock_split",
+                "detail": detail,
+            },
+        ])
+
+    def test_two_different_times_same_day_are_both_sent_in_one_run(self):
+        morning_and_afternoon = pd.concat([
+            self._split_hit(9, "朝の発表"), self._split_hit(16, "夕方の訂正"),
+        ], ignore_index=True)
+        result, mock_send = self._run(split=morning_and_afternoon)
+
+        self.assertEqual(result, 0)
+        # ヘッダー1通+朝1通+夕方1通の計3回（同日でも別の候補として扱われる）。
+        self.assertEqual(mock_send.call_count, 3)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("朝の発表", sent_text)
+        self.assertIn("夕方の訂正", sent_text)
+
+    def test_afternoon_correction_is_still_sent_after_morning_already_notified(self):
+        # 10:00相当の実行で朝の発表だけを通知済みにしてから、13:00相当の
+        # 実行で同日の夕方の訂正が新たに検出された状況を再現する。
+        self._run(split=self._split_hit(9, "朝の発表"))
+
+        result, mock_send2 = self._run(split=self._split_hit(16, "夕方の訂正"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(mock_send2.call_count, 2)  # ヘッダー+夕方の訂正
+        sent_text = self._sent_text(mock_send2)
+        self.assertIn("夕方の訂正", sent_text)
+        self.assertNotIn("朝の発表", sent_text)
+
+
 class TestIpoNotifications(_WatchAndNotifyTestCase):
     def test_approval_and_listing_today_are_both_notified(self):
         listings = pd.DataFrame([
@@ -496,6 +541,30 @@ class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
         self.assertEqual(state["profit_growth_watermark"], _TODAY.isoformat())
         self.assertEqual(state["tdnet_watermark"], _TODAY.isoformat())
         self.assertEqual(state["ipo_watermark"], _TODAY.isoformat())
+
+
+class TestPruneState(unittest.TestCase):
+    def test_plain_date_keys_are_pruned_by_cutoff(self):
+        # 重複排除キーの日時部分は、TDnet由来のruleでは時刻付き
+        # (YYYY-MM-DDTHH:MM:SS)、それ以外は日付のみ(YYYY-MM-DD)の
+        # 2種類が混在しうる（_hits_to_candidates docstring参照）。
+        # 文字列比較(key.rsplit("|",1)[-1] >= cutoff_str)がどちらの
+        # 形式でも正しく機能することを確認する（2026-08-28のCodexレビューで
+        # 指摘・修正した重複排除キーの精度向上に伴う回帰確認）。
+        today = dt.date(2026, 8, 27)
+        state = {
+            "notified": {
+                "stop_high|1234|2026-06-01": True,  # STATE_RETENTION_DAYS(60日)より前 -> 削除
+                "stop_high|1234|2026-08-01": True,  # 60日以内 -> 残る
+                "stock_split|5678|2026-06-01T09:00:00": True,  # 60日より前 -> 削除
+                "stock_split|5678|2026-08-01T16:30:00": True,  # 60日以内 -> 残る
+            }
+        }
+        wan._prune_state(state, today)
+        self.assertEqual(
+            set(state["notified"]),
+            {"stop_high|1234|2026-08-01", "stock_split|5678|2026-08-01T16:30:00"},
+        )
 
 
 class TestScanStart(unittest.TestCase):
