@@ -290,5 +290,27 @@ class TestProfitGrowthMajorGatedBySelection(unittest.TestCase):
         self.assertTrue(any("経常利益急増" in m for m in messages))
 
 
+class TestStopHighMalformedSchemaWarns(unittest.TestCase):
+    def test_malformed_quotes_schema_warns_instead_of_crashing(self):
+        # detect_stop_highはquotes_dfが非空なのに必要な列(UL等)を欠く場合に
+        # 例外を送出するようになった(rules.py参照)。この画面がそのまま
+        # クラッシュすると他の全ルールの結果まで失われるため、警告メッセージへ
+        # 変換して処理を継続することを確認する（2026-08-28の10巡目の
+        # Codexレビューで指摘・修正）。
+        malformed_quotes = pd.DataFrame([{"Code": "1234", "Date": "2026-08-03"}])  # UL・C列が無い
+        with (
+            patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 8, 5)),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=malformed_quotes),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            hits, messages = pipeline.run_screening(
+                client=object(), start=dt.date(2026, 8, 1), end=dt.date(2026, 8, 5),
+                selected_rules=["stop_high"],
+            )
+        self.assertTrue(any("ストップ高" in m for m in messages))
+
+
 if __name__ == "__main__":
     unittest.main()

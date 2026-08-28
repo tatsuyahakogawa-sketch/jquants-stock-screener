@@ -133,9 +133,26 @@ def _is_primary_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
-    """ストップ高で終値が確定した(Code, Date)の一覧を返す。"""
-    if quotes_df.empty or QUOTES_UPPER_LIMIT_FLAG not in quotes_df.columns:
+    """ストップ高で終値が確定した(Code, Date)の一覧を返す。
+
+    quotes_dfが空でないのに必要な列を欠く場合は例外を送出する。
+    scripts/watch_and_notify.pyの呼び出し元(_stop_high_candidates)は
+    戻り値を「正常にスキャンできた（該当0件かもしれない）」とみなして
+    stop_high_watermarkを進めるため、空のDataFrameを黙って返すと
+    J-Quants側のスキーマ変更等でデータが壊れている場合でも気付けず、
+    その期間のストップ高を検出漏れのまま二度と再走査されなくなる
+    （detect_profit_growth_majorと同じ理由。2026-08-28の10巡目の
+    Codexレビューで指摘・修正）。
+    """
+    required = {QUOTES_CODE, QUOTES_DATE, QUOTES_UPPER_LIMIT_FLAG, QUOTES_CLOSE}
+    if quotes_df.empty:
         return pd.DataFrame(columns=[QUOTES_CODE, QUOTES_DATE, "rule", "detail"])
+    if not required.issubset(quotes_df.columns):
+        missing = sorted(required - set(quotes_df.columns))
+        raise ValueError(
+            f"quotes_dfに必要な列が不足しています（不足: {missing}）。"
+            "J-Quants側のスキーマ変更の可能性があります。"
+        )
     flag = _to_numeric(quotes_df[QUOTES_UPPER_LIMIT_FLAG]).fillna(0)
     hit = quotes_df.loc[flag == 1, [QUOTES_CODE, QUOTES_DATE, QUOTES_CLOSE]].copy()
     hit["rule"] = "stop_high"

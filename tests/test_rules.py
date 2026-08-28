@@ -22,6 +22,24 @@ def _row(code, per_type, per_end, disc_date, sales, odp, is_primary=None):
     return row
 
 
+class TestDetectStopHigh(unittest.TestCase):
+    def test_empty_input_returns_empty_without_raising(self):
+        result = rules.detect_stop_high(pd.DataFrame())
+        self.assertTrue(result.empty)
+
+    def test_nonempty_input_missing_required_column_raises(self):
+        # 空の入力（該当データが単に存在しない、正常な状態）と、非空なのに
+        # 必要な列（UL等）が欠けている状態（J-Quants側のスキーマ変更等、
+        # 異常な状態）を区別する。後者を空のDataFrameとして黙って返すと、
+        # scripts/watch_and_notify.pyの呼び出し元が「正常にスキャンできた
+        # （該当0件）」とみなしてstop_high_watermarkを進めてしまい、
+        # この期間のストップ高を検出漏れのまま二度と再走査しなくなる
+        # （2026-08-28の10巡目のCodexレビューで指摘・修正）。
+        quotes = pd.DataFrame([{"Code": "1234", "Date": "2026-08-27", "C": 500.0}])  # UL列が無い
+        with self.assertRaises(ValueError):
+            rules.detect_stop_high(quotes)
+
+
 class TestDetectTwoQuarterGrowth(unittest.TestCase):
     def test_hit_uses_only_primary_rows_for_the_disclosure_sequence(self):
         # src/tdnet_xbrl.pyの合成行(IsPrimary=False。開示に埋め込まれた前年

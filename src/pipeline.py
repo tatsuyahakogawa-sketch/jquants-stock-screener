@@ -254,7 +254,6 @@ def run_screening(
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
-        rules.detect_stop_high(quotes_df),
         rules.detect_sales_growth(statements_df),
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
@@ -263,6 +262,17 @@ def run_screening(
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
     ]
+    try:
+        # detect_stop_highは、quotes_dfが非空なのに必要な列を欠く場合
+        # （J-Quants側のスキーマ変更等）に例外を送出するように変更した
+        # (scripts/watch_and_notify.py専用の要件。同関数のdocstring参照)。
+        # この対話的画面ではその例外をそのまま送出すると他のルールの結果
+        # ごと画面がクラッシュしてしまうため、既存のTDnet取得失敗時や
+        # profit_growth_majorと同様に警告メッセージへ変換して処理を継続する
+        # （2026-08-28の10巡目のCodexレビューで指摘・修正）。
+        hits.append(rules.detect_stop_high(quotes_df))
+    except Exception as e:
+        messages.append(f"ストップ高の判定に失敗しました: {e}")
 
     # profit_growth_major(経常利益が前年同期比+50%以上)が選択されていない
     # 場合はhitsに追加しない。build_summary()はhits内の銘柄を全て集計し、
