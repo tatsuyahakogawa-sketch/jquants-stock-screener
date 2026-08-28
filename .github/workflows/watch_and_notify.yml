@@ -138,7 +138,20 @@ jobs:
             TREE=$(printf '100644 blob %s\tnotify_state.json\n' "$BLOB" | git mktree)
             COMMIT=$(git commit-tree "$TREE" -m "chore: initialize notify state")
           fi
-          git push origin "$COMMIT:refs/heads/notify-state"
+          # この時点でDiscordへの送信は既に完了している。pushが一時的な
+          # ネットワーク不調等で失敗すると、ローカルにしか残っていない
+          # 送信済み状態が失われ、次回実行が同じ通知を重複送信してしまう。
+          # 数回リトライしてから諦める（2026-08-28の9巡目のCodexレビューで
+          # 指摘・修正）。
+          for attempt in 1 2 3; do
+            if git push origin "$COMMIT:refs/heads/notify-state"; then
+              exit 0
+            fi
+            echo "git push failed (attempt $attempt/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::notify-stateへのpushが繰り返し失敗しました。Discordへの送信は完了していますが状態の記録に失敗したため、次回実行時に同じ内容を重複送信する可能性があります。"
+          exit 1
 
       - name: Fail job if watch_and_notify reported an error
         if: steps.run.outcome == 'failure'

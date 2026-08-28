@@ -567,10 +567,27 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     （既に取り下げられたはずの）非欠損の行がそのまま「その期の代表行」として
     生き残り、訂正前の数値で+50%と誤判定しうる（2026-08-28の8巡目のCodexレビューで
     指摘・修正。同一日タイのケースとは別の、訂正後の値が欠損になるケース）。
+
+    statements_dfが空でないのに必要な列が欠けている場合は、J-Quants側の
+    スキーマ変更等でデータ取得自体が壊れている可能性が高い。この関数の
+    呼び出し元(scripts/watch_and_notify.py._profit_growth_candidates)は
+    戻り値を「正常にスキャンできた（該当0件かもしれないが取得自体は成功）」
+    とみなしてprofit_growth_watermarkを進めるため、ここで空のDataFrameを
+    黙って返すと、この期間の候補が実際にあっても検出漏れのまま二度と
+    再走査されなくなる。空の入力（該当データが単に存在しない、正常な状態）
+    と、非空なのにスキーマが壊れている異常な状態を区別し、後者は例外を
+    送出して呼び出し元のtry/exceptに検知させる（2026-08-28の9巡目の
+    Codexレビューで指摘・修正）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_ORDINARY_PROFIT, STMT_DISCLOSED_DATE}
-    if statements_df.empty or not required.issubset(statements_df.columns):
+    if statements_df.empty:
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+    if not required.issubset(statements_df.columns):
+        missing = sorted(required - set(statements_df.columns))
+        raise ValueError(
+            f"statements_dfに必要な列が不足しています（不足: {missing}）。"
+            "J-Quants側のスキーマ変更の可能性があります。"
+        )
 
     df = statements_df.copy()
     df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")

@@ -106,14 +106,17 @@ def parse_new_listing_table(html_text: str) -> pd.DataFrame:
         )
 
     records = []
+    skipped_count = 0
     for primary_tr in rows:
         tds = primary_tr.xpath("./td")
         if len(tds) < 3:
+            skipped_count += 1
             continue
         listing_date, approval_date = _extract_listing_and_approval_date(tds[0])
         company_name = _extract_company_name(tds[1])
         code = (tds[2].text_content() or "").strip()
         if listing_date is None or not code:
+            skipped_count += 1
             continue
 
         market_segment = ""
@@ -131,15 +134,23 @@ def parse_new_listing_table(html_text: str) -> pd.DataFrame:
             "ApprovalDate": approval_date,
         })
 
-    if not records:
-        # rows自体は見つかったが、セル構成の変更等で1件も抽出できなかった
-        # 場合。ここで空のDataFrameを黙って返すと「新規上場0件」と区別が
-        # つかず、実際には上場承認・本日上場があるのに気付けなくなる
-        # （2026-08-27のCodexレビューで指摘）。
+    if skipped_count:
+        # rows自体は見つかったが、一部の行だけセル構成の変更等で解析できな
+        # かった場合。この時点でrecordsが（他の行の分だけ）空でなくても、
+        # 静かに一部の行を読み飛ばして「解析できた分だけの結果」を返すと、
+        # 該当行の銘柄の上場承認・本日上場を検出漏れのまま二度と気付けなく
+        # なる（watch_and_notify.pyはこの戻り値が得られた時点でスキャン成功と
+        # みなしipo_watermarkを進めるため。2026-08-28の9巡目のCodexレビューで
+        # 指摘・修正。全滅の場合は元々この後のif not recordsでも検知できるが、
+        # 一部だけの読み飛ばしはそれでは検知できないため、件数ベースで
+        # 統一的に検知する）。
         raise ValueError(
-            "JPX新規上場会社情報ページの表から1件も抽出できませんでした"
+            f"JPX新規上場会社情報ページの表で{skipped_count}件の行を解析できませんでした"
             "（ページのHTML構造が変更された可能性があります）。"
         )
+    # rowsは非空(前段のif not rows参照)で、各行はrecordsへの追加か
+    # skipped_countの加算のどちらかに必ず該当するため、ここに到達した
+    # 時点でskipped_count == 0であれば必ずrecordsも非空になる。
 
     return pd.DataFrame(records, columns=NEW_LISTINGS_COLUMNS)
 

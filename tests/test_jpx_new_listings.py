@@ -100,6 +100,20 @@ class TestParseNewListingTable(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_new_listing_table(html)
 
+    def test_one_unparseable_row_among_others_still_raises(self):
+        # 他の行は正常に解析できていても、1件でも解析できない行があれば
+        # 例外を送出する。件数ベースで「全滅」しか検知しないと、この
+        # ケース（1件だけ読み飛ばし）が検出漏れのまま静かに処理され、
+        # watch_and_notify.pyがそのままスキャン成功とみなしてipo_watermarkを
+        # 進めてしまい、その銘柄の上場承認・本日上場を永久に見逃す
+        # （2026-08-28の9巡目のCodexレビューで指摘・修正）。
+        html = _SAMPLE_HTML.replace(
+            '<td rowspan="2">2026/08/04<br />（2026/06/30）</td>',
+            '<td rowspan="2">日付形式が変わって取れない</td>',
+        )
+        with self.assertRaises(ValueError):
+            parse_new_listing_table(html)
+
 
 class TestDetectNewListingApprovals(unittest.TestCase):
     def test_approval_on_or_after_since_is_included(self):

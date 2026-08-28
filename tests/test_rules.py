@@ -125,6 +125,24 @@ class TestDetectSalesGrowth(unittest.TestCase):
 
 
 class TestDetectProfitGrowthMajor(unittest.TestCase):
+    def test_empty_input_returns_empty_without_raising(self):
+        result = rules.detect_profit_growth_major(pd.DataFrame())
+        self.assertTrue(result.empty)
+
+    def test_nonempty_input_missing_required_column_raises(self):
+        # 空の入力（該当データが単に存在しない、正常な状態）と、非空なのに
+        # 必要な列が欠けている状態（J-Quants側のスキーマ変更等、異常な状態）
+        # を区別する。後者を空のDataFrameとして黙って返すと、
+        # scripts/watch_and_notify.pyの呼び出し元が「正常にスキャンできた
+        # （該当0件）」とみなしてprofit_growth_watermarkを進めてしまい、
+        # この期間の候補を検出漏れのまま二度と再走査しなくなる
+        # （2026-08-28の9巡目のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            {"Code": "1234", "CurPerType": "1Q", "CurPerEn": pd.Timestamp("2026-06-30")},
+        ])  # OdP・DiscDate列が無い
+        with self.assertRaises(ValueError):
+            rules.detect_profit_growth_major(statements)
+
     def test_growth_over_threshold_is_hit(self):
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),

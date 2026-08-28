@@ -274,7 +274,17 @@ def run_screening(
     # スキップすることでその影響を増やさない。2026-08-28の8巡目の
     # Codexレビューで指摘・修正）。
     if selected_rules is None or "profit_growth_major" in selected_rules:
-        hits.append(rules.detect_profit_growth_major(statements_df))
+        try:
+            # detect_profit_growth_majorは、statements_dfが非空なのに必要な
+            # 列を欠く場合（J-Quants側のスキーマ変更等）に例外を送出する
+            # ように変更した(scripts/watch_and_notify.py専用の要件。同関数の
+            # docstring参照)。この対話的画面ではその例外をそのまま送出すると
+            # 他のルールの結果ごと画面がクラッシュしてしまうため、既存の
+            # TDnet取得失敗時と同様に警告メッセージへ変換して処理を継続する
+            # （2026-08-28の9巡目のCodexレビューで指摘・修正）。
+            hits.append(rules.detect_profit_growth_major(statements_df))
+        except Exception as e:
+            messages.append(f"経常利益急増（前年同期比+50%以上）の判定に失敗しました: {e}")
 
     # "sales_growth_doubling"(1年で売上高2倍)は選択期間(start〜end)内の
     # イベントではなく「銘柄が現在その状態にあるか」を判定するため、

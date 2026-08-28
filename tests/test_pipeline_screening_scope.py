@@ -268,6 +268,27 @@ class TestProfitGrowthMajorGatedBySelection(unittest.TestCase):
         hits = self._run(selected_rules=None)
         self.assertIn("profit_growth_major", set(hits["Rule"]))
 
+    def test_malformed_statements_schema_warns_instead_of_crashing(self):
+        # detect_profit_growth_majorはstatements_dfが非空なのに必要な列を
+        # 欠く場合に例外を送出するようになった(rules.py参照)。この画面が
+        # そのままクラッシュすると他の全ルールの結果まで失われるため、
+        # 既存のTDnet取得失敗時と同様に警告メッセージへ変換して処理を
+        # 継続することを確認する（2026-08-28の9巡目のCodexレビューで
+        # 指摘・修正）。
+        malformed_statements = pd.DataFrame([{"Code": "1234", "CurPerType": "1Q"}])
+        with (
+            patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 8, 5)),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=malformed_statements),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            hits, messages = pipeline.run_screening(
+                client=object(), start=dt.date(2026, 8, 1), end=dt.date(2026, 8, 5),
+                selected_rules=["profit_growth_major"],
+            )
+        self.assertTrue(any("経常利益急増" in m for m in messages))
+
 
 if __name__ == "__main__":
     unittest.main()
