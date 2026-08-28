@@ -560,14 +560,19 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     （detect_current_sales_doublingと同じ問題。2026-08-27のCodexレビューで
     指摘）。比較の計算に入る前に、同一期内は最新の開示日(DiscDate)の行だけに
     絞る。
+
+    同一期内の絞り込み(最新DiscDateの行だけを残す)は、OdPの数値変換・欠損
+    除外より前に行う。先にOdPが欠損の行を除外してしまうと、取り下げ・訂正で
+    最新の開示がOdPを欠く場合にその行が絞り込みの土俵にすら乗らず、古い
+    （既に取り下げられたはずの）非欠損の行がそのまま「その期の代表行」として
+    生き残り、訂正前の数値で+50%と誤判定しうる（2026-08-28の8巡目のCodexレビューで
+    指摘・修正。同一日タイのケースとは別の、訂正後の値が欠損になるケース）。
     """
     required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_ORDINARY_PROFIT, STMT_DISCLOSED_DATE}
     if statements_df.empty or not required.issubset(statements_df.columns):
         return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
 
     df = statements_df.copy()
-    df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
-    df = df.dropna(subset=[STMT_ORDINARY_PROFIT])
     df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
     df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
     df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
@@ -581,6 +586,14 @@ def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(STMT_DISCLOSED_DATE, kind="stable")
     df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
+
+    # 同一期の絞り込みが終わった後で数値変換する。ここでOdPが欠損になる行
+    # （取り下げ等でその期の最新開示に数値が無い場合）を明示的にdropnaは
+    # しない。その期自体はヒット対象外になり（growthがNaNになり後段のvalid
+    # 判定で自然に除外される）、かつ次の期からの比較基準(prev_ordinary_profit)
+    # としても「不明」のままNaNが伝播し、誤って古い値まで遡って比較される
+    # ことはない。
+    df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
 
     df["prev_ordinary_profit"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_ORDINARY_PROFIT].shift(1)
     df["prev_period_end"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_PERIOD_END].shift(1)

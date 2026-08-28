@@ -221,5 +221,53 @@ class TestYearsBefore(unittest.TestCase):
         )
 
 
+def _profit_growth_triggering_statements():
+    # DiscDateはテストのstart〜end(2026-08-01〜2026-08-05)の範囲内にする
+    # 必要がある（run_screening()の最終的な日付範囲フィルタの対象になるため）。
+    return pd.DataFrame([
+        {
+            "Code": "1234", "CurPerType": "1Q", "CurPerEn": pd.Timestamp("2025-06-30"),
+            "DiscDate": pd.Timestamp("2025-08-01"), "OdP": 10,
+        },
+        {
+            "Code": "1234", "CurPerType": "1Q", "CurPerEn": pd.Timestamp("2026-06-30"),
+            "DiscDate": pd.Timestamp("2026-08-04"), "OdP": 16,  # +60%
+        },
+    ])
+
+
+class TestProfitGrowthMajorGatedBySelection(unittest.TestCase):
+    def _run(self, selected_rules):
+        with (
+            patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 8, 5)),
+            patch(f"{_MOD}.endpoints.get_listed_info", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_daily_quotes_range", return_value=pd.DataFrame()),
+            patch(f"{_MOD}.endpoints.get_statements_range", return_value=_profit_growth_triggering_statements()),
+            patch(f"{_MOD}.tdnet_client.get_disclosures_range", return_value=pd.DataFrame()),
+        ):
+            hits, _messages = pipeline.run_screening(
+                client=object(), start=dt.date(2026, 8, 1), end=dt.date(2026, 8, 5),
+                selected_rules=selected_rules,
+            )
+        return hits
+
+    def test_unselected_rule_does_not_appear_in_hits(self):
+        # build_summary()はhits内の銘柄を全て集計し、app.pyはこの後
+        # enrich_with_market_data()をselected_rulesによる絞り込みより前に
+        # 呼ぶため、選択していないprofit_growth_majorの銘柄までhitsに
+        # 混ざると、選択していないルールのために余計なAPI呼び出しが発生する
+        # （2026-08-28の8巡目のCodexレビューで指摘・修正）。
+        hits = self._run(selected_rules=["stop_high"])
+        self.assertNotIn("profit_growth_major", set(hits["Rule"]))
+
+    def test_selected_rule_appears_in_hits(self):
+        hits = self._run(selected_rules=["profit_growth_major"])
+        self.assertIn("profit_growth_major", set(hits["Rule"]))
+
+    def test_default_none_includes_the_rule(self):
+        hits = self._run(selected_rules=None)
+        self.assertIn("profit_growth_major", set(hits["Rule"]))
+
+
 if __name__ == "__main__":
     unittest.main()

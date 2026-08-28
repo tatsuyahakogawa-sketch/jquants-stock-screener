@@ -259,11 +259,22 @@ def run_screening(
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
         rules.detect_profit_doubling(statements_df),
-        rules.detect_profit_growth_major(statements_df),
         rules.detect_low_pbr(statements_df, quotes_df),
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
     ]
+
+    # profit_growth_major(経常利益が前年同期比+50%以上)が選択されていない
+    # 場合はhitsに追加しない。build_summary()はhits内の銘柄を全て集計し、
+    # app.pyはenrich_with_market_data()をselected_rulesによる絞り込みより
+    # 前に呼ぶため、無条件に追加すると選択していない銘柄までここで
+    # 時価総額・PER等の追加API呼び出し対象になってしまう
+    # （sales_growth_doubling以外の既存ルールにも共通する既知の特性だが、
+    # この行は今回新規に追加したものであり、選択されていない場合に
+    # スキップすることでその影響を増やさない。2026-08-28の8巡目の
+    # Codexレビューで指摘・修正）。
+    if selected_rules is None or "profit_growth_major" in selected_rules:
+        hits.append(rules.detect_profit_growth_major(statements_df))
 
     # "sales_growth_doubling"(1年で売上高2倍)は選択期間(start〜end)内の
     # イベントではなく「銘柄が現在その状態にあるか」を判定するため、

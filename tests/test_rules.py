@@ -191,6 +191,19 @@ class TestDetectProfitGrowthMajor(unittest.TestCase):
         result = rules.detect_profit_growth_major(statements)
         self.assertEqual(len(result), 1)
 
+    def test_withdrawal_leaving_profit_blank_supersedes_older_hit(self):
+        # 最新の開示(訂正・取り下げ)がOdPを欠く場合、その期はヒット対象外に
+        # なる。欠損を先に除外してしまうと、より古い非欠損の行がその期の
+        # 代表として生き残り、既に取り下げられたはずの数値で+50%と誤判定
+        # してしまう（2026-08-28の8巡目のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 訂正前 +60%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, None),  # 取り下げ(OdP欠損)
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
     def test_correction_above_threshold_is_hit_with_corrected_date(self):
         statements = pd.DataFrame([
             _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),

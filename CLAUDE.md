@@ -111,7 +111,7 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `scripts/watch_and_notify.py`: ストップ高・株式分割/併合・経常利益急増（前年同期比+50%以上）・東証新規上場（承認発表・当日上場）を平日10:00/13:00 JSTに定期チェックしDiscordへ通知するバッチ（2026-08-27にユーザー指定、README「Discord通知」参照）。GitHub Actions(`.github/workflows/watch_and_notify.yml`)から実行され、`app.py`のUI安全弁（TDnet開示件数上限）を経由せずrules.py/endpoints.pyを直接呼ぶ。通知済み状態・各データ源のウォーターマーク（前回成功した走査開始日。長期休場明けの取りこぼし防止用）は`data/notify_state.json`にJSONで保存し、ワークフロー側で`notify-state`という専用ブランチにコミットして実行間（使い捨てコンテナ）をまたいで永続化する（`main`にコミットするとStreamlit Cloudの不要な再デプロイを招くため専用ブランチに分離。2026-08-27のCodexレビューで指摘・修正）
 - `src/jpx_new_listings.py`: JPX公式サイトの「新規上場会社情報」ページ（東証本体のみ。UTF-8）をスクレイピングし、銘柄コード単位で上場日・上場承認日・市場区分を取得する。上場前の会社はTDnetアカウントを持たないため、TDnet開示だけでは東証新規上場の「上場承認」を網羅的に検出できないことを実データで確認した上で採用したデータ源（watch_and_notify.py専用）
 - `src/discord_notify.py`: Discord Webhookへのメッセージ送信（2000文字上限を超える場合は分割送信）
-- `src/market_calendar.py`: 土日・日本の祝日（`jpholiday`パッケージ）判定。watch_and_notify.py専用
+- `src/market_calendar.py`: 土日・日本の祝日（`jpholiday`パッケージ）・東証の年末年始休場(12/31・1/2・1/3。国民の祝日ではないためjpholidayだけでは判定できない)判定。watch_and_notify.py専用
 
 ## 開発体制（Claude Code + Codexレビュー）
 

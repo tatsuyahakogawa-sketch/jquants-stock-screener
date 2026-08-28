@@ -25,6 +25,17 @@ class TestIsMarketHoliday(unittest.TestCase):
         # 敬老の日（2026年は9/21・月曜）
         self.assertTrue(is_market_holiday(dt.date(2026, 9, 21)))
 
+    def test_year_end_closure_on_a_weekday_is_a_holiday(self):
+        # 12/31は国民の祝日ではないが東証は休場する。2025年は水曜日
+        # （2026-08-28の8巡目のCodexレビューで指摘・修正）。
+        self.assertTrue(is_market_holiday(dt.date(2025, 12, 31)))
+
+    def test_new_year_closure_on_a_weekday_is_a_holiday(self):
+        # 1/2は国民の祝日ではないが東証は休場する。2026年は金曜日。
+        self.assertTrue(is_market_holiday(dt.date(2026, 1, 2)))
+        # 1/3も同様。2028年は月曜日。
+        self.assertTrue(is_market_holiday(dt.date(2028, 1, 3)))
+
 
 if __name__ == "__main__":
     unittest.main()
