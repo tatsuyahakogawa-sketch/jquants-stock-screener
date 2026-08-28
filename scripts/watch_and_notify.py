@@ -10,6 +10,16 @@ GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
   - 経常利益が前年同期比+50%以上（1.5倍以上）     -> rules.detect_profit_growth_major
   - 東証本体への新規上場（上場承認発表・当日上場） -> src/jpx_new_listings.py
 
+上記4条件は互いに独立したデータ源・エンドポイントを使い、それぞれ専用の
+try/exceptとウォーターマーク(state["*_watermark"])を持つ
+（_stop_high_candidates/_profit_growth_candidates/_tdnet_candidates/
+_ipo_candidates）。ストップ高と経常利益急増はどちらもJ-Quantsだが、
+別々のエンドポイント(/equities/bars/daily, /fins/summary)を使うため、
+片方が一時的に失敗してももう片方の通知は届く（2026-08-28のCodexレビューで
+指摘・修正。以前は1つのtry/exceptにまとめており、後者(統計データ、
+約425日分を1日ごとに個別リクエストする重い処理)の障害が前者まで
+巻き込んでいた）。
+
 土日・日本の祝日は市場が休みで新しいデータが出ないためスキップする
 (src/market_calendar.py)。
 
@@ -43,7 +53,7 @@ GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
     同じ考え方）。
   - GitHub Actionsの各実行は使い捨てのコンテナで、data/以下の変更は
     ワークフロー側でリポジトリにコミットしない限り次回実行時に残らない。
-    通知済み状態・ウォーターマーク（state["jquants_watermark"]等。前回
+    通知済み状態・ウォーターマーク（state["stop_high_watermark"]等。前回
     成功した走査の開始日。_scan_start参照）は日を跨いで重複通知・取りこぼしを
     防ぐために必須のため、ワークフロー側でこの変更をコミット・pushする
     （mainに直接コミットするとStreamlit Cloudの自動デプロイが不要にトリガー
@@ -82,8 +92,8 @@ logger = logging.getLogger(__name__)
 STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "notify_state.json"
 
 # 初回実行時（まだウォーターマークが無い場合）の再走査窓。2回目以降は
-# state["jquants_watermark"]/state["tdnet_watermark"]（前回成功した走査の
-# 開始日）を使うため、この値は初回のみ意味を持つ。
+# state["stop_high_watermark"]等（前回成功した走査の開始日。情報源ごとに
+# 別のキーを持つ。_scan_start参照）を使うため、この値は初回のみ意味を持つ。
 LOOKBACK_DAYS = 5
 # ウォーターマークを使っても、ゴールデンウィーク等の長期休場明けに大きく
 # 遡りすぎないための上限（それより前の欠落は「取りこぼし」として許容する）。
@@ -213,8 +223,22 @@ def _hits_to_candidates(
 WatermarkUpdate = tuple[str, str]
 
 
-def _jquants_candidates(
-    today: dt.date, state: dict, seen_keys: set[str]
+def _safe_name_map(client: JQuantsClient) -> dict[str, str]:
+    """上場銘柄マスタから銘柄コード→会社名の対応を取得する。失敗しても
+    会社名が空欄になるだけで検出結果自体には影響しないため、呼び出し側の
+    本体処理を止めない（空の辞書を返す）。
+    """
+    try:
+        listed_info = endpoints.get_listed_info(client)
+        if not listed_info.empty and "Code" in listed_info.columns and "CoName" in listed_info.columns:
+            return dict(zip(listed_info["Code"].astype(str), listed_info["CoName"]))
+    except Exception:
+        logger.warning("上場銘柄マスタの取得に失敗しました（会社名なしで続行します）", exc_info=True)
+    return {}
+
+
+def _stop_high_candidates(
+    client: JQuantsClient, today: dt.date, state: dict, seen_keys: set[str]
 ) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
     """(候補一覧, ウォーターマーク更新案 or None, エラーメッセージ or None) を返す。
 
@@ -222,23 +246,16 @@ def _jquants_candidates(
     stateに反映しない（呼び出し側のmain()に委ねる。_hits_to_candidates
     docstring・main()参照）。
 
-    J-Quants由来: ストップ高・経常利益急増。TDnetとは独立して失敗しうる
-    （TDnetの非公式ミラーは個人運営で不安定なことがある。CLAUDE.md参照）ため、
-    このチェック全体を専用のtry/exceptで囲み、TDnet側の失敗と互いに
-    影響しないようにする（2026-08-27のCodexレビューで指摘・修正）。
+    ストップ高（J-Quantsの株価四本値）。経常利益急増(_profit_growth_candidates)
+    とは別のエンドポイント(/equities/bars/daily と /fins/summary)を使うため、
+    独立したtry/exceptで囲む。以前は同じtry/exceptにまとめていたため、
+    片方のエンドポイントの一時的な障害がもう片方の（本来は取得できていた
+    はずの）通知まで巻き込んで消してしまっていた（2026-08-28のCodexレビューで
+    指摘・修正）。
     """
-    start = _scan_start(state, "jquants_watermark", today)
+    start = _scan_start(state, "stop_high_watermark", today)
     try:
-        client = JQuantsClient()
-
-        name_map: dict[str, str] = {}
-        try:
-            listed_info = endpoints.get_listed_info(client)
-            if not listed_info.empty and "Code" in listed_info.columns and "CoName" in listed_info.columns:
-                name_map = dict(zip(listed_info["Code"].astype(str), listed_info["CoName"]))
-        except Exception:
-            logger.warning("上場銘柄マスタの取得に失敗しました（会社名なしで続行します）", exc_info=True)
-
+        name_map = _safe_name_map(client)
         # 株価四本値は営業日の大引け後にしか当日分が更新されない
         # (CLAUDE.md参照)。10:00/13:00 JSTはどちらも大引け(15:00頃)より前で、
         # 当日を含めて取得すると空のレスポンスが返る。get_daily_quotes_by_date
@@ -248,6 +265,26 @@ def _jquants_candidates(
         # 二度と取得されずストップ高を取りこぼす（2026-08-27のCodexレビューで
         # 指摘）。当日はそもそもデータが存在しないため、最初から対象に含めない。
         quotes_df = endpoints.get_daily_quotes_range(client, start, today - dt.timedelta(days=1))
+        hits = [rules.detect_stop_high(quotes_df)]
+    except Exception as e:
+        logger.exception("ストップ高のチェックに失敗しました")
+        return [], None, f"⚠️ ストップ高のチェックに失敗しました: {e}"
+
+    candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
+    # ウォーターマークの確定(stateへの反映)はmain()に委ねる（理由は
+    # main()のコメント・過去のCodexレビュー対応参照）。
+    return candidates, ("stop_high_watermark", today.isoformat()), None
+
+
+def _profit_growth_candidates(
+    client: JQuantsClient, today: dt.date, state: dict, seen_keys: set[str]
+) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
+    """経常利益急増（J-Quantsの決算情報）。ストップ高(_stop_high_candidates)とは
+    独立したtry/exceptで囲む（同関数のdocstring参照）。
+    """
+    start = _scan_start(state, "profit_growth_watermark", today)
+    try:
+        name_map = _safe_name_map(client)
         # ウォーターマークによる巻き戻り走査(_scan_start参照)で、今回examineする
         # 最も古い候補日はstart(today基準ではない)になりうる。前年同期比較は
         # その候補日から最大400日前まで必要(detect_profit_growth_majorの
@@ -259,22 +296,13 @@ def _jquants_candidates(
         statements_df = endpoints.get_statements_range(
             client, start - dt.timedelta(days=PROFIT_GROWTH_LOOKBACK_DAYS), today
         )
-        hits = [
-            rules.detect_stop_high(quotes_df),
-            rules.detect_profit_growth_major(statements_df),
-        ]
+        hits = [rules.detect_profit_growth_major(statements_df)]
     except Exception as e:
-        logger.exception("J-Quants由来の条件チェックに失敗しました")
-        return [], None, f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}"
+        logger.exception("経常利益急増のチェックに失敗しました")
+        return [], None, f"⚠️ 経常利益急増のチェックに失敗しました: {e}"
 
     candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
-    # ウォーターマークの確定(stateへの反映)はmain()に委ねる。ここで直接
-    # state["jquants_watermark"]を進めてしまうと、この後Discordへの送信が
-    # 一部失敗した場合でも（既に送信成功した他の候補がstateを保存する
-    # 副作用で）先に進んだ値が保存されてしまい、未送信の候補の日付が
-    # ウォーターマークより古くなって次回以降二度と再走査されなくなる
-    # （2026-08-27の3巡目のCodexレビューで指摘・修正）。
-    return candidates, ("jquants_watermark", today.isoformat()), None
+    return candidates, ("profit_growth_watermark", today.isoformat()), None
 
 
 def _tdnet_candidates(
@@ -334,8 +362,12 @@ def _ipo_candidates(
         )
         candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message))
 
-    listed_today = jpx_new_listings.detect_listings_today(listings, today)
-    for _, row in listed_today.iterrows():
+    # 完全一致(==today)ではなくsince以降の範囲で見る。JPXの取得やDiscordへの
+    # 送信が上場日当日に一時的に失敗した場合、翌日には「今日」が進んでしまい
+    # 完全一致では二度と検出できなくなるため（2026-08-28のCodexレビューで
+    # 指摘・修正。detect_listings_sinceのdocstring参照）。
+    listed_recently = jpx_new_listings.detect_listings_since(listings, since=since, today=today)
+    for _, row in listed_recently.iterrows():
         key = f"ipo_listed|{row['Code']}|{row['ListingDate'].isoformat()}"
         if key in state["notified"] or key in seen_keys:
             continue
@@ -343,7 +375,7 @@ def _ipo_candidates(
         message = f"🎉 本日新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）"
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
 
-    return candidates, ("ipo_watermark", today.isoformat()), None  # _jquants_candidatesと同じ理由
+    return candidates, ("ipo_watermark", today.isoformat()), None  # _stop_high_candidatesと同じ理由
 
 
 def main() -> int:
@@ -363,10 +395,38 @@ def main() -> int:
     error_messages: list[str] = []
     seen_keys: set[str] = set()
 
-    jquants_candidates, jquants_watermark, jquants_error = _jquants_candidates(today, state, seen_keys)
-    if jquants_error:
+    # JQuantsClientの構築自体（APIキー未設定・不正等）が失敗する場合、
+    # ストップ高・経常利益急増の両方に等しく影響する単一の原因のため、
+    # 個別のtry/exceptに分ける意味が無く、1つのエラーとしてまとめて扱う。
+    # 構築後の個々のエンドポイント呼び出し（get_daily_quotes_range等）は
+    # _stop_high_candidates/_profit_growth_candidatesがそれぞれ独立した
+    # try/exceptで囲む（2026-08-28のCodexレビューで指摘・修正。以前は
+    # 両方を1つのtry/exceptにまとめており、片方のエンドポイントの一時的な
+    # 障害がもう片方の通知まで巻き込んで消してしまっていた）。
+    stop_high_candidates: list[Candidate] = []
+    stop_high_watermark: WatermarkUpdate | None = None
+    profit_growth_candidates: list[Candidate] = []
+    profit_growth_watermark: WatermarkUpdate | None = None
+    try:
+        jquants_client = JQuantsClient()
+    except Exception as e:
+        logger.exception("JQuantsClientの構築に失敗しました")
         had_error = True
-        error_messages.append(jquants_error)
+        error_messages.append(f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}")
+    else:
+        stop_high_candidates, stop_high_watermark, stop_high_error = _stop_high_candidates(
+            jquants_client, today, state, seen_keys
+        )
+        if stop_high_error:
+            had_error = True
+            error_messages.append(stop_high_error)
+
+        profit_growth_candidates, profit_growth_watermark, profit_growth_error = _profit_growth_candidates(
+            jquants_client, today, state, seen_keys
+        )
+        if profit_growth_error:
+            had_error = True
+            error_messages.append(profit_growth_error)
 
     tdnet_candidates, tdnet_watermark, tdnet_error = _tdnet_candidates(today, state, seen_keys)
     if tdnet_error:
@@ -379,17 +439,18 @@ def main() -> int:
         error_messages.append(ipo_error)
 
     sources = [
-        (jquants_candidates, jquants_watermark),
+        (stop_high_candidates, stop_high_watermark),
+        (profit_growth_candidates, profit_growth_watermark),
         (tdnet_candidates, tdnet_watermark),
         (ipo_candidates, ipo_watermark),
     ]
-    all_candidates = jquants_candidates + tdnet_candidates + ipo_candidates
+    all_candidates = stop_high_candidates + profit_growth_candidates + tdnet_candidates + ipo_candidates
 
     if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
         # 候補が0件の情報源は、この走査範囲を全て「送信済み」扱いにできる
         # ため、ウォーターマークをそのまま確定してよい。
-        for watermark_update in (jquants_watermark, tdnet_watermark, ipo_watermark):
+        for _, watermark_update in sources:
             if watermark_update:
                 key, value = watermark_update
                 state[key] = value

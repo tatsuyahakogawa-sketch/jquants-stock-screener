@@ -163,9 +163,19 @@ def detect_new_listing_approvals(listings: pd.DataFrame, since: dt.date) -> pd.D
     return hit.reset_index(drop=True)
 
 
-def detect_listings_today(listings: pd.DataFrame, today: dt.date) -> pd.DataFrame:
-    """上場日がちょうどtodayの銘柄を返す（本日上場の通知用）。"""
+def detect_listings_since(listings: pd.DataFrame, since: dt.date, today: dt.date) -> pd.DataFrame:
+    """上場日がsince以降today以下（本日を含む）の銘柄を返す（本日上場の通知用）。
+
+    以前はtodayとの完全一致(==)で判定していたが、その場合JPXの取得や
+    Discordへの送信がその上場日当日に一時的に失敗すると、呼び出し側は
+    通知済み状態(state["notified"])を更新しないためウォーターマーク自体は
+    意図的に進めなくても、次回実行では「今日」が翌日に進んでしまい
+    ちょうどの一致条件を二度と満たせず、その銘柄の本日上場通知を永久に
+    取りこぼしていた。上場承認日の判定(detect_new_listing_approvals)と
+    同様にsince以降の範囲で見ることで、一時的な失敗からの再試行を
+    可能にする（2026-08-28のCodexレビューで指摘・修正）。
+    """
     if listings.empty:
         return listings
-    hit = listings.loc[listings["ListingDate"] == today]
+    hit = listings.loc[(listings["ListingDate"] >= since) & (listings["ListingDate"] <= today)]
     return hit.reset_index(drop=True)

@@ -153,7 +153,7 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
 
         state = self._load_state()
         self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
-        self.assertEqual(state["jquants_watermark"], _TODAY.isoformat())
+        self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
 
     def test_already_notified_hit_is_not_sent_again(self):
         self._run(stop_high=self._stop_high_hit())
@@ -173,7 +173,7 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
     def test_second_candidate_send_failure_still_records_the_first(self):
         # ヘッダーと1件目の候補送信は成功し、2件目の送信で失敗した場合、
         # 1件目は既に届いているため通知済みとして記録済みでなければならず、
-        # かつ2件目がまだ未送信である以上jquants_watermarkは進めてはならない
+        # かつ2件目がまだ未送信である以上stop_high_watermarkは進めてはならない
         # （進めてしまうと、次回以降2件目の日付がウォーターマークより古く
         # なり二度と再走査されなくなる。情報源ごとの送信はtry/exceptで
         # 分離しているため、main()自体は例外を送出せずエラーとして
@@ -215,7 +215,80 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
         state = self._load_state()
         self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
         self.assertNotIn(f"stop_high|5678|{_TODAY.isoformat()}", state["notified"])
-        self.assertNotIn("jquants_watermark", state)
+        self.assertNotIn("stop_high_watermark", state)
+
+
+class TestStopHighAndProfitGrowthIsolation(_WatchAndNotifyTestCase):
+    def test_statements_fetch_failure_does_not_suppress_stop_high(self):
+        # ストップ高(quotes)と経常利益急増(statements)は別のJ-Quants
+        # エンドポイントを使う独立したチェックのため、片方の取得失敗が
+        # もう片方の通知を巻き込んではならない（2026-08-28のCodexレビューで
+        # 指摘・修正。以前は1つのtry/exceptにまとめており、statements側
+        # （約425日分を1日ごとに個別リクエストする重い処理で障害が起きやすい）
+        # の失敗がquotes側の通知まで消してしまっていた）。
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        self.mocks = {}
+        with ExitStack() as stack:
+            def _patch(target, **kwargs):
+                m = stack.enter_context(patch(f"{_MOD}.{target}", **kwargs))
+                self.mocks[target] = m
+                return m
+
+            stack.enter_context(patch.dict(f"{_MOD}.os.environ", _DEFAULT_ENV, clear=True))
+            _patch("today_jst", return_value=_TODAY)
+            _patch("is_market_holiday", return_value=False)
+            _patch("JQuantsClient", return_value=MagicMock())
+            _patch("endpoints.get_listed_info", return_value=_empty_df())
+            _patch("endpoints.get_daily_quotes_range", return_value=_empty_df())
+            _patch("endpoints.get_statements_range", side_effect=RuntimeError("fins/summary down"))
+            _patch("tdnet_client.get_disclosures_range", return_value=_empty_df())
+            _patch("rules.detect_stop_high", return_value=stop_high_hit)
+            _patch("rules.detect_stock_split", return_value=_empty_df())
+            _patch("jpx_new_listings.fetch_new_listing_table", return_value=_empty_listings_df())
+            mock_send = _patch("discord_notify.send_discord_message")
+
+            result = wan.main()
+
+        self.assertEqual(result, 1)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("ストップ高", sent_text)
+        self.assertIn("経常利益急増", sent_text)
+        state = self._load_state()
+        self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
+        self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
+        self.assertNotIn("profit_growth_watermark", state)
+
+
+class TestJQuantsClientConstructionFailure(_WatchAndNotifyTestCase):
+    def test_client_construction_failure_reports_once_and_sets_no_jquants_watermark(self):
+        # APIキー未設定・不正等でJQuantsClient自体の構築が失敗する場合、
+        # ストップ高・経常利益急増の両方に等しく影響する単一の原因のため、
+        # 1つのエラーとしてまとめて報告し、どちらのwatermarkも進めない。
+        self.mocks = {}
+        with ExitStack() as stack:
+            def _patch(target, **kwargs):
+                m = stack.enter_context(patch(f"{_MOD}.{target}", **kwargs))
+                self.mocks[target] = m
+                return m
+
+            stack.enter_context(patch.dict(f"{_MOD}.os.environ", _DEFAULT_ENV, clear=True))
+            _patch("today_jst", return_value=_TODAY)
+            _patch("is_market_holiday", return_value=False)
+            _patch("JQuantsClient", side_effect=RuntimeError("invalid api key"))
+            _patch("tdnet_client.get_disclosures_range", return_value=_empty_df())
+            _patch("rules.detect_stock_split", return_value=_empty_df())
+            _patch("jpx_new_listings.fetch_new_listing_table", return_value=_empty_listings_df())
+            mock_send = _patch("discord_notify.send_discord_message")
+
+            result = wan.main()
+
+        self.assertEqual(result, 1)
+        mock_send.assert_called_once()
+        state = self._load_state()
+        self.assertNotIn("stop_high_watermark", state)
+        self.assertNotIn("profit_growth_watermark", state)
 
 
 class TestPerSourceWatermarkCommit(_WatchAndNotifyTestCase):
@@ -263,7 +336,7 @@ class TestPerSourceWatermarkCommit(_WatchAndNotifyTestCase):
         state = self._load_state()
         self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
         self.assertNotIn(f"stock_split|5678|{_TODAY.isoformat()}", state["notified"])
-        self.assertEqual(state["jquants_watermark"], _TODAY.isoformat())
+        self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
         self.assertNotIn("tdnet_watermark", state)
 
 
@@ -291,7 +364,7 @@ class TestSourceIsolation(_WatchAndNotifyTestCase):
         self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
         # J-Quants側は成功しているためウォーターマークは進む。TDnet側は
         # 失敗しているため進まない（次回もこの範囲を再走査する）。
-        self.assertEqual(state["jquants_watermark"], _TODAY.isoformat())
+        self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
         self.assertNotIn("tdnet_watermark", state)
 
 
@@ -316,7 +389,7 @@ class TestProfitGrowthLookbackAnchoredToScanStart(_WatchAndNotifyTestCase):
         # 静かに見逃される（2026-08-27の3巡目のCodexレビューで指摘・修正）。
         old_watermark = (_TODAY - dt.timedelta(days=20)).isoformat()
         with self.state_path.open("w", encoding="utf-8") as f:
-            json.dump({"notified": {}, "jquants_watermark": old_watermark}, f)
+            json.dump({"notified": {}, "profit_growth_watermark": old_watermark}, f)
 
         self._run()
 
@@ -396,7 +469,8 @@ class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
         self.assertEqual(result, 0)
         mock_send.assert_not_called()
         state = self._load_state()
-        self.assertEqual(state["jquants_watermark"], _TODAY.isoformat())
+        self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
+        self.assertEqual(state["profit_growth_watermark"], _TODAY.isoformat())
         self.assertEqual(state["tdnet_watermark"], _TODAY.isoformat())
         self.assertEqual(state["ipo_watermark"], _TODAY.isoformat())
 
@@ -404,7 +478,7 @@ class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
 class TestScanStart(unittest.TestCase):
     def test_no_watermark_falls_back_to_lookback_days(self):
         today = dt.date(2026, 8, 27)
-        start = wan._scan_start({}, "jquants_watermark", today)
+        start = wan._scan_start({}, "stop_high_watermark", today)
         self.assertEqual(start, today - dt.timedelta(days=wan.LOOKBACK_DAYS))
 
     def test_watermark_covers_a_gap_longer_than_lookback_days(self):
@@ -413,21 +487,21 @@ class TestScanStart(unittest.TestCase):
         # （2026-08-27のCodexレビューで指摘・修正）。
         today = dt.date(2026, 5, 7)
         watermark = (today - dt.timedelta(days=9)).isoformat()  # LOOKBACK_DAYS(5)より長い空白
-        state = {"jquants_watermark": watermark}
-        start = wan._scan_start(state, "jquants_watermark", today)
+        state = {"stop_high_watermark": watermark}
+        start = wan._scan_start(state, "stop_high_watermark", today)
         self.assertEqual(start, today - dt.timedelta(days=9))
 
     def test_watermark_is_capped_at_max_catch_up_days(self):
         today = dt.date(2026, 8, 27)
         very_old = (today - dt.timedelta(days=200)).isoformat()
-        state = {"jquants_watermark": very_old}
-        start = wan._scan_start(state, "jquants_watermark", today)
+        state = {"stop_high_watermark": very_old}
+        start = wan._scan_start(state, "stop_high_watermark", today)
         self.assertEqual(start, today - dt.timedelta(days=wan.MAX_CATCH_UP_DAYS))
 
     def test_invalid_watermark_falls_back_to_lookback_days(self):
         today = dt.date(2026, 8, 27)
-        state = {"jquants_watermark": "not-a-date"}
-        start = wan._scan_start(state, "jquants_watermark", today)
+        state = {"stop_high_watermark": "not-a-date"}
+        start = wan._scan_start(state, "stop_high_watermark", today)
         self.assertEqual(start, today - dt.timedelta(days=wan.LOOKBACK_DAYS))
 
 

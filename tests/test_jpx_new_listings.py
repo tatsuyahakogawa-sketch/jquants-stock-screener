@@ -15,7 +15,7 @@ import datetime as dt
 import unittest
 
 from src.jpx_new_listings import (
-    detect_listings_today,
+    detect_listings_since,
     detect_new_listing_approvals,
     parse_new_listing_table,
 )
@@ -113,16 +113,30 @@ class TestDetectNewListingApprovals(unittest.TestCase):
         self.assertTrue(hit.empty)
 
 
-class TestDetectListingsToday(unittest.TestCase):
+class TestDetectListingsSince(unittest.TestCase):
     def test_listing_date_matching_today_is_included(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_today(df, today=dt.date(2026, 9, 25))
+        hit = detect_listings_since(df, since=dt.date(2026, 9, 25), today=dt.date(2026, 9, 25))
         self.assertEqual(list(hit["Code"]), ["634A"])
 
-    def test_listing_date_not_matching_today_is_excluded(self):
+    def test_listing_date_after_today_is_excluded(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_today(df, today=dt.date(2026, 9, 26))
+        hit = detect_listings_since(df, since=dt.date(2026, 9, 20), today=dt.date(2026, 9, 24))
         self.assertTrue(hit.empty)
+
+    def test_listing_date_before_since_is_excluded(self):
+        df = parse_new_listing_table(_SAMPLE_HTML)
+        hit = detect_listings_since(df, since=dt.date(2026, 9, 26), today=dt.date(2026, 9, 30))
+        self.assertTrue(hit.empty)
+
+    def test_listing_date_missed_on_its_day_is_still_found_on_a_later_run(self):
+        # 上場日当日の取得・送信が一時的に失敗しても、翌日以降の実行で
+        # sinceが上場日以前のままであれば再検出できる（2026-08-28の
+        # Codexレビューで指摘・修正。以前は今日との完全一致でしか
+        # 検出できず、翌日には永久に検出できなくなっていた）。
+        df = parse_new_listing_table(_SAMPLE_HTML)
+        hit = detect_listings_since(df, since=dt.date(2026, 9, 24), today=dt.date(2026, 9, 26))
+        self.assertEqual(list(hit["Code"]), ["634A"])
 
 
 if __name__ == "__main__":
