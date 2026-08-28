@@ -172,10 +172,12 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
 
     def test_second_candidate_send_failure_still_records_the_first(self):
         # ヘッダーと1件目の候補送信は成功し、2件目の送信で失敗した場合、
-        # 1件目は既に届いているため通知済みとして記録済みでなければならない
-        # （まとめて1通に送っていた際は、この場合も1件目まで含めて未記録に
-        # なり次回実行で重複通知していた。2026-08-27の3巡目のCodexレビューで
-        # 指摘・修正）。
+        # 1件目は既に届いているため通知済みとして記録済みでなければならず、
+        # かつ2件目がまだ未送信である以上jquants_watermarkは進めてはならない
+        # （進めてしまうと、次回以降2件目の日付がウォーターマークより古く
+        # なり二度と再走査されなくなる。情報源ごとの送信はtry/exceptで
+        # 分離しているため、main()自体は例外を送出せずエラーとして
+        # 報告する形になる。2026-08-27の2〜3巡目のCodexレビューで指摘・修正）。
         two_hits = pd.DataFrame([
             {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高1"},
             {"Code": "5678", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高2"},
@@ -204,15 +206,65 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
             # 1回目(ヘッダー)・2回目(1件目の候補)は成功、3回目(2件目の候補)で失敗
             mock_send = _patch(
                 "discord_notify.send_discord_message",
-                side_effect=[None, None, RuntimeError("network error")],
+                side_effect=[None, None, RuntimeError("network error"), None],
             )
 
-            with self.assertRaises(RuntimeError):
-                wan.main()
+            result = wan.main()
 
+        self.assertEqual(result, 1)
         state = self._load_state()
         self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
         self.assertNotIn(f"stop_high|5678|{_TODAY.isoformat()}", state["notified"])
+        self.assertNotIn("jquants_watermark", state)
+
+
+class TestPerSourceWatermarkCommit(_WatchAndNotifyTestCase):
+    def test_send_failure_in_one_source_does_not_block_another_sources_watermark(self):
+        # J-Quants側の候補は送信に成功し、TDnet側の候補は送信に失敗した場合、
+        # J-Quants側のwatermarkは確定してよいが、TDnet側は確定してはならない
+        # （情報源ごとに独立して送信・watermark確定するため。fetch時点での
+        # 障害分離と同じ考え方をDiscord送信の失敗にも適用する。2026-08-27の
+        # 3巡目のCodexレビューで指摘・修正）。
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        split_hit = pd.DataFrame([
+            {"Code": "5678", "Date": pd.Timestamp(_TODAY), "rule": "stock_split", "detail": "分割発表"},
+        ])
+        patches = []
+        self.mocks = {}
+        with ExitStack() as stack:
+            def _patch(target, **kwargs):
+                m = stack.enter_context(patch(f"{_MOD}.{target}", **kwargs))
+                self.mocks[target] = m
+                return m
+
+            stack.enter_context(patch.dict(f"{_MOD}.os.environ", _DEFAULT_ENV, clear=True))
+            _patch("today_jst", return_value=_TODAY)
+            _patch("is_market_holiday", return_value=False)
+            _patch("JQuantsClient", return_value=MagicMock())
+            _patch("endpoints.get_listed_info", return_value=_empty_df())
+            _patch("endpoints.get_daily_quotes_range", return_value=_empty_df())
+            _patch("endpoints.get_statements_range", return_value=_empty_df())
+            _patch("tdnet_client.get_disclosures_range", return_value=_empty_df())
+            _patch("rules.detect_stop_high", return_value=stop_high_hit)
+            _patch("rules.detect_stock_split", return_value=split_hit)
+            _patch("rules.detect_profit_growth_major", return_value=_empty_df())
+            _patch("jpx_new_listings.fetch_new_listing_table", return_value=_empty_listings_df())
+            # 1回目(ヘッダー)・2回目(jquants候補)は成功、3回目(tdnet候補)で失敗
+            _patch(
+                "discord_notify.send_discord_message",
+                side_effect=[None, None, RuntimeError("network error"), None],
+            )
+
+            result = wan.main()
+
+        self.assertEqual(result, 1)
+        state = self._load_state()
+        self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
+        self.assertNotIn(f"stock_split|5678|{_TODAY.isoformat()}", state["notified"])
+        self.assertEqual(state["jquants_watermark"], _TODAY.isoformat())
+        self.assertNotIn("tdnet_watermark", state)
 
 
 class TestSourceIsolation(_WatchAndNotifyTestCase):
@@ -253,6 +305,25 @@ class TestQuotesExcludeToday(_WatchAndNotifyTestCase):
         quotes_call = self.mocks["endpoints.get_daily_quotes_range"].call_args
         end_arg = quotes_call[0][2]
         self.assertEqual(end_arg, _TODAY - dt.timedelta(days=1))
+
+
+class TestProfitGrowthLookbackAnchoredToScanStart(_WatchAndNotifyTestCase):
+    def test_statements_fetch_start_uses_scan_start_not_today(self):
+        # ウォーターマークによる巻き戻り走査で最も古い候補日がstart(today
+        # 基準ではない)になりうるため、前年同期比較用の遡り取得もstartを
+        # 基準にしないと、巻き戻りが大きい場合に最も古い候補の比較対象
+        # データが取得範囲の外になり、閾値を満たす候補が「比較対象なし」で
+        # 静かに見逃される（2026-08-27の3巡目のCodexレビューで指摘・修正）。
+        old_watermark = (_TODAY - dt.timedelta(days=20)).isoformat()
+        with self.state_path.open("w", encoding="utf-8") as f:
+            json.dump({"notified": {}, "jquants_watermark": old_watermark}, f)
+
+        self._run()
+
+        statements_call = self.mocks["endpoints.get_statements_range"].call_args
+        fetch_start_arg = statements_call[0][1]
+        expected_start = (_TODAY - dt.timedelta(days=20)) - dt.timedelta(days=wan.PROFIT_GROWTH_LOOKBACK_DAYS)
+        self.assertEqual(fetch_start_arg, expected_start)
 
 
 class TestTdnetForceRefresh(_WatchAndNotifyTestCase):

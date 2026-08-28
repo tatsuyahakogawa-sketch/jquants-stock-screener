@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from src.discord_notify import DiscordNotifyError, send_discord_message
+from src.discord_notify import DiscordNotifyError, _MAX_RATE_LIMIT_RETRIES, send_discord_message
 
 _MOD = "src.discord_notify"
 
@@ -56,7 +56,7 @@ class TestSendDiscordMessage(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.status_code = 401
         mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
-            f"401 Client Error: Unauthorized for url: {secret_url}"
+            f"401 Client Error: Unauthorized for url: {secret_url}", response=mock_resp
         )
         with patch(f"{_MOD}.requests.post", return_value=mock_resp):
             with self.assertRaises(DiscordNotifyError) as ctx:
@@ -64,6 +64,55 @@ class TestSendDiscordMessage(unittest.TestCase):
 
         self.assertNotIn("super-secret-token", str(ctx.exception))
         self.assertIn("401", str(ctx.exception))
+
+    def test_connection_error_does_not_leak_webhook_url(self):
+        # requests.post自体が送出する接続エラー等（DNS失敗・タイムアウト等）も
+        # 例外メッセージにURL全体を含むことがあるため、raise_for_statusの
+        # HTTPErrorだけでなくこちらもサニタイズする（2026-08-27の3巡目の
+        # Codexレビューで指摘・修正）。
+        secret_url = "https://discord.com/api/webhooks/123/super-secret-token"
+        with patch(
+            f"{_MOD}.requests.post",
+            side_effect=requests.exceptions.ConnectionError(f"Failed to connect to {secret_url}"),
+        ):
+            with self.assertRaises(DiscordNotifyError) as ctx:
+                send_discord_message(secret_url, "hello")
+
+        self.assertNotIn("super-secret-token", str(ctx.exception))
+
+    def test_rate_limit_retries_then_succeeds(self):
+        rate_limited_resp = MagicMock()
+        rate_limited_resp.status_code = 429
+        rate_limited_resp.json.return_value = {"retry_after": 0.0}
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+
+        with (
+            patch(f"{_MOD}.requests.post", side_effect=[rate_limited_resp, ok_resp]) as mock_post,
+            patch(f"{_MOD}.time.sleep") as mock_sleep,
+        ):
+            send_discord_message("https://example.com/webhook", "hello")
+
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(0.0)
+        ok_resp.raise_for_status.assert_called_once()
+
+    def test_rate_limit_exhausts_retries_and_raises(self):
+        rate_limited_resp = MagicMock()
+        rate_limited_resp.status_code = 429
+        rate_limited_resp.json.return_value = {"retry_after": 0.0}
+        rate_limited_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "429 Too Many Requests", response=rate_limited_resp
+        )
+
+        with (
+            patch(f"{_MOD}.requests.post", return_value=rate_limited_resp) as mock_post,
+            patch(f"{_MOD}.time.sleep"),
+        ):
+            with self.assertRaises(DiscordNotifyError):
+                send_discord_message("https://example.com/webhook", "hello")
+
+        self.assertEqual(mock_post.call_count, _MAX_RATE_LIMIT_RETRIES + 1)
 
 
 if __name__ == "__main__":

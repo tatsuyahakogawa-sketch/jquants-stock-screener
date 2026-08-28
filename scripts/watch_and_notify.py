@@ -33,6 +33,14 @@ GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
     送ると、2000文字超で複数リクエストに分割された際、途中で失敗した時点で
     それ以前に届いた分もまとめて未記録のままになり、次回実行で二重に届いて
     しまう。2026-08-27のCodexレビューで指摘・修正）。
+  - ウォーターマーク（下記）の確定は情報源ごとに、その情報源の候補が
+    「全て」送信できてから行う（main()参照）。取得成功時点で即座に確定させて
+    いると、その後Discordへの送信が一部失敗した場合でも（既に送信成功した
+    他の候補がstateを保存する副作用で）先に進んだ値が保存されてしまい、
+    未送信の候補の日付がウォーターマークより古くなって次回以降二度と
+    再走査されなくなる（2026-08-27の3巡目のCodexレビューで指摘・修正）。
+    ある情報源の送信失敗は他の情報源の送信を妨げない（fetch側の独立性と
+    同じ考え方）。
   - GitHub Actionsの各実行は使い捨てのコンテナで、data/以下の変更は
     ワークフロー側でリポジトリにコミットしない限り次回実行時に残らない。
     通知済み状態・ウォーターマーク（state["jquants_watermark"]等。前回
@@ -47,6 +55,9 @@ GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
     （2026-08-27のCodexレビューで指摘）。次回はウォーターマーク
     （前回成功した走査の開始日）から走査することで、実行間隔が空いても
     （MAX_CATCH_UP_DAYSの上限まで）取りこぼさないようにする(_scan_start参照)。
+    経常利益急増の前年同期比較用の遡り取得は、この巻き戻りで最も古い候補日が
+    today基準ではなくstart基準になりうるため、todayではなくstartを起点に
+    遡る（2026-08-27の3巡目のCodexレビューで指摘・修正。_jquants_candidates参照）。
 """
 from __future__ import annotations
 
@@ -199,8 +210,19 @@ def _hits_to_candidates(
     return candidates
 
 
-def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
-    """J-Quants由来: ストップ高・経常利益急増。TDnetとは独立して失敗しうる
+WatermarkUpdate = tuple[str, str]
+
+
+def _jquants_candidates(
+    today: dt.date, state: dict, seen_keys: set[str]
+) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
+    """(候補一覧, ウォーターマーク更新案 or None, エラーメッセージ or None) を返す。
+
+    ウォーターマーク更新案は、この情報源の候補が全て送信し終わるまでは
+    stateに反映しない（呼び出し側のmain()に委ねる。_hits_to_candidates
+    docstring・main()参照）。
+
+    J-Quants由来: ストップ高・経常利益急増。TDnetとは独立して失敗しうる
     （TDnetの非公式ミラーは個人運営で不安定なことがある。CLAUDE.md参照）ため、
     このチェック全体を専用のtry/exceptで囲み、TDnet側の失敗と互いに
     影響しないようにする（2026-08-27のCodexレビューで指摘・修正）。
@@ -226,8 +248,16 @@ def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tup
         # 二度と取得されずストップ高を取りこぼす（2026-08-27のCodexレビューで
         # 指摘）。当日はそもそもデータが存在しないため、最初から対象に含めない。
         quotes_df = endpoints.get_daily_quotes_range(client, start, today - dt.timedelta(days=1))
+        # ウォーターマークによる巻き戻り走査(_scan_start参照)で、今回examineする
+        # 最も古い候補日はstart(today基準ではない)になりうる。前年同期比較は
+        # その候補日から最大400日前まで必要(detect_profit_growth_majorの
+        # gap_days.between(330, 400)参照)なため、遡り取得の起点もtodayではなく
+        # startを基準にする。todayを基準にすると、MAX_CATCH_UP_DAYSに近い
+        # 巻き戻りが起きた際に最も古い候補の比較対象データが取得範囲の外に
+        # なり、本来+50%以上のはずの候補が「比較対象なし」として静かに
+        # 見逃されうる（2026-08-27の3巡目のCodexレビューで指摘・修正）。
         statements_df = endpoints.get_statements_range(
-            client, today - dt.timedelta(days=PROFIT_GROWTH_LOOKBACK_DAYS), today
+            client, start - dt.timedelta(days=PROFIT_GROWTH_LOOKBACK_DAYS), today
         )
         hits = [
             rules.detect_stop_high(quotes_df),
@@ -235,18 +265,21 @@ def _jquants_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tup
         ]
     except Exception as e:
         logger.exception("J-Quants由来の条件チェックに失敗しました")
-        return [], f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}"
+        return [], None, f"⚠️ ストップ高・経常利益急増のチェックに失敗しました: {e}"
 
     candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
-    # ここまで到達した時点でこの範囲の走査自体は成功しているため、次回の
-    # 開始日を進める（Discordへの通知が後で失敗しても、再走査で無駄な
-    # API呼び出しが増えるだけで正しさには影響しないため、送信結果を待たずに
-    # ここで更新してよい）。
-    state["jquants_watermark"] = today.isoformat()
-    return candidates, None
+    # ウォーターマークの確定(stateへの反映)はmain()に委ねる。ここで直接
+    # state["jquants_watermark"]を進めてしまうと、この後Discordへの送信が
+    # 一部失敗した場合でも（既に送信成功した他の候補がstateを保存する
+    # 副作用で）先に進んだ値が保存されてしまい、未送信の候補の日付が
+    # ウォーターマークより古くなって次回以降二度と再走査されなくなる
+    # （2026-08-27の3巡目のCodexレビューで指摘・修正）。
+    return candidates, ("jquants_watermark", today.isoformat()), None
 
 
-def _tdnet_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
+def _tdnet_candidates(
+    today: dt.date, state: dict, seen_keys: set[str]
+) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
     """TDnet由来: 株式分割・株式併合。J-Quantsとは独立したtry/exceptで囲む
     （_jquants_candidates docstring参照）。
     """
@@ -267,20 +300,22 @@ def _tdnet_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple
             name_map = dict(zip(disclosures_df["company_code"].astype(str), disclosures_df["company_name"]))
     except Exception as e:
         logger.exception("TDnet由来の条件チェックに失敗しました")
-        return [], f"⚠️ 株式分割/併合のチェックに失敗しました（TDnet取得エラー）: {e}"
+        return [], None, f"⚠️ 株式分割/併合のチェックに失敗しました（TDnet取得エラー）: {e}"
 
     candidates = _hits_to_candidates(hits, name_map, start, today, state, seen_keys)
-    state["tdnet_watermark"] = today.isoformat()  # _jquants_candidatesと同じ理由
-    return candidates, None
+    return candidates, ("tdnet_watermark", today.isoformat()), None  # _jquants_candidatesと同じ理由
 
 
-def _ipo_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[list[Candidate], str | None]:
-    """(候補一覧, エラーメッセージ or None) を返す。"""
+def _ipo_candidates(
+    today: dt.date, state: dict, seen_keys: set[str]
+) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
+    """(候補一覧, ウォーターマーク更新案 or None, エラーメッセージ or None) を返す
+    （_jquants_candidates docstring参照）。"""
     try:
         listings = jpx_new_listings.fetch_new_listing_table()
     except Exception as e:
         logger.exception("JPX新規上場会社情報の取得に失敗しました")
-        return [], f"⚠️ JPX新規上場会社情報の取得に失敗しました: {e}"
+        return [], None, f"⚠️ JPX新規上場会社情報の取得に失敗しました: {e}"
 
     candidates = []
     # 実行間隔が長期休場等で空いても承認発表を取りこぼさないよう、
@@ -308,8 +343,7 @@ def _ipo_candidates(today: dt.date, state: dict, seen_keys: set[str]) -> tuple[l
         message = f"🎉 本日新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）"
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message))
 
-    state["ipo_watermark"] = today.isoformat()  # _jquants_candidatesと同じ理由
-    return candidates, None
+    return candidates, ("ipo_watermark", today.isoformat()), None  # _jquants_candidatesと同じ理由
 
 
 def main() -> int:
@@ -329,44 +363,74 @@ def main() -> int:
     error_messages: list[str] = []
     seen_keys: set[str] = set()
 
-    jquants_candidates, jquants_error = _jquants_candidates(today, state, seen_keys)
+    jquants_candidates, jquants_watermark, jquants_error = _jquants_candidates(today, state, seen_keys)
     if jquants_error:
         had_error = True
         error_messages.append(jquants_error)
 
-    tdnet_candidates, tdnet_error = _tdnet_candidates(today, state, seen_keys)
+    tdnet_candidates, tdnet_watermark, tdnet_error = _tdnet_candidates(today, state, seen_keys)
     if tdnet_error:
         had_error = True
         error_messages.append(tdnet_error)
 
-    ipo_candidates, ipo_error = _ipo_candidates(today, state, seen_keys)
+    ipo_candidates, ipo_watermark, ipo_error = _ipo_candidates(today, state, seen_keys)
     if ipo_error:
         had_error = True
         error_messages.append(ipo_error)
 
+    sources = [
+        (jquants_candidates, jquants_watermark),
+        (tdnet_candidates, tdnet_watermark),
+        (ipo_candidates, ipo_watermark),
+    ]
     all_candidates = jquants_candidates + tdnet_candidates + ipo_candidates
 
     if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
-        # ヒットが無くてもウォーターマーク(state["*_watermark"])の更新は
-        # 保存する必要があるため、このまま返さずstateを保存してから終える。
+        # 候補が0件の情報源は、この走査範囲を全て「送信済み」扱いにできる
+        # ため、ウォーターマークをそのまま確定してよい。
+        for watermark_update in (jquants_watermark, tdnet_watermark, ipo_watermark):
+            if watermark_update:
+                key, value = watermark_update
+                state[key] = value
         _prune_state(state, today)
         _save_state(state)
         return 1 if had_error else 0
 
-    # 1件ずつ個別のメッセージとして送信し、成功するたびに直ちに通知済みとして
-    # 記録・保存する。全件をまとめて1通に送っていると、2000文字超で複数の
-    # Discordリクエストに分割された際、途中のリクエストが失敗した時点で
-    # それ以前に届いた分もまとめて未記録のままになり、次回実行で届いた分まで
-    # 再送してしまっていた（2026-08-27のCodexレビューで指摘・修正）。
+    # ヘッダーが送れない場合、後続の個別送信もほぼ確実に同じ理由で失敗する
+    # ため、ここで打ち切る（この時点ではまだ何も送信済みとして記録して
+    # いないので、ウォーターマークも含めstateは一切進めない）。
     if all_candidates:
         header = f"📅 {today:%Y-%m-%d} のスクリーニング結果（{len(all_candidates)}件）"
         discord_notify.send_discord_message(webhook_url, header)
-        for candidate in all_candidates:
-            discord_notify.send_discord_message(webhook_url, candidate.message)
-            state["notified"][candidate.state_key] = True
-            _prune_state(state, today)
-            _save_state(state)
+
+    # 情報源ごとに送信する。1件ずつ個別のメッセージとして送信し、成功する
+    # たびに直ちに通知済みとして記録・保存することで、全件をまとめて1通に
+    # 送った場合に起こる「複数リクエストへの分割中に途中で失敗すると、
+    # それ以前に届いた分もまとめて未記録のままになる」問題を避ける
+    # （2026-08-27のCodexレビューで指摘・修正）。
+    #
+    # ウォーターマークは、その情報源の候補が「全て」送信できてから確定する。
+    # 1件でも送信に失敗した場合はウォーターマークを進めない。既に進めて
+    # いた場合、未送信の候補の日付がウォーターマークより古くなり次回以降
+    # 二度と再走査されなくなる（2026-08-27の3巡目のCodexレビューで指摘・
+    # 修正）。ある情報源の送信失敗は他の情報源の送信を妨げない（fetch側の
+    # 独立性と同じ考え方）。
+    for candidates, watermark_update in sources:
+        try:
+            for candidate in candidates:
+                discord_notify.send_discord_message(webhook_url, candidate.message)
+                state["notified"][candidate.state_key] = True
+                _prune_state(state, today)
+                _save_state(state)
+            if watermark_update:
+                key, value = watermark_update
+                state[key] = value
+                _save_state(state)
+        except Exception as e:
+            logger.exception("Discordへの送信に失敗しました")
+            had_error = True
+            error_messages.append(f"⚠️ Discordへの送信に失敗しました: {e}")
 
     if error_messages:
         discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
