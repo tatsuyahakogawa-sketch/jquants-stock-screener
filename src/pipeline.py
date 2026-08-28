@@ -33,6 +33,7 @@ RULE_LABELS = {
     "stock_consolidation": "株式併合の発表",
     "equity_ratio_high": "自己資本比率60%以上",
     "profit_doubling": "経常利益が4年で2倍以上",
+    "profit_growth_major": "経常利益が前年同期比+50%以上（1.5倍以上）",
     "pbr_low": "PBR1倍以下",
     "two_quarter_growth": "四半期決算2期連続増収増益",
     "market_upgrade_to_prime": "スタンダード/グロースからプライムへの市場変更の発表",
@@ -75,6 +76,7 @@ YOY_LOOKBACK_RULES = [
     "sales_growth_doubling",
     "two_quarter_growth",
     "profit_doubling",
+    "profit_growth_major",
 ]
 
 # YOY_LOOKBACK_RULES（sales_growth_doublingを除く。専用の別軸取得を持つため）の
@@ -93,6 +95,7 @@ _LEGACY_LOOKBACK_RULE_REQUIRED_DAYS = {
     "sales_growth_explosive": 365 + 60,
     "two_quarter_growth": 365 + 60,
     "profit_doubling": 365 * PROFIT_DOUBLING_YEARS + 60,
+    "profit_growth_major": 365 + 60,
 }
 
 
@@ -180,8 +183,21 @@ def run_screening(
     # 使われないデータのために約4年分遡った開始日を計算してしまう）。
     legacy_lookback_rules = [r for r in YOY_LOOKBACK_RULES if r != "sales_growth_doubling"]
     needs_lookback = selected_rules is None or any(r in legacy_lookback_rules for r in selected_rules)
+    # 選択中の legacy_lookback_rules だけを見て、実際に必要な遡り日数の最大値
+    # だけ遡る。以前は選択内容に関わらず一律でprofit_doubling向けの
+    # 365*PROFIT_DOUBLING_YEARS+60日(約4年)を遡っていたため、1年分の比較で
+    # 足りるsales_growth_major/explosive/two_quarter_growth/profit_growth_major
+    # だけを選んだ場合でも、使われない3年分のデータのために大幅に余計な
+    # 取得時間（冷えたキャッシュでLightプランの60件/分の制限下、数十分単位）が
+    # かかっていた（2026-08-27の3巡目のCodexレビューで指摘・修正。
+    # affected_rulesの判定でも同じ選択集合を使うため、後段で再計算せず
+    # ここで求めた値を使い回す）。
+    selected_legacy_rules = (
+        legacy_lookback_rules if selected_rules is None
+        else [r for r in legacy_lookback_rules if r in selected_rules]
+    )
     if needs_lookback:
-        comparison_lookback_days = 365 * PROFIT_DOUBLING_YEARS + 60
+        comparison_lookback_days = max(_LEGACY_LOOKBACK_RULE_REQUIRED_DAYS[r] for r in selected_legacy_rules)
         statements_fetch_start = start - dt.timedelta(days=comparison_lookback_days)
     else:
         statements_fetch_start = start
@@ -213,11 +229,9 @@ def run_screening(
             # startが1年程度前までならクランプが発生していても無関係）。
             # 選択中の全YOY_LOOKBACK_RULESを一律に警告すると、影響を受けて
             # いないルールしか選んでいない場合にも不要な警告が出てしまう
-            # （2026-08-27の2巡目のCodexレビューで指摘・修正）。
-            selected_legacy_rules = (
-                legacy_lookback_rules if selected_rules is None
-                else [r for r in legacy_lookback_rules if r in selected_rules]
-            )
+            # （2026-08-27の2巡目のCodexレビューで指摘・修正。
+            # selected_legacy_rulesは上のcomparison_lookback_days計算と
+            # 同じものを使い回す）。
             available_days_from_start = (start - earliest_available_statements_date).days
             affected_rules = [
                 r for r in selected_legacy_rules
@@ -240,7 +254,6 @@ def run_screening(
     statements_df = endpoints.get_statements_range(client, statements_fetch_start, end)
 
     hits = [
-        rules.detect_stop_high(quotes_df),
         rules.detect_sales_growth(statements_df),
         rules.detect_earnings_beat(statements_df),
         rules.detect_equity_ratio(statements_df),
@@ -249,6 +262,39 @@ def run_screening(
         rules.detect_two_quarter_growth(statements_df),
         rules.detect_downward_revision(statements_df),
     ]
+    try:
+        # detect_stop_highは、quotes_dfが非空なのに必要な列を欠く場合
+        # （J-Quants側のスキーマ変更等）に例外を送出するように変更した
+        # (scripts/watch_and_notify.py専用の要件。同関数のdocstring参照)。
+        # この対話的画面ではその例外をそのまま送出すると他のルールの結果
+        # ごと画面がクラッシュしてしまうため、既存のTDnet取得失敗時や
+        # profit_growth_majorと同様に警告メッセージへ変換して処理を継続する
+        # （2026-08-28の10巡目のCodexレビューで指摘・修正）。
+        hits.append(rules.detect_stop_high(quotes_df))
+    except Exception as e:
+        messages.append(f"ストップ高の判定に失敗しました: {e}")
+
+    # profit_growth_major(経常利益が前年同期比+50%以上)が選択されていない
+    # 場合はhitsに追加しない。build_summary()はhits内の銘柄を全て集計し、
+    # app.pyはenrich_with_market_data()をselected_rulesによる絞り込みより
+    # 前に呼ぶため、無条件に追加すると選択していない銘柄までここで
+    # 時価総額・PER等の追加API呼び出し対象になってしまう
+    # （sales_growth_doubling以外の既存ルールにも共通する既知の特性だが、
+    # この行は今回新規に追加したものであり、選択されていない場合に
+    # スキップすることでその影響を増やさない。2026-08-28の8巡目の
+    # Codexレビューで指摘・修正）。
+    if selected_rules is None or "profit_growth_major" in selected_rules:
+        try:
+            # detect_profit_growth_majorは、statements_dfが非空なのに必要な
+            # 列を欠く場合（J-Quants側のスキーマ変更等）に例外を送出する
+            # ように変更した(scripts/watch_and_notify.py専用の要件。同関数の
+            # docstring参照)。この対話的画面ではその例外をそのまま送出すると
+            # 他のルールの結果ごと画面がクラッシュしてしまうため、既存の
+            # TDnet取得失敗時と同様に警告メッセージへ変換して処理を継続する
+            # （2026-08-28の9巡目のCodexレビューで指摘・修正）。
+            hits.append(rules.detect_profit_growth_major(statements_df))
+        except Exception as e:
+            messages.append(f"経常利益急増（前年同期比+50%以上）の判定に失敗しました: {e}")
 
     # "sales_growth_doubling"(1年で売上高2倍)は選択期間(start〜end)内の
     # イベントではなく「銘柄が現在その状態にあるか」を判定するため、

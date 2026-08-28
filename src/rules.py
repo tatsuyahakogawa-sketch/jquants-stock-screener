@@ -26,6 +26,7 @@ from src.config import (
     EQUITY_RATIO_THRESHOLD,
     PROFIT_DOUBLING_YEARS,
     PROFIT_DOUBLING_MULTIPLE,
+    PROFIT_GROWTH_MAJOR_THRESHOLD,
     DOWNWARD_REVISION_THRESHOLD,
     PBR_LOW_THRESHOLD,
 )
@@ -132,9 +133,26 @@ def _is_primary_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def detect_stop_high(quotes_df: pd.DataFrame) -> pd.DataFrame:
-    """ストップ高で終値が確定した(Code, Date)の一覧を返す。"""
-    if quotes_df.empty or QUOTES_UPPER_LIMIT_FLAG not in quotes_df.columns:
+    """ストップ高で終値が確定した(Code, Date)の一覧を返す。
+
+    quotes_dfが空でないのに必要な列を欠く場合は例外を送出する。
+    scripts/watch_and_notify.pyの呼び出し元(_stop_high_candidates)は
+    戻り値を「正常にスキャンできた（該当0件かもしれない）」とみなして
+    stop_high_watermarkを進めるため、空のDataFrameを黙って返すと
+    J-Quants側のスキーマ変更等でデータが壊れている場合でも気付けず、
+    その期間のストップ高を検出漏れのまま二度と再走査されなくなる
+    （detect_profit_growth_majorと同じ理由。2026-08-28の10巡目の
+    Codexレビューで指摘・修正）。
+    """
+    required = {QUOTES_CODE, QUOTES_DATE, QUOTES_UPPER_LIMIT_FLAG, QUOTES_CLOSE}
+    if quotes_df.empty:
         return pd.DataFrame(columns=[QUOTES_CODE, QUOTES_DATE, "rule", "detail"])
+    if not required.issubset(quotes_df.columns):
+        missing = sorted(required - set(quotes_df.columns))
+        raise ValueError(
+            f"quotes_dfに必要な列が不足しています（不足: {missing}）。"
+            "J-Quants側のスキーマ変更の可能性があります。"
+        )
     flag = _to_numeric(quotes_df[QUOTES_UPPER_LIMIT_FLAG]).fillna(0)
     hit = quotes_df.loc[flag == 1, [QUOTES_CODE, QUOTES_DATE, QUOTES_CLOSE]].copy()
     hit["rule"] = "stop_high"
@@ -383,8 +401,16 @@ def detect_current_sales_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
     # すると、逆にこのケースを取りこぼしてしまう。2026-08-25の6巡目の
     # Codexレビューで一度「実際の開示を優先」で修正したが、7巡目のレビューで
     # このケースを指摘され、開示日ベースの比較に修正した）。
+    # 同一日に複数回開示された場合（同日中の訂正等）、DiscDateだけでは
+    # タイになる。pandasのsort_values既定のquicksortはタイの並び順を
+    # 保証しないため、kind="stable"で明示的に安定ソートし、取得元
+    # (get_all_pages)が返した順序（実務上はより後に処理された開示ほど
+    # 後ろに来ると期待できる）をタイブレークとして使う。J-Quantsの
+    # /fins/summaryにはDiscDateより細かい時刻・通番の列が無いため、
+    # これが現状得られる最善のタイブレークになる（2026-08-27の3巡目の
+    # Codexレビューで指摘・修正）。
     key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
-    df = df.sort_values(STMT_DISCLOSED_DATE)
+    df = df.sort_values(STMT_DISCLOSED_DATE, kind="stable")
     df = df.drop_duplicates(subset=key_cols, keep="last")
     df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
 
@@ -529,6 +555,97 @@ def detect_profit_doubling(statements_df: pd.DataFrame) -> pd.DataFrame:
                     ),
                 })
     return pd.DataFrame(hits, columns=["Code", "Date", "rule", "detail"])
+
+
+def detect_profit_growth_major(statements_df: pd.DataFrame) -> pd.DataFrame:
+    """同一の決算期タイプ(CurPerType)の前年同期と比べ、経常利益(OdP)が
+    +50%以上(1.5倍以上)に増えた開示の一覧。scripts/watch_and_notify.py専用
+    （比較期間が前年同期(1年)である点がPROFIT_DOUBLING_YEARS(4年)比較の
+    profit_doublingと異なる。detect_sales_growthと同じ考え方で、売上高の
+    代わりに経常利益で判定する）。
+
+    前年同期が赤字（0以下）の場合は「何倍」という比率に意味が無いため対象外
+    とする（黒字転換はdetect_downward_revisionの逆で別軸の話であり、この
+    ルールでは扱わない）。
+
+    J-Quantsは「1開示=1行」だが、同一期(Code, CurPerType, CurPerEn)について
+    訂正決算短信等で後から再度開示されることがあり、その場合は同じ期の行が
+    複数行存在する。愚直にgroupby().shift(1)すると、どちらが「前の期」に
+    なるかがAPIの返却順（実質的には元データの並び順）に依存してしまい、
+    訂正で閾値を下回った後でも訂正前の値でヒットし続けたり、同一期の重複行
+    同士が0日ギャップで前後関係にされたりする不具合になる
+    （detect_current_sales_doublingと同じ問題。2026-08-27のCodexレビューで
+    指摘）。比較の計算に入る前に、同一期内は最新の開示日(DiscDate)の行だけに
+    絞る。
+
+    同一期内の絞り込み(最新DiscDateの行だけを残す)は、OdPの数値変換・欠損
+    除外より前に行う。先にOdPが欠損の行を除外してしまうと、取り下げ・訂正で
+    最新の開示がOdPを欠く場合にその行が絞り込みの土俵にすら乗らず、古い
+    （既に取り下げられたはずの）非欠損の行がそのまま「その期の代表行」として
+    生き残り、訂正前の数値で+50%と誤判定しうる（2026-08-28の8巡目のCodexレビューで
+    指摘・修正。同一日タイのケースとは別の、訂正後の値が欠損になるケース）。
+
+    statements_dfが空でないのに必要な列が欠けている場合は、J-Quants側の
+    スキーマ変更等でデータ取得自体が壊れている可能性が高い。この関数の
+    呼び出し元(scripts/watch_and_notify.py._profit_growth_candidates)は
+    戻り値を「正常にスキャンできた（該当0件かもしれないが取得自体は成功）」
+    とみなしてprofit_growth_watermarkを進めるため、ここで空のDataFrameを
+    黙って返すと、この期間の候補が実際にあっても検出漏れのまま二度と
+    再走査されなくなる。空の入力（該当データが単に存在しない、正常な状態）
+    と、非空なのにスキーマが壊れている異常な状態を区別し、後者は例外を
+    送出して呼び出し元のtry/exceptに検知させる（2026-08-28の9巡目の
+    Codexレビューで指摘・修正）。
+    """
+    required = {STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END, STMT_ORDINARY_PROFIT, STMT_DISCLOSED_DATE}
+    if statements_df.empty:
+        return pd.DataFrame(columns=["Code", "Date", "rule", "detail"])
+    if not required.issubset(statements_df.columns):
+        missing = sorted(required - set(statements_df.columns))
+        raise ValueError(
+            f"statements_dfに必要な列が不足しています（不足: {missing}）。"
+            "J-Quants側のスキーマ変更の可能性があります。"
+        )
+
+    df = statements_df.copy()
+    df[STMT_PERIOD_END] = pd.to_datetime(df[STMT_PERIOD_END], errors="coerce")
+    df[STMT_DISCLOSED_DATE] = pd.to_datetime(df[STMT_DISCLOSED_DATE], errors="coerce")
+    df = df.dropna(subset=[STMT_PERIOD_END, STMT_DISCLOSED_DATE])
+
+    # 同一日に複数回開示された場合（同日中の訂正等）、DiscDateだけではタイに
+    # なる。pandasのsort_values既定のquicksortはタイの並び順を保証しない
+    # ため、kind="stable"で明示的に安定ソートし、取得元(get_all_pages)が
+    # 返した順序をタイブレークとして使う（detect_current_sales_doublingと
+    # 同じ対応。2026-08-27の3巡目のCodexレビューで指摘・修正）。
+    key_cols = [STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END]
+    df = df.sort_values(STMT_DISCLOSED_DATE, kind="stable")
+    df = df.drop_duplicates(subset=key_cols, keep="last")
+    df = df.sort_values([STMT_CODE, STMT_PERIOD_TYPE, STMT_PERIOD_END])
+
+    # 同一期の絞り込みが終わった後で数値変換する。ここでOdPが欠損になる行
+    # （取り下げ等でその期の最新開示に数値が無い場合）を明示的にdropnaは
+    # しない。その期自体はヒット対象外になり（growthがNaNになり後段のvalid
+    # 判定で自然に除外される）、かつ次の期からの比較基準(prev_ordinary_profit)
+    # としても「不明」のままNaNが伝播し、誤って古い値まで遡って比較される
+    # ことはない。
+    df[STMT_ORDINARY_PROFIT] = _to_numeric(df[STMT_ORDINARY_PROFIT])
+
+    df["prev_ordinary_profit"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_ORDINARY_PROFIT].shift(1)
+    df["prev_period_end"] = df.groupby([STMT_CODE, STMT_PERIOD_TYPE])[STMT_PERIOD_END].shift(1)
+
+    valid = df["prev_ordinary_profit"].notna() & (df["prev_ordinary_profit"] > 0)
+    gap_days = (df[STMT_PERIOD_END] - df["prev_period_end"]).dt.days
+    valid &= gap_days.between(330, 400)
+    valid &= _is_primary_mask(df)
+
+    growth = (df[STMT_ORDINARY_PROFIT] - df["prev_ordinary_profit"]) / df["prev_ordinary_profit"]
+    df["growth_rate"] = growth
+    df["detail"] = "前年同期比 経常利益 " + (df["growth_rate"] * 100).round(1).astype(str) + "% 増"
+
+    hit = df.loc[valid & (growth >= PROFIT_GROWTH_MAJOR_THRESHOLD)].copy()
+    hit["rule"] = "profit_growth_major"
+    return hit[[STMT_CODE, STMT_DISCLOSED_DATE, "rule", "detail"]].rename(
+        columns={STMT_CODE: "Code", STMT_DISCLOSED_DATE: "Date"}
+    )
 
 
 def detect_downward_revision(statements_df: pd.DataFrame) -> pd.DataFrame:

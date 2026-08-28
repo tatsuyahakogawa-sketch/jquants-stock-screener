@@ -22,6 +22,24 @@ def _row(code, per_type, per_end, disc_date, sales, odp, is_primary=None):
     return row
 
 
+class TestDetectStopHigh(unittest.TestCase):
+    def test_empty_input_returns_empty_without_raising(self):
+        result = rules.detect_stop_high(pd.DataFrame())
+        self.assertTrue(result.empty)
+
+    def test_nonempty_input_missing_required_column_raises(self):
+        # 空の入力（該当データが単に存在しない、正常な状態）と、非空なのに
+        # 必要な列（UL等）が欠けている状態（J-Quants側のスキーマ変更等、
+        # 異常な状態）を区別する。後者を空のDataFrameとして黙って返すと、
+        # scripts/watch_and_notify.pyの呼び出し元が「正常にスキャンできた
+        # （該当0件）」とみなしてstop_high_watermarkを進めてしまい、
+        # この期間のストップ高を検出漏れのまま二度と再走査しなくなる
+        # （2026-08-28の10巡目のCodexレビューで指摘・修正）。
+        quotes = pd.DataFrame([{"Code": "1234", "Date": "2026-08-27", "C": 500.0}])  # UL列が無い
+        with self.assertRaises(ValueError):
+            rules.detect_stop_high(quotes)
+
+
 class TestDetectTwoQuarterGrowth(unittest.TestCase):
     def test_hit_uses_only_primary_rows_for_the_disclosure_sequence(self):
         # src/tdnet_xbrl.pyの合成行(IsPrimary=False。開示に埋め込まれた前年
@@ -122,6 +140,115 @@ class TestDetectSalesGrowth(unittest.TestCase):
             {"sales_growth_major", "sales_growth_explosive"},
         )
         self.assertNotIn("sales_growth_doubling", set(result["rule"]))
+
+
+class TestDetectProfitGrowthMajor(unittest.TestCase):
+    def test_empty_input_returns_empty_without_raising(self):
+        result = rules.detect_profit_growth_major(pd.DataFrame())
+        self.assertTrue(result.empty)
+
+    def test_nonempty_input_missing_required_column_raises(self):
+        # 空の入力（該当データが単に存在しない、正常な状態）と、非空なのに
+        # 必要な列が欠けている状態（J-Quants側のスキーマ変更等、異常な状態）
+        # を区別する。後者を空のDataFrameとして黙って返すと、
+        # scripts/watch_and_notify.pyの呼び出し元が「正常にスキャンできた
+        # （該当0件）」とみなしてprofit_growth_watermarkを進めてしまい、
+        # この期間の候補を検出漏れのまま二度と再走査しなくなる
+        # （2026-08-28の9巡目のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            {"Code": "1234", "CurPerType": "1Q", "CurPerEn": pd.Timestamp("2026-06-30")},
+        ])  # OdP・DiscDate列が無い
+        with self.assertRaises(ValueError):
+            rules.detect_profit_growth_major(statements)
+
+    def test_growth_over_threshold_is_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 経常利益 +60%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Code"], "1234")
+        self.assertEqual(result.iloc[0]["rule"], "profit_growth_major")
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-10"))
+
+    def test_growth_under_threshold_not_hit(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 13),  # 経常利益 +30%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_previous_year_loss_is_not_hit(self):
+        # 前年同期が赤字（0以下）の場合、「何倍」という比率に意味が無いため対象外
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, -10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_hit_uses_only_primary_rows(self):
+        # ヒット自体は実際の開示行に限定する（_is_primary_mask docstring参照）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16, is_primary=True),
+            _row("1234", "1Q", "2025-06-30", "2026-08-10", 100, 10, is_primary=False),
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-10"))
+
+    def test_correction_below_threshold_supersedes_original_hit(self):
+        # 同一期(Code, CurPerType, CurPerEn)が訂正決算短信で再度開示された
+        # 場合、開示日が最新の行(訂正後の値)だけを比較対象にする。訂正前の
+        # 値がgroupby().shift(1)の並び順次第でヒットに残ってしまわないことを
+        # 確認する（2026-08-27のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 訂正前 +60%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, 11),  # 訂正後 +10%（閾値未満）
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_same_day_tie_breaks_deterministically_by_input_order(self):
+        # 同一期(Code, CurPerType, CurPerEn)が同一日に複数回開示された場合
+        # （同日中の訂正等）、DiscDateだけではタイになる。安定ソート
+        # (kind="stable")により、取得元が返した順序で最後に並んでいる行
+        # （＝APIの返却順で後に処理された、より新しい情報とみなせる行）が
+        # 決定的に優先されることを確認する（2026-08-27の3巡目のCodexレビューで
+        # 指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 12),  # 同日1件目 +20%（閾値未満）
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 同日2件目 +60%（入力順で後）
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+
+    def test_withdrawal_leaving_profit_blank_supersedes_older_hit(self):
+        # 最新の開示(訂正・取り下げ)がOdPを欠く場合、その期はヒット対象外に
+        # なる。欠損を先に除外してしまうと、より古い非欠損の行がその期の
+        # 代表として生き残り、既に取り下げられたはずの数値で+50%と誤判定
+        # してしまう（2026-08-28の8巡目のCodexレビューで指摘・修正）。
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 16),  # 訂正前 +60%
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, None),  # 取り下げ(OdP欠損)
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertTrue(result.empty)
+
+    def test_correction_above_threshold_is_hit_with_corrected_date(self):
+        statements = pd.DataFrame([
+            _row("1234", "1Q", "2025-06-30", "2025-08-10", 100, 10),
+            _row("1234", "1Q", "2026-06-30", "2026-08-10", 130, 12),  # 訂正前 +20%（閾値未満）
+            _row("1234", "1Q", "2026-06-30", "2026-08-20", 130, 16),  # 訂正後 +60%
+        ])
+        result = rules.detect_profit_growth_major(statements)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["Date"], pd.Timestamp("2026-08-20"))
 
 
 class TestDetectCurrentSalesDoubling(unittest.TestCase):

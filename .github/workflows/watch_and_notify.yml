@@ -1,0 +1,158 @@
+name: watch-and-notify
+
+# 平日10:00・13:00 JSTに実行する（UTC 01:00/04:00。JSTはUTC+9で日付を
+# またがないため、UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
+# 日本の祝日はcronでは表現できないため、scripts/watch_and_notify.py内で
+# src.market_calendar.is_market_holiday()により実行時にスキップする。
+on:
+  schedule:
+    - cron: "0 1 * * 1-5"
+    - cron: "0 4 * * 1-5"
+  workflow_dispatch: {}
+
+# 通知済み状態を別ブランチ(notify-state)にpushするために書き込み権限が必要。
+permissions:
+  contents: write
+
+# workflow_dispatch（手動実行）が定期実行(schedule)と重なると、両方のジョブが
+# 互いの更新前のnotify-stateを読んでしまい、同じ候補を二重通知したり、
+# 後からpushした側がnon-fast-forwardで失敗して自分の送信結果が記録されない
+# ことがある（2026-08-27の3巡目のCodexレビューで指摘・修正）。同時に1つしか
+# 実行しないようにする（先着を打ち切らず、後続は順番待ちにする）。
+concurrency:
+  group: watch-and-notify
+  cancel-in-progress: false
+
+jobs:
+  watch-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # J-Quants/TDnetの日付単位バルク取得結果のローカルキャッシュ(data/cache/)を
+      # 実行間で永続化する。初回は過去分キャッシュが無いため経常利益比較用の
+      # 遡り取得(約425日分)に時間がかかるが、2回目以降は当日分だけ取得すれば
+      # よくなる（CLAUDE.md「未決事項」参照。同じ日付単位バルク取得+ローカル
+      # キャッシュという設計を使っている）。exactキーは常にmissさせて
+      # 毎回新しいキャッシュを保存し、restore-keysで直前の内容を復元する。
+      - uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: jquants-data-cache-${{ github.run_id }}
+          restore-keys: |
+            jquants-data-cache-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 通知済み状態・ウォーターマーク(data/notify_state.json)はmainには
+      # 置かない。このリポジトリはmainへのpushでStreamlit Community Cloudが
+      # 自動再デプロイされるため、機械的な状態更新のたびにmainへコミットすると
+      # 平日10:00/13:00に無関係な再デプロイが繰り返し走ってしまう
+      # （2026-08-27の3巡目のCodexレビューで指摘・修正）。代わりに
+      # notify-stateという専用ブランチだけに保存する（初回はブランチが
+      # 存在しないため、その場合は空の状態から開始する）。
+      - name: Restore notify state from the notify-state branch
+        run: |
+          mkdir -p data
+          # FETCH_HEADは一時的な参照で、fetchが失敗しても以前の(actions/checkout
+          # による)内容が残ってしまい「ブランチが存在するか」の判定に使えない。
+          # refs/remotes/origin/notify-state という名前付きの参照へ明示的に
+          # fetchし、後段のpushステップでも同じ参照で存在確認する。
+          #
+          # git ls-remoteの終了コードで「ブランチが本当に存在しない(2)」と
+          # 「一時的なネットワーク・認証エラー等で確認できなかった(それ以外)」
+          # を区別する。区別せずどちらも「存在しない」扱いにすると、後者の
+          # 場合に空の状態から再開してしまい、通知済みの銘柄まで全て
+          # 再走査・二重通知した上、実際には存在するブランチへのpushが
+          # non-fast-forwardで拒否される（2026-08-27の3巡目のCodexレビューで
+          # 指摘・修正）。確認できない場合は二重通知を避けるためジョブを
+          # 中断する（fail closed）。
+          if git ls-remote --exit-code origin notify-state >/dev/null 2>&1; then
+            git fetch origin notify-state:refs/remotes/origin/notify-state
+            # シェルのリダイレクト(>)は、コマンドの成否に関わらず出力先を
+            # 先に作成・空にする。data/notify_state.jsonへ直接リダイレクトすると、
+            # git showが何らかの理由で失敗した場合でも空ファイルが残ってしまい、
+            # 後段のpushステップ(if: always())がその空ファイルを「復元成功」と
+            # 誤認してnotify-stateブランチへそのままpushし、ブランチを破壊して
+            # しまう（以降の全実行がJSONパースに失敗し続ける）。一時ファイルに
+            # 出力し、内容を検証できてから初めて本来のパスへ配置する
+            # （2026-08-28のCodexレビューで指摘・修正）。
+            git show origin/notify-state:notify_state.json > data/notify_state.json.tmp
+            python -c "import json; json.load(open('data/notify_state.json.tmp', encoding='utf-8'))"
+            mv data/notify_state.json.tmp data/notify_state.json
+          else
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              echo '{"notified": {}}' > data/notify_state.json
+              echo "notify-state branch does not exist yet, starting fresh"
+            else
+              echo "::error::notify-stateブランチの存在確認に失敗しました(git ls-remote exit=$code)。通知の重複送信を避けるため処理を中断します。"
+              exit 1
+            fi
+          fi
+
+      # watch_and_notify.pyは、Discord送信自体は成功したが一部のチェック
+      # （JPX新規上場情報の取得等）が失敗した場合、その旨をDiscordに送った
+      # 上で非ゼロ終了する（CI上でエラーに気付けるようにするため）。
+      # ここでジョブを即失敗させるとこの後の状態push がスキップされ、
+      # 成功した分の通知まで次回再送されてしまうため、いったん
+      # continue-on-errorで先に進め、状態push後に改めて失敗させる。
+      - name: Run watch_and_notify
+        id: run
+        continue-on-error: true
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scripts/watch_and_notify.py
+
+      # notify-stateブランチには常にnotify_state.json 1個だけを含むコミットを
+      # 積む（gitのプラミングコマンドでツリー・コミットを直接組み立てることで、
+      # mainのファイル一式をチェックアウトし直す必要が無い）。
+      - name: Push updated notify state to the notify-state branch (never to main)
+        if: always()
+        run: |
+          if [ ! -f data/notify_state.json ]; then
+            # Restoreステップ自体が失敗した(fail closed)場合はここに来る。
+            # push対象が無いため何もしない（ジョブ全体は既に失敗扱いになる）。
+            echo "data/notify_state.json not found, nothing to push"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BLOB=$(git hash-object -w data/notify_state.json)
+          if git rev-parse --verify -q origin/notify-state >/dev/null; then
+            PARENT=$(git rev-parse origin/notify-state)
+            OLD_BLOB=$(git rev-parse "origin/notify-state:notify_state.json" 2>/dev/null || true)
+            if [ "$BLOB" = "$OLD_BLOB" ]; then
+              echo "notify state unchanged, skipping push"
+              exit 0
+            fi
+            TREE=$(printf '100644 blob %s\tnotify_state.json\n' "$BLOB" | git mktree)
+            COMMIT=$(git commit-tree "$TREE" -p "$PARENT" -m "chore: update notify state")
+          else
+            TREE=$(printf '100644 blob %s\tnotify_state.json\n' "$BLOB" | git mktree)
+            COMMIT=$(git commit-tree "$TREE" -m "chore: initialize notify state")
+          fi
+          # この時点でDiscordへの送信は既に完了している。pushが一時的な
+          # ネットワーク不調等で失敗すると、ローカルにしか残っていない
+          # 送信済み状態が失われ、次回実行が同じ通知を重複送信してしまう。
+          # 数回リトライしてから諦める（2026-08-28の9巡目のCodexレビューで
+          # 指摘・修正）。
+          for attempt in 1 2 3; do
+            if git push origin "$COMMIT:refs/heads/notify-state"; then
+              exit 0
+            fi
+            echo "git push failed (attempt $attempt/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::notify-stateへのpushが繰り返し失敗しました。Discordへの送信は完了していますが状態の記録に失敗したため、次回実行時に同じ内容を重複送信する可能性があります。"
+          exit 1
+
+      - name: Fail job if watch_and_notify reported an error
+        if: steps.run.outcome == 'failure'
+        run: exit 1
