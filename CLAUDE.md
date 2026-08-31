@@ -155,6 +155,23 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
   以前は選択内容に関わらず一律でprofit_doubling相当の約4年分を遡っていたため
   profit_growth_major単独選択時にも無駄な待ち時間が発生する不具合を指摘され、選択中の
   ルールが実際に必要とする日数の最大値だけ遡るよう修正した）
+- `.github/workflows/watch_and_notify.yml`のschedule実行（平日10:00・13:00 JST）が
+  2026-08-31に2回連続（10:00・13:00 JSTの両方）で発火しなかった。切り分けのため以下を確認済み:
+  (1) `workflow_dispatch`（手動実行）は同日中に2回とも正常に成功しており、Secrets
+  （`JQUANTS_API_KEY`・`DISCORD_WEBHOOK_URL`）・Actions権限（`contents: write`）・
+  Discord Webhook自体（実URLへ直接テストPOSTしdiscordが204を返すことを実機確認）は
+  いずれも問題なし。(2) ワークフローの状態は`gh api .../actions/workflows`で`state: "active"`、
+  cron構文（`0 1 * * 1-5` / `0 4 * * 1-5`、UTC）・ワークフローファイルが`main`（デフォルト
+  ブランチ）上に存在することも確認済み。(3) https://www.githubstatus.com/ 確認時点で、
+  この完全な未発火を説明できるような進行中の障害は見当たらなかった（直近のActions関連
+  インシデントは8/18・8/24・8/26でいずれも「遅延」であり「完全に発火しない」ものではなく、
+  かつ全て解決済み）。原因はGitHub Actions側でこのワークフローのschedule登録が反映されて
+  いない（またはできていない）可能性が高いと推測し、暫定対処としてワークフローファイルに
+  変更を加えて`main`へpush（2a3054d）し、cron再登録を試みた。翌営業日以降の自動発火有無を
+  要継続確認。恒久対策が必要な場合の候補: (a) scheduleが一定時間内に発火したかを検知する
+  監視の追加（例: 別ジョブが`gh api .../actions/runs`を見て`event: schedule`の最終実行時刻を
+  チェックし、閾値超過でDiscordに警告する）、(b) cron式を毎時ちょうど(`:00`)から数分ずらす
+  （GitHub公式が「毎時ちょうどは高負荷になりやすく遅延しやすい」と明言しているため）。
 
 ## 注意事項
 
