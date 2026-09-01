@@ -280,6 +280,30 @@ LINE通知は非対応。LINE Notify（個人向けの簡単な通知サービ�
 提供終了済みで、代替のLINE Messaging APIはLINE公式アカウント（Bot）の作成が
 別途必要になるため、2026-08-27時点ではDiscordのみに対応している。
 
+## メール通知（日次まとめ）
+
+上記Discord通知（平日10:00・13:00 JST）とは別に、毎朝9:00 JST（平日）に
+「前営業日にDiscordへ通知した内容」をまとめて1通のメールで再掲するバッチ
+（`scripts/send_daily_email.py`、GitHub Actions
+`.github/workflows/daily_email_digest.yml`から実行。2026-09-01にユーザー指定）。
+
+`scripts/watch_and_notify.py`がDiscordへ送信するたびに`data/notify_state.json`の
+`notified`エントリへ送信時刻(JST)と送信本文を記録しており、このバッチはそれを
+読むだけで新たにデータを取得し直さない（読み取り専用。`notify-state`ブランチへの
+書き込みは行わない）。該当銘柄が無かった日も「該当銘柄はありませんでした」という
+メールを送る（バッチ自体が動いていることの簡易的な生存確認を兼ねる）。
+
+### セットアップ
+
+1. 送信元にするGoogleアカウントで2段階認証を有効にし、
+   [アプリパスワード](https://myaccount.google.com/apppasswords)を発行する
+2. GitHubリポジトリの「Settings > Secrets and variables > Actions」で、
+   `GMAIL_ADDRESS`（送信元Gmailアドレス）・`GMAIL_APP_PASSWORD`（手順1で
+   発行したアプリパスワード）・`NOTIFY_EMAIL_TO`（送り先メールアドレス。
+   送信元と同じでもよい）をRepository secretsとして登録する
+3. `.github/workflows/daily_email_digest.yml`が自動的にスケジュール実行される
+   （「Actions」タブから`workflow_dispatch`で手動実行して動作確認も可能）
+
 ## 免責事項
 
 本アプリの判定結果は投資判断の参考情報であり、投資助言ではない。自己判断・自己責任で利用すること。

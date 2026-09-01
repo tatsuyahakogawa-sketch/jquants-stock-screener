@@ -77,6 +77,7 @@ class _WatchAndNotifyTestCase(unittest.TestCase):
 
             stack.enter_context(patch.dict(f"{_MOD}.os.environ", env, clear=True))
             _patch("today_jst", return_value=_TODAY)
+            _patch("_now_jst", return_value=dt.datetime.combine(_TODAY, dt.time(12, 0), tzinfo=wan.JST))
             _patch("is_market_holiday", return_value=holiday)
             _patch("JQuantsClient", return_value=MagicMock())
             _patch("endpoints.get_listed_info", return_value=_empty_df())
@@ -152,8 +153,15 @@ class TestStopHighNotification(_WatchAndNotifyTestCase):
         self.assertIn("ストップ高", sent_text)
 
         state = self._load_state()
-        self.assertIn(f"stop_high|1234|{_TODAY.isoformat()}", state["notified"])
+        key = f"stop_high|1234|{_TODAY.isoformat()}"
+        self.assertIn(key, state["notified"])
         self.assertEqual(state["stop_high_watermark"], _TODAY.isoformat())
+
+        # sent_at・messageはscripts/send_daily_email.pyが日次まとめメールを
+        # 組み立てる際に読む（2026-09-01追加）。
+        recorded = state["notified"][key]
+        self.assertIn("ストップ高", recorded["message"])
+        self.assertTrue(recorded["sent_at"].startswith(_TODAY.isoformat()))
 
     def test_already_notified_hit_is_not_sent_again(self):
         self._run(stop_high=self._stop_high_hit())
