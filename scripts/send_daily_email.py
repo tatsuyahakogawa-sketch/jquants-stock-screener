@@ -12,8 +12,11 @@ watch_and_notify.py自体の送信スケジュール（平日10:00・13:00 JST�
 （GitHub Actions側もnotify-stateブランチへのpushを行わない。
 .github/workflows/watch_and_notify.ymlが書き込む側、こちらは読むだけ）。
 
+NOTIFY_EMAIL_TOは複数の宛先をカンマ区切りで指定できる（2026-09-01にユーザーが
+社内の複数アドレスへの同報を指定したため）。
+
 実行方法（ローカル確認用。通常はGitHub Actionsから実行される）:
-    GMAIL_ADDRESS=... GMAIL_APP_PASSWORD=... NOTIFY_EMAIL_TO=... \
+    GMAIL_ADDRESS=... GMAIL_APP_PASSWORD=... NOTIFY_EMAIL_TO=a@example.com,b@example.com \
         python scripts/send_daily_email.py
 """
 from __future__ import annotations
@@ -57,6 +60,10 @@ def _load_state() -> dict:
         data = json.load(f)
     data.setdefault("notified", {})
     return data
+
+
+def _parse_recipients(raw: str) -> list[str]:
+    return [addr.strip() for addr in raw.split(",") if addr.strip()]
 
 
 def _previous_business_day(today: dt.date) -> dt.date:
@@ -115,16 +122,21 @@ def _build_email_body(target_day: dt.date, messages: list[str]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _send_email(smtp_user: str, smtp_password: str, to_addr: str, subject: str, body: str) -> None:
+def _send_email(
+    smtp_user: str, smtp_password: str, to_addrs: list[str], subject: str, body: str
+) -> None:
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = smtp_user
-    msg["To"] = to_addr
+    msg["To"] = ", ".join(to_addrs)
     msg.set_content(body)
     with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=30) as smtp:
         smtp.starttls()
         smtp.login(smtp_user, smtp_password)
-        smtp.send_message(msg)
+        # to_addrsを明示的に渡す。省略した場合smtplibはTo/Cc/Bccヘッダを
+        # 解析して宛先を決めるが、それに頼るよりヘッダ文字列の組み立てと
+        # 実際の宛先リストを常に一致させておく方が確実。
+        smtp.send_message(msg, to_addrs=to_addrs)
 
 
 def main() -> int:
@@ -136,9 +148,13 @@ def main() -> int:
 
     smtp_user = os.environ.get("GMAIL_ADDRESS")
     smtp_password = os.environ.get("GMAIL_APP_PASSWORD")
-    to_addr = os.environ.get("NOTIFY_EMAIL_TO")
-    if not smtp_user or not smtp_password or not to_addr:
+    to_addrs_raw = os.environ.get("NOTIFY_EMAIL_TO")
+    if not smtp_user or not smtp_password or not to_addrs_raw:
         logger.error("GMAIL_ADDRESS / GMAIL_APP_PASSWORD / NOTIFY_EMAIL_TO が設定されていません。")
+        return 1
+    to_addrs = _parse_recipients(to_addrs_raw)
+    if not to_addrs:
+        logger.error("NOTIFY_EMAIL_TO から有効な宛先を抽出できませんでした: %r", to_addrs_raw)
         return 1
 
     state = _load_state()
@@ -149,7 +165,7 @@ def main() -> int:
     body = _build_email_body(target_day, messages)
 
     try:
-        _send_email(smtp_user, smtp_password, to_addr, subject, body)
+        _send_email(smtp_user, smtp_password, to_addrs, subject, body)
     except Exception as e:
         # smtplibの例外はGmailアドレスを含みうるが、パスワード自体は
         # 含まないため、discord_notify.pyほど神経質に扱う必要はない。

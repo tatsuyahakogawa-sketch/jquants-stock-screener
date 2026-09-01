@@ -65,6 +65,21 @@ class _SendDailyEmailTestCase(unittest.TestCase):
         return result, smtp_instance
 
 
+class TestParseRecipients(unittest.TestCase):
+    def test_splits_and_strips_whitespace(self):
+        self.assertEqual(
+            sde._parse_recipients(" a@example.com, b@example.com ,c@example.com"),
+            ["a@example.com", "b@example.com", "c@example.com"],
+        )
+
+    def test_single_address(self):
+        self.assertEqual(sde._parse_recipients("a@example.com"), ["a@example.com"])
+
+    def test_empty_or_blank_yields_no_recipients(self):
+        self.assertEqual(sde._parse_recipients(""), [])
+        self.assertEqual(sde._parse_recipients("  ,  ,"), [])
+
+
 class TestPreviousBusinessDay(unittest.TestCase):
     def test_skips_weekend(self):
         # 2026-09-01(火)の前営業日は2026-08-31(月)。
@@ -155,6 +170,12 @@ class TestMain(_SendDailyEmailTestCase):
         self.assertEqual(result, 1)
         smtp_instance.send_message.assert_not_called()
 
+    def test_blank_recipient_list_returns_error_without_sending(self):
+        env = dict(_DEFAULT_ENV, NOTIFY_EMAIL_TO=" , ,")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 1)
+        smtp_instance.send_message.assert_not_called()
+
     def test_sends_digest_for_previous_business_day(self):
         self._write_state(
             {
@@ -174,6 +195,17 @@ class TestMain(_SendDailyEmailTestCase):
         self.assertEqual(sent_msg["From"], "sender@example.com")
         self.assertIn("2026-08-31", sent_msg["Subject"])
         self.assertIn("1234 テスト株式", sent_msg.get_content())
+
+    def test_multiple_recipients_are_split_and_all_addressed(self):
+        env = dict(_DEFAULT_ENV, NOTIFY_EMAIL_TO=" a@example.com, b@example.com ,c@example.com")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertEqual(sent_msg["To"], "a@example.com, b@example.com, c@example.com")
+        self.assertEqual(
+            smtp_instance.send_message.call_args.kwargs["to_addrs"],
+            ["a@example.com", "b@example.com", "c@example.com"],
+        )
 
     def test_no_hits_still_sends_confirmation_email(self):
         result, smtp_instance = self._run()

@@ -300,7 +300,8 @@ LINE通知は非対応。LINE Notify（個人向けの簡単な通知サービ�
 2. GitHubリポジトリの「Settings > Secrets and variables > Actions」で、
    `GMAIL_ADDRESS`（送信元Gmailアドレス）・`GMAIL_APP_PASSWORD`（手順1で
    発行したアプリパスワード）・`NOTIFY_EMAIL_TO`（送り先メールアドレス。
-   送信元と同じでもよい）をRepository secretsとして登録する
+   送信元と同じでもよい。複数宛先はカンマ区切りで指定可能）を
+   Repository secretsとして登録する
 3. `.github/workflows/daily_email_digest.yml`が自動的にスケジュール実行される
    （「Actions」タブから`workflow_dispatch`で手動実行して動作確認も可能）
 
