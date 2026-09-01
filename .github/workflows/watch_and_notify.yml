@@ -4,6 +4,12 @@ name: watch-and-notify
 # またがないため、UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
 # 日本の祝日はcronでは表現できないため、scripts/watch_and_notify.py内で
 # src.market_calendar.is_market_holiday()により実行時にスキップする。
+#
+# 2026-08-31: マージ後、2026-08-31 10:00/13:00 JSTのschedule実行が2回
+# 連続で発火しなかった（workflow_dispatchでの手動実行は正常に成功する
+# ため、Actions自体やSecrets設定の問題ではない）。GitHub側でこの
+# ワークフローファイルへのコミットがなくcron登録が反映されていない
+# 可能性があるため、ファイルを変更して再登録を試みる。
 on:
   schedule:
     - cron: "0 1 * * 1-5"
