@@ -2,9 +2,18 @@
   "ipo_watermark": "2026-09-01",
   "notified": {
     "ipo_approval|634A|2026-08-24": true,
-    "ipo_approval|640A|2026-09-01": true,
-    "ipo_approval|641A|2026-09-01": true,
-    "ipo_approval|642A|2026-09-01": true,
+    "ipo_approval|640A|2026-09-01": {
+      "message": "🆕 新規上場承認\n640A （株）ASNOVA Companies *（グロース）\n上場承認日: 2026-09-01 / 上場予定日: 2026-10-01",
+      "sent_at": "2026-09-01T18:17:00+09:00"
+    },
+    "ipo_approval|641A|2026-09-01": {
+      "message": "🆕 新規上場承認\n641A NOK Group（株） *（プライム）\n上場承認日: 2026-09-01 / 上場予定日: 2026-10-01",
+      "sent_at": "2026-09-01T18:17:00+09:00"
+    },
+    "ipo_approval|642A|2026-09-01": {
+      "message": "🆕 新規上場承認\n642A キューデンホールディングス（株） *（プライム）\n上場承認日: 2026-09-01 / 上場予定日: 2026-10-01",
+      "sent_at": "2026-09-01T18:17:00+09:00"
+    },
     "profit_growth_major|25900|2026-08-27": true,
     "profit_growth_major|57260|2026-08-25": true,
     "stock_consolidation|19090|2026-08-24T16:00:00": true,
