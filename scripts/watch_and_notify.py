@@ -68,6 +68,13 @@ _ipo_candidates）。ストップ高と経常利益急増はどちらもJ-Quants
     経常利益急増の前年同期比較用の遡り取得は、この巻き戻りで最も古い候補日が
     today基準ではなくstart基準になりうるため、todayではなくstartを起点に
     遡る（2026-08-27の3巡目のCodexレビューで指摘・修正。_jquants_candidates参照）。
+  - state["notified"][key]には送信成功時刻(sent_at)と実際に送った本文
+    (message)を保存する（2026-09-01にユーザー指定の朝9時メールまとめ機能の
+    ため追加）。scripts/send_daily_email.pyがこれを読み、前営業日に送信した
+    分だけを抽出してメールに再掲する。この値は単なる真偽値ではなく辞書に
+    なったが、他の箇所は全て`key in state["notified"]`という存在確認しか
+    行わないため後方互換（この変更前に書かれた値がTrueのままのエントリは
+    日次メールの対象からは無視されるだけで、動作に影響しない）。
 """
 from __future__ import annotations
 
@@ -84,7 +91,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import discord_notify, endpoints, jpx_new_listings, rules, tdnet_client
 from src.jquants_client import JQuantsClient
-from src.jst import today_jst
+from src.jst import JST, today_jst
 from src.market_calendar import is_market_holiday
 
 logger = logging.getLogger(__name__)
@@ -118,6 +125,12 @@ class Candidate:
         self.date = date  # 表示用（メッセージの日付表記等）。重複排除にはkeyを使う。
         self.message = message
         self.state_key = key
+
+
+def _now_jst() -> dt.datetime:
+    # テストでtoday_jst()と同様にpatchできるよう、dt.datetime.now(JST)を
+    # 薄いラッパー関数に切り出す。
+    return dt.datetime.now(JST)
 
 
 def _load_state() -> dict:
@@ -499,7 +512,15 @@ def main() -> int:
         try:
             for candidate in candidates:
                 discord_notify.send_discord_message(webhook_url, candidate.message)
-                state["notified"][candidate.state_key] = True
+                # sent_at・messageを残すのは、scripts/send_daily_email.pyが
+                # 「実際にDiscordへ送信した内容」をそのまま日次メールに再掲する
+                # ため。値がTrueのままの古いエントリ（この変更以前に書かれた分）
+                # は日次メールの対象外として無視される（実害はなく、対象の日付は
+                # とうに過ぎている）。
+                state["notified"][candidate.state_key] = {
+                    "sent_at": _now_jst().isoformat(),
+                    "message": candidate.message,
+                }
                 _prune_state(state, today)
                 _save_state(state)
             if watermark_update:
