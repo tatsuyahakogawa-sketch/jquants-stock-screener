@@ -112,7 +112,8 @@ Python + Streamlit に決定（2026-07-28）。個人利用のダッシュボー
 - `src/jpx_new_listings.py`: JPX公式サイトの「新規上場会社情報」ページ（東証本体のみ。UTF-8）をスクレイピングし、銘柄コード単位で上場日・上場承認日・市場区分を取得する。上場前の会社はTDnetアカウントを持たないため、TDnet開示だけでは東証新規上場の「上場承認」を網羅的に検出できないことを実データで確認した上で採用したデータ源（watch_and_notify.py専用）
 - `src/discord_notify.py`: Discord Webhookへのメッセージ送信（2000文字上限を超える場合は分割送信）
 - `src/market_calendar.py`: 土日・日本の祝日（`jpholiday`パッケージ）・東証の年末年始休場(12/31・1/2・1/3。国民の祝日ではないためjpholidayだけでは判定できない)判定。watch_and_notify.py専用
-- `scripts/send_daily_email.py`: 前営業日にDiscordへ通知した内容をまとめて平日9:00 JSTに1通のメールで再掲するバッチ（2026-09-01にユーザー指定、README「メール通知」参照）。GitHub Actions(`.github/workflows/daily_email_digest.yml`)から実行され、新規のデータ取得は行わずdata/notify_state.jsonを読むだけ（notify-stateブランチへの書き込みなし）。watch_and_notify.py側は送信成功のたびに`state["notified"][key]`を`{"sent_at": ..., "message": ...}`という辞書で保存するよう変更した（この機能追加前の値はTrueのままで、日次メールの対象からは無視されるだけで実害はない）
+- `scripts/send_daily_email.py`: 前営業日にDiscordへ通知した内容をまとめて平日9:00 JSTに1通のメールで再掲するバッチ（2026-09-01にユーザー指定、README「メール通知」参照）。GitHub Actions(`.github/workflows/daily_email_digest.yml`)から実行され、新規のデータ取得は行わずdata/notify_state.jsonを読むだけ（notify-stateブランチへの書き込みなし）。watch_and_notify.py側は送信成功のたびに`state["notified"][key]`を`{"sent_at": ..., "message": ...}`という辞書で保存するよう変更した。
+  - 2026-09-02に実機で判明: この変更を含むPRを`main`にマージする前（2026-08-31・09-01）に実際にDiscordへ送信された分は、当時稼働していた旧コードのままTrueで記録されており、日次メールの対象から漏れていた（「実害はない」という想定は誤りで、初回の日次メール（9/1分）で新規上場承認3件・ストップ高16件が実際に欠落した）。ユーザーがDiscordのスクリーンショットで気付いて発覚。J-Quants（stop_high。当該日の確定Close等は変わらないため再取得可能）・JPX新規上場ページ（ipo_approval。承認日は変わらない）から実データを再取得してsent_at/messageを補完し、notify-stateブランチを手動で修正した上でメールを再送して解消した。このズレは「機能追加のマージ時点をまたぐ移行期間中に送信された分」だけに限られる一度限りの事象で、マージ後は全ての送信がsent_at/message付きで記録されるため再発しない。
 
 ## 開発体制（Claude Code + Codexレビュー）
 
