@@ -237,11 +237,15 @@ Claude Codeに銘柄コード（または会社名）を伝えて「HPを見て�
 
 ## Discord通知（定期監視バッチ）
 
-`app.py`の対話的な画面とは別に、以下4条件を平日10:00・13:00 JSTに自動チェックし、
-新しく該当した銘柄があればDiscordに通知するバッチ（`scripts/watch_and_notify.py`、
-GitHub Actions `.github/workflows/watch_and_notify.yml`から実行）。土日・日本の
-祝日は市場が休みでデータが更新されないためスキップする（`src/market_calendar.py`、
-`jpholiday`パッケージが内閣府の祝日データに基づき判定）。
+`app.py`の対話的な画面とは別に、以下4条件を平日10:00・13:00・15:30 JSTに自動
+チェックし、新しく該当した銘柄があればDiscordに通知するバッチ
+（`scripts/watch_and_notify.py`、GitHub Actions
+`.github/workflows/watch_and_notify.yml`から実行）。土日・日本の祝日は市場が
+休みでデータが更新されないためスキップする（`src/market_calendar.py`、
+`jpholiday`パッケージが内閣府の祝日データに基づき判定）。15:30 JST枠は、
+大引け(15:00 JST)後に確定するストップ高を同日中に通知するために追加した
+（2026-09-17。それ以前は当日分を対象から除外していたため、確定した当日分でも
+必ず翌営業日の実行まで通知が遅れていた）。
 
 - ストップ高
 - 株式分割・株式併合の発表
@@ -264,7 +268,7 @@ GitHub Actions `.github/workflows/watch_and_notify.yml`から実行）。土日�
 実行間で永続化する（`contents: write`権限が必要）。`main`には置かない。
 このリポジトリは`main`へのpushでStreamlit Community Cloudが自動再デプロイ
 されるため、`main`に直接コミットすると機械的な状態更新のたびに無関係な
-再デプロイが平日10:00/13:00に繰り返し走ってしまう。
+再デプロイが平日10:00/13:00/15:30に繰り返し走ってしまう。
 
 ### セットアップ
 
@@ -282,7 +286,7 @@ LINE通知は非対応。LINE Notify（個人向けの簡単な通知サービ�
 
 ## メール通知（日次まとめ）
 
-上記Discord通知（平日10:00・13:00 JST）とは別に、毎朝9:00 JST（平日）に
+上記Discord通知（平日10:00・13:00・15:30 JST）とは別に、毎朝9:00 JST（平日）に
 「前営業日にDiscordへ通知した内容」をまとめて1通のメールで再掲するバッチ
 （`scripts/send_daily_email.py`、GitHub Actions
 `.github/workflows/daily_email_digest.yml`から実行。2026-09-01にユーザー指定）。

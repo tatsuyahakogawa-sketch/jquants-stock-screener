@@ -57,8 +57,23 @@ def get_listed_info(client: JQuantsClient, date: dt.date | None = None) -> pd.Da
 
 
 def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFrame:
-    """指定日の全銘柄分の株価四本値(/v2/equities/bars/daily)を取得する（キャッシュ利用）。"""
+    """指定日の全銘柄分の株価四本値(/v2/equities/bars/daily)を取得する（キャッシュ利用）。
+
+    dateが今日以降の場合はキャッシュを使わず毎回APIから取得し直す。株価四本値は
+    「大引け後に当日分を更新」とだけ案内されており(CLAUDE.md参照)、
+    get_statements_by_dateのような確定時刻(18:00/24:30)の案内が無いため
+    「いつ確定するか」を固定時刻で決め打ちできない。決め打ちした時刻で
+    恒久キーに切り替えると、その時刻を過ぎてもまだ未確定だった場合に
+    空/不完全なレスポンスを恒久キーで保存してしまい、後で確定しても
+    二度と取得されなくなる（2026-08-27のCodexレビューで指摘された問題と
+    同種）。dateが過去日になった時点で初めて恒久キーを使う（2026-09-17に
+    ユーザー要望でストップ高の同日即時通知に対応する際、この関数を毎回
+    呼び直しても確定後のデータを取り漏らさないようにするために導入）。
+    """
     date_str = date.strftime("%Y%m%d")
+    if date >= today_jst():
+        records = list(client.get_all_pages("/equities/bars/daily", {"date": date_str}))
+        return pd.DataFrame.from_records(records)
     cached = cache.load("daily_quotes", date_str)
     if cached is not None:
         return cached

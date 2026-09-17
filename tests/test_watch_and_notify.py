@@ -376,16 +376,17 @@ class TestSourceIsolation(_WatchAndNotifyTestCase):
         self.assertNotIn("tdnet_watermark", state)
 
 
-class TestQuotesExcludeToday(_WatchAndNotifyTestCase):
-    def test_daily_quotes_range_end_is_yesterday(self):
-        # 株価四本値は大引け後にしか当日分が更新されないため、大引け前に
-        # 実行される10:00/13:00 JSTの時点で当日を含めて取得すると空の
-        # レスポンスが恒久キーでキャッシュされてしまい、後で実際のデータが
-        # 揃っても再取得されない（2026-08-27のCodexレビューで指摘・修正）。
+class TestQuotesIncludesToday(_WatchAndNotifyTestCase):
+    def test_daily_quotes_range_end_is_today(self):
+        # endpoints.get_daily_quotes_by_dateが当日分をキャッシュせず毎回
+        # APIから取得し直すようになったため（2026-09-17、ストップ高の当日中
+        # 通知に対応）、ここでは当日を除外せず含めてよい。大引け前の実行
+        # （10:00/13:00 JST）では単に当日分が空で返るだけで、大引け後の
+        # 実行（15:30 JST）で確定済みの当日分を取得できる。
         self._run()
         quotes_call = self.mocks["endpoints.get_daily_quotes_range"].call_args
         end_arg = quotes_call[0][2]
-        self.assertEqual(end_arg, _TODAY - dt.timedelta(days=1))
+        self.assertEqual(end_arg, _TODAY)
 
 
 class TestProfitGrowthLookbackAnchoredToScanStart(_WatchAndNotifyTestCase):

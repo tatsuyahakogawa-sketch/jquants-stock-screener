@@ -1,9 +1,14 @@
 name: watch-and-notify
 
-# 平日10:00・13:00 JSTに実行する（UTC 01:00/04:00。JSTはUTC+9で日付を
-# またがないため、UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
+# 平日10:00・13:00・15:30 JSTに実行する（UTC 01:00/04:00/06:30。JSTはUTC+9で
+# 日付をまたがないため、UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
 # 日本の祝日はcronでは表現できないため、scripts/watch_and_notify.py内で
 # src.market_calendar.is_market_holiday()により実行時にスキップする。
+#
+# 15:30 JST枠は、大引け(15:00 JST)後に確定した当日分のストップ高を同日中に
+# 通知するために追加した（2026-09-17にユーザー要望。src/endpoints.py の
+# get_daily_quotes_by_date参照。以前は当日を対象から除外していたため、
+# 確定した当日分でも必ず翌営業日の実行まで通知が遅れていた）。
 #
 # 2026-08-31: マージ後、2026-08-31 10:00/13:00 JSTのschedule実行が2回
 # 連続で発火しなかった（workflow_dispatchでの手動実行は正常に成功する
@@ -14,6 +19,7 @@ on:
   schedule:
     - cron: "0 1 * * 1-5"
     - cron: "0 4 * * 1-5"
+    - cron: "30 6 * * 1-5"
   workflow_dispatch: {}
 
 # 通知済み状態を別ブランチ(notify-state)にpushするために書き込み権限が必要。
