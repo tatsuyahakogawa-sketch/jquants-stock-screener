@@ -10,7 +10,7 @@ app.py（対話的なスクリーニング画面）とは
   - ストップ高                                  -> rules.detect_stop_high
   - 株式分割・株式併合の発表                     -> rules.detect_stock_split
   - 経常利益が前年同期比+50%以上（1.5倍以上）     -> rules.detect_profit_growth_major
-  - 東証本体への新規上場（上場承認発表・当日上場） -> src/jpx_new_listings.py
+  - 東証本体への新規上場（上場承認発表・上場前日）   -> src/jpx_new_listings.py
 
 上記4条件は互いに独立したデータ源・エンドポイントを使い、それぞれ専用の
 try/exceptとウォーターマーク(state["*_watermark"])を持つ
@@ -388,22 +388,21 @@ def _ipo_candidates(
         )
         candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message, key))
 
-    # 完全一致(==today)ではなくsince以降の範囲で見る。JPXの取得やDiscordへの
-    # 送信が上場日当日に一時的に失敗した場合、翌日には「今日」が進んでしまい
-    # 完全一致では二度と検出できなくなるため（2026-08-28のCodexレビューで
-    # 指摘・修正。detect_listings_sinceのdocstring参照）。
-    listed_recently = jpx_new_listings.detect_listings_since(listings, since=since, today=today)
-    for _, row in listed_recently.iterrows():
+    # 上場当日ではなく前日にリマインダーとして知らせる。上場当日に知らせても
+    # 既に取引が始まっており手遅れなため（2026-09-17にユーザー指摘・変更）。
+    # detect_listings_tomorrowは意図的にwatermarkによるcatch-upを行わず
+    # 「今日の翌日」との完全一致のみを見る（他のruleと異なりcatch-upしない
+    # 理由はdocstring参照。一時的な取得・送信失敗で前日に送れなかった場合、
+    # 後日改めて送っても上場日を過ぎていて手遅れなため、送らない方がよいと
+    # ユーザーが明言した）。
+    listing_tomorrow = jpx_new_listings.detect_listings_tomorrow(listings, today=today)
+    for _, row in listing_tomorrow.iterrows():
         key = f"ipo_listed|{row['Code']}|{row['ListingDate'].isoformat()}"
         if key in state["notified"] or key in seen_keys:
             continue
         seen_keys.add(key)
-        # 「本日」ではなく実際の上場日を明記する。取得・送信の一時的な失敗で
-        # 上場日当日に送れず後日リトライされた場合、「本日新規上場」のままだと
-        # 実際にはtodayより前の日付なのに今日上場したかのように誤った内容を
-        # 伝えてしまう（2026-08-28のCodexレビューで指摘・修正）。
         message = (
-            f"🎉 新規上場\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
+            f"🔔 上場前日のお知らせ\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場日: {row['ListingDate']:%Y-%m-%d}"
         )
         candidates.append(Candidate("ipo_listed", row["Code"], row["ListingDate"], message, key))

@@ -15,7 +15,7 @@ import datetime as dt
 import unittest
 
 from src.jpx_new_listings import (
-    detect_listings_since,
+    detect_listings_tomorrow,
     detect_new_listing_approvals,
     parse_new_listing_table,
 )
@@ -127,30 +127,39 @@ class TestDetectNewListingApprovals(unittest.TestCase):
         self.assertTrue(hit.empty)
 
 
-class TestDetectListingsSince(unittest.TestCase):
-    def test_listing_date_matching_today_is_included(self):
+class TestDetectListingsTomorrow(unittest.TestCase):
+    def test_listing_date_matching_tomorrow_is_included(self):
+        # サンプルデータの634Aの上場日は2026-09-25。today=2026-09-24なら
+        # その翌日(明日)に当たるため、前日リマインダーの対象になる。
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 25), today=dt.date(2026, 9, 25))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 24))
         self.assertEqual(list(hit["Code"]), ["634A"])
 
-    def test_listing_date_after_today_is_excluded(self):
+    def test_listing_date_matching_today_is_excluded(self):
+        # 上場当日に知らせても既に取引が始まっており手遅れなため、
+        # today自身と一致する上場日は対象外（前日にのみ知らせる）。
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 20), today=dt.date(2026, 9, 24))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 25))
         self.assertTrue(hit.empty)
 
-    def test_listing_date_before_since_is_excluded(self):
+    def test_listing_date_further_in_the_future_is_excluded(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 26), today=dt.date(2026, 9, 30))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 23))
         self.assertTrue(hit.empty)
 
-    def test_listing_date_missed_on_its_day_is_still_found_on_a_later_run(self):
-        # 上場日当日の取得・送信が一時的に失敗しても、翌日以降の実行で
-        # sinceが上場日以前のままであれば再検出できる（2026-08-28の
-        # Codexレビューで指摘・修正。以前は今日との完全一致でしか
-        # 検出できず、翌日には永久に検出できなくなっていた）。
+    def test_listing_date_in_the_past_is_excluded(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 24), today=dt.date(2026, 9, 26))
-        self.assertEqual(list(hit["Code"]), ["634A"])
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 26))
+        self.assertTrue(hit.empty)
+
+    def test_missed_reminder_is_not_caught_up_later(self):
+        # 意図的にcatch-upしない。前日(2026-09-24)に一時的な失敗で送れな
+        # かった場合、後日(2026-09-26)の実行でも再送されない。上場当日以降に
+        # 「前日リマインダー」を送ってもユーザーにとって無意味なため、遅れて
+        # 送るよりは送らない方がよいとユーザーが明言した（2026-09-17）。
+        df = parse_new_listing_table(_SAMPLE_HTML)
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 26))
+        self.assertTrue(hit.empty)
 
 
 if __name__ == "__main__":
