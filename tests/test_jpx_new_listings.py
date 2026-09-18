@@ -14,8 +14,10 @@ from __future__ import annotations
 import datetime as dt
 import unittest
 
+import pandas as pd
+
 from src.jpx_new_listings import (
-    detect_listings_since,
+    detect_listings_tomorrow,
     detect_new_listing_approvals,
     parse_new_listing_table,
 )
@@ -127,30 +129,73 @@ class TestDetectNewListingApprovals(unittest.TestCase):
         self.assertTrue(hit.empty)
 
 
-class TestDetectListingsSince(unittest.TestCase):
-    def test_listing_date_matching_today_is_included(self):
+class TestDetectListingsTomorrow(unittest.TestCase):
+    def test_listing_date_matching_tomorrow_is_included(self):
+        # サンプルデータの634Aの上場日は2026-09-25。today=2026-09-24なら
+        # その翌日(明日)に当たるため、前日リマインダーの対象になる。
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 25), today=dt.date(2026, 9, 25))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 24))
         self.assertEqual(list(hit["Code"]), ["634A"])
 
-    def test_listing_date_after_today_is_excluded(self):
+    def test_listing_date_matching_today_is_excluded(self):
+        # 上場当日に知らせても既に取引が始まっており手遅れなため、
+        # today自身と一致する上場日は対象外（前日にのみ知らせる）。
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 20), today=dt.date(2026, 9, 24))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 25))
         self.assertTrue(hit.empty)
 
-    def test_listing_date_before_since_is_excluded(self):
+    def test_listing_date_further_in_the_future_is_excluded(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 26), today=dt.date(2026, 9, 30))
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 17))
         self.assertTrue(hit.empty)
 
-    def test_listing_date_missed_on_its_day_is_still_found_on_a_later_run(self):
-        # 上場日当日の取得・送信が一時的に失敗しても、翌日以降の実行で
-        # sinceが上場日以前のままであれば再検出できる（2026-08-28の
-        # Codexレビューで指摘・修正。以前は今日との完全一致でしか
-        # 検出できず、翌日には永久に検出できなくなっていた）。
+    def test_listing_date_in_the_past_is_excluded(self):
         df = parse_new_listing_table(_SAMPLE_HTML)
-        hit = detect_listings_since(df, since=dt.date(2026, 9, 24), today=dt.date(2026, 9, 26))
-        self.assertEqual(list(hit["Code"]), ["634A"])
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 26))
+        self.assertTrue(hit.empty)
+
+    def test_missed_reminder_is_not_caught_up_later(self):
+        # 意図的にcatch-upしない。前日(2026-09-24)に一時的な失敗で送れな
+        # かった場合、後日(2026-09-26)の実行でも再送されない。上場当日以降に
+        # 「前日リマインダー」を送ってもユーザーにとって無意味なため、遅れて
+        # 送るよりは送らない方がよいとユーザーが明言した（2026-09-17）。
+        df = parse_new_listing_table(_SAMPLE_HTML)
+        hit = detect_listings_tomorrow(df, today=dt.date(2026, 9, 26))
+        self.assertTrue(hit.empty)
+
+    def test_monday_listing_is_reminded_on_preceding_friday(self):
+        # 単純な「today+1日」との一致だと、月曜上場の前日は日曜(非営業日)に
+        # 当たり、ワークフロー自体が動かないため永久に検出できない
+        # （2026-09-17のCodexレビューで指摘・修正）。2026-08-31(月)は
+        # 上場日、その直前の営業日は2026-08-28(金)（間の8/29・30は土日）。
+        monday_listing = dt.date(2026, 8, 31)
+        listings = pd.DataFrame([
+            {
+                "Code": "999A", "CompanyName": "月曜上場テスト", "MarketSegment": "グロース",
+                "ListingDate": monday_listing, "ApprovalDate": None,
+            },
+        ])
+        hit = detect_listings_tomorrow(listings, today=dt.date(2026, 8, 28))
+        self.assertEqual(list(hit["Code"]), ["999A"])
+        # 金曜より前(木曜)や土日自体では、まだ「次の営業日」が月曜にならない
+        # ため対象外（木曜の次の営業日は金曜）。
+        self.assertTrue(detect_listings_tomorrow(listings, today=dt.date(2026, 8, 27)).empty)
+
+    def test_listing_after_multi_day_holiday_bridge_is_reminded_on_preceding_trading_day(self):
+        # 2026-09-21(月・敬老の日)〜09-23(水・秋分の日)は祝日が連続する
+        # （間の09-22(火)も国民の休日）。この間ワークフローは一度も動かない
+        # ため、直前の営業日である09-18(金)が「次の営業日」を計算する起点に
+        # なり、その次の営業日である09-24(木)上場の銘柄がここでリマインド
+        # される。
+        listing_after_holidays = dt.date(2026, 9, 24)
+        listings = pd.DataFrame([
+            {
+                "Code": "888A", "CompanyName": "連休明け上場テスト", "MarketSegment": "スタンダード",
+                "ListingDate": listing_after_holidays, "ApprovalDate": None,
+            },
+        ])
+        hit = detect_listings_tomorrow(listings, today=dt.date(2026, 9, 18))
+        self.assertEqual(list(hit["Code"]), ["888A"])
 
 
 if __name__ == "__main__":
