@@ -19,6 +19,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import endpoints
@@ -187,6 +189,86 @@ class TestGetStatementsByDateCacheKey(unittest.TestCase):
         mock_load, mock_save = self._call_with_fixed_now(past_date, fixed_now)
         mock_load.assert_called_once_with("statements_v2", "20260810")
         self.assertEqual(mock_save.call_args[0][1], "20260810")
+
+
+class TestGetDailyQuotesByDateCacheKey(unittest.TestCase):
+    """get_daily_quotes_by_date()のキャッシュ利用の回帰テスト。
+
+    当日分は大引け(15:30 JST)後にしか確定しない上、get_statements_by_date
+    のような確定時刻(18:00/24:30)の案内が無いため、固定時刻での場合分けが
+    できない。dateが今日以降の間はキャッシュを使わず常にAPIから取得し直し、
+    過去日になった時点で初めて恒久キーを使うことを確認する（2026-09-17に
+    ストップ高の当日中通知に対応する際に導入）。
+    """
+
+    def _call(self, date: dt.date, fixed_today: dt.date):
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter([])
+        with patch(f"{_MOD}.today_jst", return_value=fixed_today), \
+                patch(f"{_MOD}.cache.load", return_value=None) as mock_load, \
+                patch(f"{_MOD}.cache.save") as mock_save:
+            endpoints.get_daily_quotes_by_date(mock_client, date)
+        return mock_load, mock_save
+
+    def test_today_bypasses_cache_entirely(self):
+        today = dt.date(2026, 9, 17)
+        mock_load, mock_save = self._call(today, fixed_today=today)
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_future_date_also_bypasses_cache(self):
+        # 通常のフローでは起こらないが、防御的にtoday以降は同じ扱いにする。
+        today = dt.date(2026, 9, 17)
+        future = dt.date(2026, 9, 18)
+        mock_load, mock_save = self._call(future, fixed_today=today)
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_past_date_uses_permanent_cache_key(self):
+        today = dt.date(2026, 9, 17)
+        yesterday = dt.date(2026, 9, 16)
+        mock_load, mock_save = self._call(yesterday, fixed_today=today)
+        mock_load.assert_called_once_with("daily_quotes_v2", "20260916")
+        self.assertEqual(mock_save.call_args[0][1], "20260916")
+
+    def test_legacy_daily_quotes_namespace_is_not_read(self):
+        # この関数が導入される前(旧watch_and_notify.pyの当日除外は呼び出し側
+        # でのみ行っていた)、app.pyの対話的な画面（終了日のデフォルトが本日）
+        # が大引け前に当日分を素通しで要求すると、空/不完全なレスポンスが
+        # 旧"daily_quotes"名前空間の恒久キーに保存されてしまっていた可能性が
+        # ある。名前空間を"daily_quotes_v2"に変えたことで、そのような古い
+        # エントリが（存在しても）読まれないことを確認する
+        # （2026-09-17のCodexレビューで指摘・修正）。
+        fake_cache: dict[tuple[str, str], object] = {
+            ("daily_quotes", "20260916"): pd.DataFrame(),  # 旧名前空間の汚染データ
+        }
+        real_df = pd.DataFrame([{"Code": "1234", "C": 100.0}])
+        today = dt.date(2026, 9, 17)
+        yesterday = dt.date(2026, 9, 16)
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter(real_df.to_dict("records"))
+        with patch(f"{_MOD}.today_jst", return_value=today), \
+                patch(f"{_MOD}.cache.load", side_effect=lambda ep, k: fake_cache.get((ep, k))), \
+                patch(f"{_MOD}.cache.save"):
+            result = endpoints.get_daily_quotes_by_date(mock_client, yesterday)
+        self.assertFalse(result.empty)
+        self.assertEqual(list(result["Code"]), ["1234"])
+
+    def test_today_always_calls_the_api_even_if_called_repeatedly(self):
+        # 同日内で複数回(10:00/13:00/16:10 JSTの各実行)呼ばれても、毎回
+        # APIから取得し直すこと（キャッシュに邪魔されて大引け後の確定分を
+        # 取り漏らさないことの直接確認）。
+        today = dt.date(2026, 9, 17)
+        mock_client = MagicMock()
+        mock_client.get_all_pages.return_value = iter([])
+        with patch(f"{_MOD}.today_jst", return_value=today), \
+                patch(f"{_MOD}.cache.load") as mock_load, \
+                patch(f"{_MOD}.cache.save") as mock_save:
+            endpoints.get_daily_quotes_by_date(mock_client, today)
+            endpoints.get_daily_quotes_by_date(mock_client, today)
+        self.assertEqual(mock_client.get_all_pages.call_count, 2)
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
 
 
 if __name__ == "__main__":
