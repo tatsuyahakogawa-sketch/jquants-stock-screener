@@ -69,17 +69,29 @@ def get_daily_quotes_by_date(client: JQuantsClient, date: dt.date) -> pd.DataFra
     同種）。dateが過去日になった時点で初めて恒久キーを使う（2026-09-17に
     ユーザー要望でストップ高の同日即時通知に対応する際、この関数を毎回
     呼び直しても確定後のデータを取り漏らさないようにするために導入）。
+
+    キャッシュの名前空間を"daily_quotes"から"daily_quotes_v2"に変更している。
+    この変更の前は当日分の除外を呼び出し側（旧scripts/watch_and_notify.py）
+    でしか行っておらず、`app.py`の対話的な画面（終了日のデフォルトが本日）
+    はこの関数自体を当日分にも素通しで呼んでいたため、大引け前に画面を
+    開くと空/不完全なレスポンスがこの関数の恒久キー(日付のみ)でそのまま
+    保存されてしまっていた可能性がある。同じ名前空間のままだと、この変更後も
+    その古い（一部・空の）エントリを「確定済みの正しいキャッシュ」として
+    誤って読み込み続けてしまう。名前空間を変えることで既存のエントリを
+    全て無効化し、このロジックで確実に取り直す（2026-09-17の
+    Codexレビューで指摘・修正。get_statements_by_dateの同種の問題への
+    対処と同じ手法）。
     """
     date_str = date.strftime("%Y%m%d")
     if date >= today_jst():
         records = list(client.get_all_pages("/equities/bars/daily", {"date": date_str}))
         return pd.DataFrame.from_records(records)
-    cached = cache.load("daily_quotes", date_str)
+    cached = cache.load("daily_quotes_v2", date_str)
     if cached is not None:
         return cached
     records = list(client.get_all_pages("/equities/bars/daily", {"date": date_str}))
     df = pd.DataFrame.from_records(records)
-    cache.save("daily_quotes", date_str, df)
+    cache.save("daily_quotes_v2", date_str, df)
     return df
 
 
