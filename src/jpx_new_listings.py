@@ -33,6 +33,8 @@ import pandas as pd
 import requests
 from lxml import html as lxml_html
 
+from src.market_calendar import is_market_holiday
+
 JPX_NEW_LISTING_URL = "https://www.jpx.co.jp/listing/stocks/new/index.html"
 # JPXはUser-Agent無しのリクエストを403で拒否する（2026-08-27に実機確認）。
 _REQUEST_HEADERS = {
@@ -174,23 +176,41 @@ def detect_new_listing_approvals(listings: pd.DataFrame, since: dt.date) -> pd.D
     return hit.reset_index(drop=True)
 
 
-def detect_listings_tomorrow(listings: pd.DataFrame, today: dt.date) -> pd.DataFrame:
-    """上場日が「今日の翌日」に完全一致する銘柄を返す（上場前日のリマインダー通知用）。
+def _next_trading_day(after: dt.date) -> dt.date:
+    """afterの翌日以降で最初に到来する営業日を返す（土日・日本の祝日・
+    東証の年末年始休場を除く）。"""
+    day = after + dt.timedelta(days=1)
+    while is_market_holiday(day):
+        day += dt.timedelta(days=1)
+    return day
 
-    上場当日に知らせても既に取引が始まっており手遅れなため、代わりに前日中に
+
+def detect_listings_tomorrow(listings: pd.DataFrame, today: dt.date) -> pd.DataFrame:
+    """上場日が「次の営業日」に完全一致する銘柄を返す（上場前日のリマインダー通知用）。
+
+    上場当日に知らせても既に取引が始まっており手遅れなため、代わりに前営業日中に
     知らせる（2026-09-17にユーザー指摘・変更。以前はdetect_listings_sinceという
     名前でtoday以下=本日上場を対象にしていた）。
 
+    単純な「今日の翌日」との一致にすると、月曜上場や連休明け上場の場合、本来の
+    前日（日曜・祝日）はワークフロー自体が動かない（.github/workflows/
+    watch_and_notify.ymlは平日のみ・scripts/watch_and_notify.pyのmain()も
+    休日はスキップする）ため、その上場日のリマインダーが永久に検出されない
+    （2026-09-17のCodexレビューで指摘・修正）。today自身は呼び出し側
+    （watch_and_notify.pyのmain()）が休日ならこの関数を呼ぶ前に既にスキップして
+    いるため必ず営業日であり、_next_trading_day(today)は「今日の次にワークフローが
+    実際に動く日」＝「今日が最後の実行機会となる上場日」を表す。
+
     他の判定関数（例: detect_new_listing_approvals、以前のdetect_listings_since）
-    とは異なり、意図的にsince以降の範囲によるcatch-upを行わず「今日の翌日」との
-    完全一致のみを見る。一時的な取得・送信失敗で前日に送れなかった場合、その後の
-    実行では二度と送られない（catch-upしない）が、これは意図した動作。ユーザーが
+    とは異なり、意図的にsince以降の範囲によるcatch-upを行わず、この1点との
+    完全一致のみを見る。一時的な取得・送信失敗で送れなかった場合、その後の実行
+    では二度と送られない（catch-upしない）が、これは意図した動作。ユーザーが
     「上場当日に知らされても手遅れで意味が無いので、遅れて送るよりは送らない方が
     よい」と明言したため、このリマインダーに限りcatch-upより「上場日を過ぎたら
     送らない」ことを優先する。
     """
     if listings.empty:
         return listings
-    tomorrow = today + dt.timedelta(days=1)
-    hit = listings.loc[listings["ListingDate"] == tomorrow]
+    target = _next_trading_day(today)
+    hit = listings.loc[listings["ListingDate"] == target]
     return hit.reset_index(drop=True)
