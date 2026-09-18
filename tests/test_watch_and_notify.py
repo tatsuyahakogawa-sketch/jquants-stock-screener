@@ -382,7 +382,7 @@ class TestQuotesIncludesToday(_WatchAndNotifyTestCase):
         # APIから取得し直すようになったため（2026-09-17、ストップ高の当日中
         # 通知に対応）、ここでは当日を除外せず含めてよい。大引け前の実行
         # （10:00/13:00 JST）では単に当日分が空で返るだけで、大引け後の
-        # 実行（15:30 JST）で確定済みの当日分を取得できる。
+        # 実行（16:10 JST）で確定済みの当日分を取得できる。
         self._run()
         quotes_call = self.mocks["endpoints.get_daily_quotes_range"].call_args
         end_arg = quotes_call[0][2]
