@@ -5,7 +5,7 @@ https://www.jpx.co.jp/listing/stocks/new/index.html は日次更新され、
 1つの表に「上場日」と「上場承認日」（上場日セル内に括弧書きで併記）が
 銘柄コード単位で載っている。地方単独上場企業やTOKYO PRO Market銘柄の
 新規上場検出（src/regional_stocks.py）とは別に、このページを使うことで
-東証本体への完全新規IPOの「上場承認」（事前告知）と「本日上場」の両方を
+東証本体への完全新規IPOの「上場承認」（事前告知）と「上場前日リマインダー」の両方を
 1つのデータソースから検出できる（2026-08-27に実機のページ構造を確認して
 設計。TDnet開示は上場前の会社自身のTDnetアカウントが無いため、投資先の
 株式会社が上場承認を受けたことを出資会社側が任意で開示することがある
@@ -32,6 +32,8 @@ import re
 import pandas as pd
 import requests
 from lxml import html as lxml_html
+
+from src.market_calendar import is_market_holiday
 
 JPX_NEW_LISTING_URL = "https://www.jpx.co.jp/listing/stocks/new/index.html"
 # JPXはUser-Agent無しのリクエストを403で拒否する（2026-08-27に実機確認）。
@@ -138,7 +140,7 @@ def parse_new_listing_table(html_text: str) -> pd.DataFrame:
         # rows自体は見つかったが、一部の行だけセル構成の変更等で解析できな
         # かった場合。この時点でrecordsが（他の行の分だけ）空でなくても、
         # 静かに一部の行を読み飛ばして「解析できた分だけの結果」を返すと、
-        # 該当行の銘柄の上場承認・本日上場を検出漏れのまま二度と気付けなく
+        # 該当行の銘柄の上場承認・上場前日リマインダーを検出漏れのまま二度と気付けなく
         # なる（watch_and_notify.pyはこの戻り値が得られた時点でスキャン成功と
         # みなしipo_watermarkを進めるため。2026-08-28の9巡目のCodexレビューで
         # 指摘・修正。全滅の場合は元々この後のif not recordsでも検知できるが、
@@ -174,19 +176,41 @@ def detect_new_listing_approvals(listings: pd.DataFrame, since: dt.date) -> pd.D
     return hit.reset_index(drop=True)
 
 
-def detect_listings_since(listings: pd.DataFrame, since: dt.date, today: dt.date) -> pd.DataFrame:
-    """上場日がsince以降today以下（本日を含む）の銘柄を返す（本日上場の通知用）。
+def _next_trading_day(after: dt.date) -> dt.date:
+    """afterの翌日以降で最初に到来する営業日を返す（土日・日本の祝日・
+    東証の年末年始休場を除く）。"""
+    day = after + dt.timedelta(days=1)
+    while is_market_holiday(day):
+        day += dt.timedelta(days=1)
+    return day
 
-    以前はtodayとの完全一致(==)で判定していたが、その場合JPXの取得や
-    Discordへの送信がその上場日当日に一時的に失敗すると、呼び出し側は
-    通知済み状態(state["notified"])を更新しないためウォーターマーク自体は
-    意図的に進めなくても、次回実行では「今日」が翌日に進んでしまい
-    ちょうどの一致条件を二度と満たせず、その銘柄の本日上場通知を永久に
-    取りこぼしていた。上場承認日の判定(detect_new_listing_approvals)と
-    同様にsince以降の範囲で見ることで、一時的な失敗からの再試行を
-    可能にする（2026-08-28のCodexレビューで指摘・修正）。
+
+def detect_listings_tomorrow(listings: pd.DataFrame, today: dt.date) -> pd.DataFrame:
+    """上場日が「次の営業日」に完全一致する銘柄を返す（上場前日のリマインダー通知用）。
+
+    上場当日に知らせても既に取引が始まっており手遅れなため、代わりに前営業日中に
+    知らせる（2026-09-17にユーザー指摘・変更。以前はdetect_listings_sinceという
+    名前でtoday以下=本日上場を対象にしていた）。
+
+    単純な「今日の翌日」との一致にすると、月曜上場や連休明け上場の場合、本来の
+    前日（日曜・祝日）はワークフロー自体が動かない（.github/workflows/
+    watch_and_notify.ymlは平日のみ・scripts/watch_and_notify.pyのmain()も
+    休日はスキップする）ため、その上場日のリマインダーが永久に検出されない
+    （2026-09-17のCodexレビューで指摘・修正）。today自身は呼び出し側
+    （watch_and_notify.pyのmain()）が休日ならこの関数を呼ぶ前に既にスキップして
+    いるため必ず営業日であり、_next_trading_day(today)は「今日の次にワークフローが
+    実際に動く日」＝「今日が最後の実行機会となる上場日」を表す。
+
+    他の判定関数（例: detect_new_listing_approvals、以前のdetect_listings_since）
+    とは異なり、意図的にsince以降の範囲によるcatch-upを行わず、この1点との
+    完全一致のみを見る。一時的な取得・送信失敗で送れなかった場合、その後の実行
+    では二度と送られない（catch-upしない）が、これは意図した動作。ユーザーが
+    「上場当日に知らされても手遅れで意味が無いので、遅れて送るよりは送らない方が
+    よい」と明言したため、このリマインダーに限りcatch-upより「上場日を過ぎたら
+    送らない」ことを優先する。
     """
     if listings.empty:
         return listings
-    hit = listings.loc[(listings["ListingDate"] >= since) & (listings["ListingDate"] <= today)]
+    target = _next_trading_day(today)
+    hit = listings.loc[listings["ListingDate"] == target]
     return hit.reset_index(drop=True)
