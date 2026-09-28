@@ -1,7 +1,10 @@
 """Discord Webhookへの定期監視・通知バッチ。
 
 GitHub Actions(.github/workflows/watch_and_notify.yml)から平日
-10:00・13:00 JSTに実行される想定。app.py（対話的なスクリーニング画面）とは
+10:00・13:00・16:10 JSTに実行される想定（16:10は大引け(15:30 JST。2024年11月
+の取引時間延長後の現行時刻)後の株価確定を受けたストップ高の当日中通知用。
+2026-09-17にユーザー要望で追加）。
+app.py（対話的なスクリーニング画面）とは
 別に、ユーザーが常時監視してほしいと指定した以下の条件を毎回チェックし、
 新しく該当した銘柄があればDiscordに通知する（2026-08-27にユーザー指定）。
 
@@ -280,15 +283,15 @@ def _stop_high_candidates(
     start = _scan_start(state, "stop_high_watermark", today)
     try:
         name_map = _safe_name_map(client)
-        # 株価四本値は営業日の大引け後にしか当日分が更新されない
-        # (CLAUDE.md参照)。10:00/13:00 JSTはどちらも大引け(15:00頃)より前で、
-        # 当日を含めて取得すると空のレスポンスが返る。get_daily_quotes_by_date
-        # は日付だけの恒久キーでキャッシュし、get_statements_by_dateのような
-        # 当日限定のam/pm一時キーを持たないため、この空レスポンスがそのまま
-        # 恒久的にキャッシュされてしまい、大引け後に実際のデータが揃っても
-        # 二度と取得されずストップ高を取りこぼす（2026-08-27のCodexレビューで
-        # 指摘）。当日はそもそもデータが存在しないため、最初から対象に含めない。
-        quotes_df = endpoints.get_daily_quotes_range(client, start, today - dt.timedelta(days=1))
+        # 当日分を含めて取得する。株価四本値は大引け(15:30 JST)後にしか
+        # 当日分が更新されないため、10:00/13:00 JSTの実行時点では当日分は
+        # まだ空で返るが、endpoints.get_daily_quotes_by_dateが当日分を
+        # キャッシュせず毎回APIから取得し直すため、後で確定してから実行される
+        # 分（16:10 JST。.github/workflows/watch_and_notify.yml参照）で
+        # 実際に取得できる（2026-09-17にユーザー要望でストップ高の当日中の
+        # 即時通知に対応。以前は当日を対象から除外していたため、確定した
+        # 当日分は必ず翌営業日の実行まで通知が遅れていた）。
+        quotes_df = endpoints.get_daily_quotes_range(client, start, today)
         hits = [rules.detect_stop_high(quotes_df)]
     except Exception as e:
         logger.exception("ストップ高のチェックに失敗しました")
