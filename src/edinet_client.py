@@ -1,5 +1,8 @@
 """EDINET(金融庁)から有価証券報告書の「事業の内容」「大株主の状況」「潜在株式の
-状況」を取得するクライアント。
+状況」を取得するクライアント。上場承認銘柄については、有価証券報告書の代わりに
+有価証券届出書（新規公開時）から「事業の内容」を取得する
+（fetch_ipo_business_overview参照。watch_and_notify.pyの上場承認通知用に
+2026-09-28追加）。
 
 これらはJ-Quantsには無い自由記述項目だが、EDINETの開示書類には実データとして
 存在する。ただし個別の構造化要素としては取れず、1つのテキストブロック要素の中に
@@ -31,6 +34,14 @@ CODE_LIST_URL = "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/
 
 # 有価証券報告書・訂正有価証券報告書（大量保有報告書等の他の書類種別は対象外）
 _YUHO_DOC_TYPE_CODES = {"120", "130"}
+
+# 有価証券届出書・訂正有価証券届出書のうち、新規上場（IPO）時に提出される分
+# （docTypeCodeだけでは投資信託受益証券等の届出書とも区別できないため、
+# docDescriptionに「新規公開時」を含むものだけに絞る。2026-09-28に実機の
+# EDINET API(documents.json)で確認: docTypeCode="030"のdocDescriptionが
+# 「有価証券届出書（新規公開時）」となっている）。
+_IPO_PROSPECTUS_DOC_TYPE_CODES = {"030", "040"}
+_IPO_PROSPECTUS_DESCRIPTION_MARKER = "新規公開時"
 
 _BUSINESS_OVERVIEW_TAGS = ["DescriptionOfBusinessTextBlock"]
 _SHAREHOLDERS_TAGS = ["MajorShareholdersTextBlock"]
@@ -71,13 +82,20 @@ def _load_code_list() -> pd.DataFrame:
 
 
 def get_edinet_code(stock_code: str) -> str | None:
-    """証券コード(4桁または5桁)からEDINETコード(例: E01753)を引く。"""
+    """証券コード(4桁または5桁)からEDINETコード(例: E01753)を引く。
+
+    EDINETの証券コード列は5桁（4桁+末尾0）で登録されている。以前は
+    4桁が数字のみの場合しか末尾0を補わなかったが、2024年以降のTSEの
+    新形式コード（数字3桁+英字1桁、例: "634A"）は数字のみではないため
+    候補に入らず、新規上場銘柄のEDINETコードが引けなかった
+    （2026-09-28、上場承認通知への事業概要追加時に発見・修正）。
+    """
     df = _load_code_list()
     if df.empty or "証券コード" not in df.columns:
         return None
     code = str(stock_code)
     candidates = {code}
-    if code.isdigit() and len(code) == 4:
+    if len(code) == 4:
         candidates.add(code + "0")
     match = df.loc[df["証券コード"].astype(str).str.strip().isin(candidates)]
     if match.empty:
@@ -140,6 +158,62 @@ def find_latest_yuho(edinet_code: str, fiscal_year_end: dt.date | None = None) -
         return None
     found.sort(key=lambda x: x.get("submitDateTime", ""))
     return found[-1]
+
+
+def find_latest_ipo_prospectus(edinet_code: str, approval_date: dt.date) -> dict | None:
+    """指定EDINETコードの新規上場時の有価証券届出書（訂正含む）のメタデータを検索する。
+
+    上場前の会社にはfind_latest_yuhoが前提とする決算期末情報が無いため、
+    代わりに上場承認日を基準にした前後の窓（提出は承認発表の前後どちらも
+    ありうるため両方向に取る）で走査する。
+    """
+    key = _api_key()
+    today = today_jst()
+    window_start = approval_date - dt.timedelta(days=60)
+    window_end = min(approval_date + dt.timedelta(days=30), today)
+
+    found = []
+    d = window_end
+    while d >= window_start:
+        for doc in _get_documents_for_date(d, key):
+            if (
+                doc.get("edinetCode") == edinet_code
+                and doc.get("docTypeCode") in _IPO_PROSPECTUS_DOC_TYPE_CODES
+                and _IPO_PROSPECTUS_DESCRIPTION_MARKER in (doc.get("docDescription") or "")
+            ):
+                found.append(doc)
+        d -= dt.timedelta(days=1)
+
+    if not found:
+        return None
+    found.sort(key=lambda x: x.get("submitDateTime", ""))
+    return found[-1]
+
+
+def fetch_ipo_business_overview(stock_code: str, approval_date: dt.date) -> str | None:
+    """新規上場承認された銘柄の「事業の内容」を有価証券届出書（新規公開時）から取得する。
+
+    watch_and_notify.pyの上場承認通知に「どのような会社か」の簡単な説明を
+    添えるために2026-09-28に追加（ユーザー要望）。該当書類が無い、
+    EDINET_API_KEY未設定、その他取得エラーの場合はNoneを返し、呼び出し側は
+    その項目を省略するだけにする（fetch_yuho_texts docstring同様、
+    「無い」と「取得失敗」を区別せずNoneとして扱う）。
+    """
+    try:
+        edinet_code = get_edinet_code(stock_code)
+        if edinet_code is None:
+            return None
+        doc = find_latest_ipo_prospectus(edinet_code, approval_date)
+        if doc is None:
+            return None
+        key = _api_key()
+        zip_bytes = _download_xbrl_zip(doc["docID"], key)
+    except EdinetAuthError:
+        return None
+    except Exception:
+        return None
+
+    return _find_text_block(zip_bytes, _BUSINESS_OVERVIEW_TAGS)
 
 
 def _download_xbrl_zip(doc_id: str, key: str) -> bytes:

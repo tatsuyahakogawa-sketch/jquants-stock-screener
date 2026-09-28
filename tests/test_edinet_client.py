@@ -1,0 +1,155 @@
+"""src/edinet_client.py の単体テスト。EDINETへの実通信は行わない。
+
+実行方法:
+    python -m unittest discover tests
+"""
+from __future__ import annotations
+
+import datetime as dt
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src import edinet_client
+
+_MOD = "src.edinet_client"
+
+
+class TestGetEdinetCodeAlphanumericStockCode(unittest.TestCase):
+    """2024年以降のTSEの新形式コード（数字3桁+英字1桁）への対応の回帰テスト。
+
+    以前はcode.isdigit()のときしか末尾0を補わなかったため、新形式コードの
+    銘柄（例: "634A"）はEDINETの証券コード列("634A0")と一致せずNoneを
+    返していた（2026-09-28、上場承認通知への事業概要追加時に発見・修正）。
+    """
+
+    def _code_list_df(self):
+        return pd.DataFrame(
+            {
+                "証券コード": ["634A0", "72030"],
+                "ＥＤＩＮＥＴコード": ["E40756", "E00001"],
+            }
+        )
+
+    def test_alphanumeric_4char_code_matches_trailing_zero_entry(self):
+        with patch(f"{_MOD}._load_code_list", return_value=self._code_list_df()):
+            result = edinet_client.get_edinet_code("634A")
+        self.assertEqual(result, "E40756")
+
+    def test_numeric_4char_code_still_matches(self):
+        with patch(f"{_MOD}._load_code_list", return_value=self._code_list_df()):
+            result = edinet_client.get_edinet_code("7203")
+        self.assertEqual(result, "E00001")
+
+    def test_unknown_code_returns_none(self):
+        with patch(f"{_MOD}._load_code_list", return_value=self._code_list_df()):
+            result = edinet_client.get_edinet_code("9999")
+        self.assertIsNone(result)
+
+
+class TestFindLatestIpoProspectus(unittest.TestCase):
+    def test_filters_by_doc_type_and_description_marker(self):
+        approval_date = dt.date(2026, 9, 1)
+        docs_by_date = {
+            dt.date(2026, 8, 20): [
+                {
+                    "edinetCode": "E40756",
+                    "docTypeCode": "030",
+                    "docDescription": "有価証券届出書（新規公開時）",
+                    "docID": "S100AAA",
+                    "submitDateTime": "2026-08-20 15:00",
+                },
+                # 別会社の同種届出書（対象外）
+                {
+                    "edinetCode": "E99999",
+                    "docTypeCode": "030",
+                    "docDescription": "有価証券届出書（新規公開時）",
+                    "docID": "S100ZZZ",
+                    "submitDateTime": "2026-08-20 15:00",
+                },
+                # 同じ会社だが投資信託の届出書（対象外、マーカーを含まない）
+                {
+                    "edinetCode": "E40756",
+                    "docTypeCode": "030",
+                    "docDescription": "有価証券届出書（内国投資信託受益証券）",
+                    "docID": "S100BBB",
+                    "submitDateTime": "2026-08-20 16:00",
+                },
+            ],
+            dt.date(2026, 8, 25): [
+                {
+                    "edinetCode": "E40756",
+                    "docTypeCode": "040",
+                    "docDescription": "訂正有価証券届出書（新規公開時）",
+                    "docID": "S100CCC",
+                    "submitDateTime": "2026-08-25 15:00",
+                },
+            ],
+        }
+
+        def _get_documents(date, key):
+            return docs_by_date.get(date, [])
+
+        with patch(f"{_MOD}._api_key", return_value="dummy-key"), \
+                patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 9, 5)), \
+                patch(f"{_MOD}._get_documents_for_date", side_effect=_get_documents):
+            result = edinet_client.find_latest_ipo_prospectus("E40756", approval_date)
+
+        # 訂正後の届出書（より新しい提出日時）が選ばれる。
+        self.assertEqual(result["docID"], "S100CCC")
+
+    def test_no_matching_document_returns_none(self):
+        with patch(f"{_MOD}._api_key", return_value="dummy-key"), \
+                patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 9, 5)), \
+                patch(f"{_MOD}._get_documents_for_date", return_value=[]):
+            result = edinet_client.find_latest_ipo_prospectus("E40756", dt.date(2026, 9, 1))
+        self.assertIsNone(result)
+
+
+class TestFetchIpoBusinessOverview(unittest.TestCase):
+    def test_happy_path_returns_extracted_text(self):
+        with patch(f"{_MOD}.get_edinet_code", return_value="E40756"), \
+                patch(f"{_MOD}.find_latest_ipo_prospectus", return_value={"docID": "S100CCC"}), \
+                patch(f"{_MOD}._api_key", return_value="dummy-key"), \
+                patch(f"{_MOD}._download_xbrl_zip", return_value=b"zip-bytes"), \
+                patch(f"{_MOD}._find_text_block", return_value="当社は、菓子小売事業を行っております。") as mock_find:
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+
+        self.assertEqual(result, "当社は、菓子小売事業を行っております。")
+        mock_find.assert_called_once_with(b"zip-bytes", edinet_client._BUSINESS_OVERVIEW_TAGS)
+
+    def test_no_edinet_code_returns_none_without_further_calls(self):
+        with patch(f"{_MOD}.get_edinet_code", return_value=None), \
+                patch(f"{_MOD}.find_latest_ipo_prospectus") as mock_find_doc:
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+
+        self.assertIsNone(result)
+        mock_find_doc.assert_not_called()
+
+    def test_no_matching_document_returns_none(self):
+        with patch(f"{_MOD}.get_edinet_code", return_value="E40756"), \
+                patch(f"{_MOD}.find_latest_ipo_prospectus", return_value=None), \
+                patch(f"{_MOD}._download_xbrl_zip") as mock_download:
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+
+        self.assertIsNone(result)
+        mock_download.assert_not_called()
+
+    def test_auth_error_is_swallowed(self):
+        with patch(f"{_MOD}.get_edinet_code", side_effect=edinet_client.EdinetAuthError("no key")):
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+        self.assertIsNone(result)
+
+    def test_unexpected_error_is_swallowed(self):
+        with patch(f"{_MOD}.get_edinet_code", side_effect=RuntimeError("network error")):
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+        self.assertIsNone(result)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -85,6 +85,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -92,7 +93,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import discord_notify, endpoints, jpx_new_listings, rules, tdnet_client
+from src import discord_notify, edinet_client, endpoints, jpx_new_listings, rules, tdnet_client
 from src.jquants_client import JQuantsClient
 from src.jst import JST, today_jst
 from src.market_calendar import is_market_holiday
@@ -361,6 +362,33 @@ def _tdnet_candidates(
     return candidates, ("tdnet_watermark", today.isoformat()), None  # _jquants_candidatesと同じ理由
 
 
+_BUSINESS_OVERVIEW_MAX_LEN = 200
+# 有価証券届出書の項目見出し（例: "３ 【事業の内容】"）は内容ではないため、
+# 通知に含める前に取り除く。
+_SECTION_HEADER_PATTERN = re.compile(r"^[^【]{0,10}【[^】]*】")
+
+
+def _summarize_business_overview(text: str, max_len: int = _BUSINESS_OVERVIEW_MAX_LEN) -> str:
+    """EDINETの「事業の内容」原文から、Discord通知に載せる簡単な説明を作る。
+
+    LLMによる要約・言い換えは行わず、開示された原文をそのまま短く切り出すだけ
+    にする（CLAUDE.md「データの正確性を最優先」参照。数値・事実を含む開示文を
+    独自に要約すると誤った印象を与えかねないため）。開示のHTML由来の改行・
+    空白（表組みの空セル等）は日本語の文章には本来不要なため除去し、
+    max_len文字を超える場合は最後の「。」で自然に区切れればそこまでを使い、
+    区切れなければ「…」を付けて機械的に切り詰める。
+    """
+    collapsed = re.sub(r"\s+", "", text)
+    collapsed = _SECTION_HEADER_PATTERN.sub("", collapsed, count=1)
+    if len(collapsed) <= max_len:
+        return collapsed
+    cut = collapsed[:max_len]
+    last_period = cut.rfind("。")
+    if last_period >= max_len // 2:
+        return cut[: last_period + 1]
+    return cut + "…"
+
+
 def _ipo_candidates(
     today: dt.date, state: dict, seen_keys: set[str]
 ) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
@@ -387,6 +415,20 @@ def _ipo_candidates(
             f"🆕 新規上場承認\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場承認日: {row['ApprovalDate']:%Y-%m-%d} / 上場予定日: {row['ListingDate']:%Y-%m-%d}"
         )
+        # どのような会社かを簡単に説明する（2026-09-28にユーザー要望）。
+        # 上場前の会社はEDINETの有価証券報告書を持たないため、代わりに
+        # 有価証券届出書（新規公開時）から「事業の内容」を取得する
+        # （src/edinet_client.fetch_ipo_business_overview参照）。取得できない
+        # 場合（該当書類が無い・EDINET_API_KEY未設定・一時的な取得失敗等）は
+        # 通知自体は本文なしでそのまま送る（この情報は付加的なものであり、
+        # 取得できないことを理由に本来の通知自体を止めてはならないため）。
+        try:
+            overview = edinet_client.fetch_ipo_business_overview(row["Code"], row["ApprovalDate"])
+        except Exception:
+            logger.warning("事業概要の取得に失敗しました（%s）", row["Code"], exc_info=True)
+            overview = None
+        if overview:
+            message += f"\n事業内容: {_summarize_business_overview(overview)}"
         candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message, key))
 
     # 上場当日ではなく前日にリマインダーとして知らせる。上場当日に知らせても

@@ -59,6 +59,8 @@ class _WatchAndNotifyTestCase(unittest.TestCase):
         fetch_listings_error=None,
         disclosures_error=None,
         send_error=None,
+        business_overview=None,
+        business_overview_error=None,
     ):
         """main()を、指定した戻り値/例外でモックした状態で1回実行する。
 
@@ -100,6 +102,10 @@ class _WatchAndNotifyTestCase(unittest.TestCase):
                     "jpx_new_listings.fetch_new_listing_table",
                     return_value=listings if listings is not None else _empty_listings_df(),
                 )
+            if business_overview_error is not None:
+                _patch("edinet_client.fetch_ipo_business_overview", side_effect=business_overview_error)
+            else:
+                _patch("edinet_client.fetch_ipo_business_overview", return_value=business_overview)
             mock_send = _patch("discord_notify.send_discord_message")
             if send_error is not None:
                 mock_send.side_effect = send_error
@@ -550,6 +556,86 @@ class TestIpoNotifications(_WatchAndNotifyTestCase):
         self.assertEqual(result, 1)
         mock_send.assert_called_once()
         self.assertIn("JPX新規上場会社情報の取得に失敗", mock_send.call_args[0][1])
+
+    def test_approval_message_includes_business_overview_when_available(self):
+        # 上場承認の通知には、どのような会社かの簡単な説明を添える
+        # （2026-09-28にユーザー要望）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(
+            listings=listings, business_overview="当社は、菓子小売事業を行っております。",
+        )
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertIn("事業内容: 当社は、菓子小売事業を行っております。", sent_text)
+        self.mocks["edinet_client.fetch_ipo_business_overview"].assert_called_once_with("634A", _TODAY)
+
+    def test_approval_message_omits_business_overview_when_unavailable(self):
+        # EDINET側で該当書類が無い場合はNoneが返る想定（fetch_ipo_business_overview
+        # 自体が「無い」と「取得失敗」を区別せずNoneを返すため）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(listings=listings, business_overview=None)
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertNotIn("事業内容", sent_text)
+
+    def test_business_overview_failure_does_not_block_approval_notification(self):
+        # EDINET側の一時的な失敗で例外が出ても、上場承認の通知自体は
+        # 止めてはならない（この情報は付加的なものであるため）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(
+            listings=listings, business_overview_error=RuntimeError("EDINET down"),
+        )
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertIn("634A", sent_text)
+        self.assertNotIn("事業内容", sent_text)
+
+
+class TestSummarizeBusinessOverview(unittest.TestCase):
+    def test_short_text_is_returned_as_is_with_whitespace_collapsed(self):
+        text = "当社は、\n菓子小売事業を 　行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、菓子小売事業を行っております。",
+        )
+
+    def test_leading_section_header_is_stripped(self):
+        text = "３　【事業の内容】当社は、菓子小売事業を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、菓子小売事業を行っております。",
+        )
+
+    def test_long_text_is_cut_at_the_last_sentence_boundary(self):
+        text = "あ" * 50 + "。" + "い" * 300
+        result = wan._summarize_business_overview(text, max_len=100)
+        self.assertEqual(result, "あ" * 50 + "。")
+
+    def test_long_text_without_sentence_boundary_is_hard_truncated(self):
+        text = "あ" * 300
+        result = wan._summarize_business_overview(text, max_len=100)
+        self.assertEqual(result, "あ" * 100 + "…")
 
 
 class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
