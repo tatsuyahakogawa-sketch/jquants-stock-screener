@@ -485,48 +485,64 @@ class TestTdnetSameDayCorrectionIsNotDiscarded(_WatchAndNotifyTestCase):
 
 
 class TestIpoNotifications(_WatchAndNotifyTestCase):
-    def test_approval_and_listing_today_are_both_notified(self):
+    def test_approval_and_listing_tomorrow_are_both_notified(self):
+        # 上場当日ではなく前日にリマインダーを送る（2026-09-17にユーザー
+        # 指摘・変更。当日知らせても既に取引が始まっており手遅れなため）。
+        listing_date = _TODAY + dt.timedelta(days=1)
         listings = pd.DataFrame([
             {
                 "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
-                "ListingDate": _TODAY, "ApprovalDate": _TODAY - dt.timedelta(days=1),
+                "ListingDate": listing_date, "ApprovalDate": _TODAY - dt.timedelta(days=1),
             },
         ])
         result, mock_send = self._run(listings=listings)
 
         self.assertEqual(result, 0)
-        # ヘッダー1通+承認1通+本日上場1通の計3回。
+        # ヘッダー1通+承認1通+上場前日リマインダー1通の計3回。
         self.assertEqual(mock_send.call_count, 3)
         sent_text = self._sent_text(mock_send)
         self.assertIn("新規上場承認", sent_text)
-        self.assertIn("新規上場", sent_text)
-        self.assertIn(f"上場日: {_TODAY:%Y-%m-%d}", sent_text)
+        self.assertIn("上場前日", sent_text)
+        self.assertIn(f"上場日: {listing_date:%Y-%m-%d}", sent_text)
         self.assertIn("634A", sent_text)
 
         state = self._load_state()
         self.assertEqual(state["ipo_watermark"], _TODAY.isoformat())
 
-    def test_listing_notified_late_states_actual_listing_date_not_today(self):
-        # 上場日当日の取得・送信が一時的に失敗して後日リトライされた場合、
-        # 「本日新規上場」のまま実際にはtodayより前の上場日を隠してしまうと
-        # 誤解を招くため、実際の上場日を明記する（2026-08-28のCodexレビューで
-        # 指摘・修正）。
-        actual_listing_date = _TODAY - dt.timedelta(days=2)
+    def test_listing_today_is_not_notified(self):
+        # 上場当日はリマインダーの対象外（前日に既に送っているはず、または
+        # 前日に取得できなかった場合は取りこぼしとして許容する）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY, "ApprovalDate": None,
+            },
+        ])
+        result, mock_send = self._run(listings=listings)
+
+        self.assertEqual(result, 0)
+        mock_send.assert_not_called()
+
+    def test_missed_reminder_is_not_caught_up_later(self):
+        # 上場前日リマインダーは意図的にcatch-upしない。上場日が既に過去に
+        # なっている（前日に送れなかった）場合、ウォーターマークを古くしても
+        # 再送されない（上場当日以降に送っても手遅れで無意味だとユーザーが
+        # 明言したため。2026-09-17）。
+        actual_listing_date = _TODAY - dt.timedelta(days=1)
         listings = pd.DataFrame([
             {
                 "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
                 "ListingDate": actual_listing_date, "ApprovalDate": None,
             },
         ])
+        old_watermark = (_TODAY - dt.timedelta(days=5)).isoformat()
         with self.state_path.open("w", encoding="utf-8") as f:
-            json.dump({"notified": {}, "ipo_watermark": actual_listing_date.isoformat()}, f)
+            json.dump({"notified": {}, "ipo_watermark": old_watermark}, f)
 
         result, mock_send = self._run(listings=listings)
 
         self.assertEqual(result, 0)
-        sent_text = self._sent_text(mock_send)
-        self.assertNotIn("本日", sent_text)
-        self.assertIn(f"上場日: {actual_listing_date:%Y-%m-%d}", sent_text)
+        mock_send.assert_not_called()
 
     def test_jpx_fetch_failure_still_reports_and_fails_job(self):
         result, mock_send = self._run(fetch_listings_error=RuntimeError("scrape failed"))
