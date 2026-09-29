@@ -102,6 +102,18 @@ def _event_date_from_key(key: str) -> dt.date | None:
         return None
 
 
+# ipo_listed（上場前日のお知らせ）だけは、キーに埋め込まれる日付が
+# 「対象の事象が起きた日」ではなく「翌営業日の上場予定日」（送信日の1日後）
+# になる設計のため（scripts/watch_and_notify.py _ipo_candidates参照）、
+# 他のruleと同じ基準で_event_date_from_keyと比較すると常に不一致になり、
+# 前日に届いたはずのリマインダーが翌朝のまとめメールから毎回漏れてしまう
+# （2026-09-29のCodexレビューで指摘・修正）。この情報源はそもそも意図的に
+# watermarkによるcatch-upを行わない（detect_listings_tomorrowのdocstring
+# 参照）ため、catch-upによる古い日付混入の心配が無く、sent_atの日付だけで
+# 絞れば十分。
+_NO_CATCH_UP_RULES = {"ipo_listed"}
+
+
 def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
     """target_day（JST）分の内容として、target_day当日にDiscordへ実際に
     送信され、かつ対象銘柄・事象そのものの日付もtarget_dayであるメッセージ
@@ -137,9 +149,9 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
         sent_at_jst = sent_at.astimezone(JST)
         if sent_at_jst.date() != target_day:
             continue
-        if _event_date_from_key(key) != target_day:
-            continue
         rule = key.split("|", 1)[0]
+        if rule not in _NO_CATCH_UP_RULES and _event_date_from_key(key) != target_day:
+            continue
         entries.append((sent_at_jst, rule, message))
     entries.sort(key=lambda e: (_rule_sort_key(e[1]), e[0]))
     return [message for _, _, message in entries]

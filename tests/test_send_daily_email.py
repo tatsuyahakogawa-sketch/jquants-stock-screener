@@ -167,6 +167,24 @@ class TestCollectDigestMessages(unittest.TestCase):
         messages = sde._collect_digest_messages(state, target)
         self.assertEqual(messages, ["月曜分のストップ高"])
 
+    def test_ipo_listed_reminder_is_kept_despite_next_day_key_date(self):
+        # ipo_listed（上場前日のお知らせ）は、送信日(target)の翌営業日を
+        # キーの日付に持つ（watch_and_notify.py _ipo_candidates参照）ため、
+        # 他のruleと同じ日付一致条件を適用すると毎回除外されてしまう
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        target = dt.date(2026, 8, 28)  # 金曜（例）
+        listing_date = target + dt.timedelta(days=1)
+        state = {
+            "notified": {
+                f"ipo_listed|634A|{listing_date.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 28, 16, 10, tzinfo=JST).isoformat(),
+                    "message": "🔔 上場前日のお知らせ",
+                },
+            }
+        }
+        messages = sde._collect_digest_messages(state, target)
+        self.assertEqual(messages, ["🔔 上場前日のお知らせ"])
+
     def test_ordered_by_rule_then_time(self):
         target = dt.date(2026, 8, 28)
         state = {
