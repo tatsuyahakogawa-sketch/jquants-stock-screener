@@ -185,6 +185,43 @@ class TestCollectDigestMessages(unittest.TestCase):
         messages = sde._collect_digest_messages(state, target)
         self.assertEqual(messages, ["🔔 上場前日のお知らせ"])
 
+    def test_profit_growth_major_one_day_source_lag_is_kept(self):
+        # 財務情報(/fins/summary)は18:00/24:30に更新されるが、
+        # watch_and_notify.pyの実行は16:10 JSTが最終なため、18:00以降に
+        # 確定した分は翌営業日の10:00の実行で初めて検出・送信される。
+        # この場合sent_atは翌営業日(target)、キーの日付(開示日)は
+        # 前営業日になるが、これは一時的な障害由来のcatch-upではなく
+        # 構造上ほぼ毎回起きる正常な1日遅れなので、target分のまとめ
+        # メールに含める（2026-09-29のCodexレビューで指摘・修正）。
+        target = dt.date(2026, 8, 31)  # 月曜
+        disclosure_date = dt.date(2026, 8, 28)  # 前営業日(金曜)
+        state = {
+            "notified": {
+                f"profit_growth_major|1234|{disclosure_date.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 31, 10, 0, tzinfo=JST).isoformat(),
+                    "message": "経常利益急増（1日遅れ検出）",
+                },
+            }
+        }
+        messages = sde._collect_digest_messages(state, target)
+        self.assertEqual(messages, ["経常利益急増（1日遅れ検出）"])
+
+    def test_profit_growth_major_older_than_one_day_lag_is_still_excluded(self):
+        # 1日遅れは許容するが、それより古い（2営業日以上前の）catch-upは
+        # 依然として除外する。
+        target = dt.date(2026, 8, 31)  # 月曜
+        stale_date = dt.date(2026, 8, 26)  # 3営業日前
+        state = {
+            "notified": {
+                f"profit_growth_major|1234|{stale_date.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 31, 10, 0, tzinfo=JST).isoformat(),
+                    "message": "経常利益急増（古いcatch-up）",
+                },
+            }
+        }
+        messages = sde._collect_digest_messages(state, target)
+        self.assertEqual(messages, [])
+
     def test_ordered_by_rule_then_time(self):
         target = dt.date(2026, 8, 28)
         state = {

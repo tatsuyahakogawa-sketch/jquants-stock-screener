@@ -113,6 +113,18 @@ def _event_date_from_key(key: str) -> dt.date | None:
 # 絞れば十分。
 _NO_CATCH_UP_RULES = {"ipo_listed"}
 
+# profit_growth_major（経常利益急増）は財務情報(/fins/summary)が対象で、
+# CLAUDE.mdの通り18:00と24:30(=翌0:30)に更新される。watch_and_notify.pyの
+# 実行は平日10:00/13:00/16:10 JSTで、いずれも18:00より前のため、18:00〜
+# 24:30の間に確定した分は当日中には検出できず、翌営業日の10:00の実行で
+# 初めて検出・送信される。この場合sent_atは翌営業日、キーの日付（開示日）は
+# 前営業日になり、他のruleと同じ「target_dayに完全一致」の条件を課すと、
+# 一時的な障害由来のcatch-upと区別できずこの正常な1日遅れの通知が
+# どのまとめメールにも一度も載らなくなってしまう（2026-09-29のCodex
+# レビューで指摘・修正）。このruleに限り、キーの日付がtarget_day自体か
+# その前営業日のどちらでも許容する。
+_NEXT_DAY_LAG_RULES = {"profit_growth_major"}
+
 
 def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
     """target_day（JST）分の内容として、target_day当日にDiscordへ実際に
@@ -127,6 +139,11 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
     情報が古いまま再掲されてしまう（2026-09-29にユーザー指摘・修正。
     catch-up自体はDiscord側の取りこぼし防止のために必要な挙動なので
     そのまま残し、日次まとめメールへの反映だけを対象日と一致する分に絞る）。
+
+    ただし全ruleに単純な完全一致を課すと、一時的な障害由来のcatch-upとは
+    別に、データ源の構造上ほぼ毎回1日遅れが起きるruleまで拾えなくなる
+    （_NEXT_DAY_LAG_RULES/_NO_CATCH_UP_RULES参照。2026-09-29のCodexレビューで
+    指摘・修正）。
 
     watch_and_notify.pyがこの機能の追加より前に書き込んだ、値がTrueのままの
     古いエントリ（sent_at・messageを持たない）は対象外として無視する
@@ -150,8 +167,13 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
         if sent_at_jst.date() != target_day:
             continue
         rule = key.split("|", 1)[0]
-        if rule not in _NO_CATCH_UP_RULES and _event_date_from_key(key) != target_day:
-            continue
+        if rule not in _NO_CATCH_UP_RULES:
+            event_date = _event_date_from_key(key)
+            allowed_dates = {target_day}
+            if rule in _NEXT_DAY_LAG_RULES:
+                allowed_dates.add(_previous_business_day(target_day))
+            if event_date not in allowed_dates:
+                continue
         entries.append((sent_at_jst, rule, message))
     entries.sort(key=lambda e: (_rule_sort_key(e[1]), e[0]))
     return [message for _, _, message in entries]
