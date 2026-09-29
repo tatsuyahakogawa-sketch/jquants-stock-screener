@@ -126,6 +126,11 @@ jobs:
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 上場承認通知の事業内容取得(src/edinet_client.fetch_ipo_business_overview)用。
+          # 未設定のままだとEdinetAuthErrorがfetch_ipo_business_overview内で
+          # 握りつぶされ、本番では常に事業内容が省略されるだけで気付けない
+          # （2026-09-29のCodexレビューで指摘・修正。secrets自体も同時に登録した）。
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
         run: python scripts/watch_and_notify.py
 
       # notify-stateブランチには常にnotify_state.json 1個だけを含むコミットを
