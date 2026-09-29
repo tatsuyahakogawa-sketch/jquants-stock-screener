@@ -160,12 +160,19 @@ def find_latest_yuho(edinet_code: str, fiscal_year_end: dt.date | None = None) -
     return found[-1]
 
 
-def find_latest_ipo_prospectus(edinet_code: str, approval_date: dt.date) -> dict | None:
-    """指定EDINETコードの新規上場時の有価証券届出書（訂正含む）のメタデータを検索する。
+def find_ipo_prospectus_candidates(edinet_code: str, approval_date: dt.date) -> list[dict]:
+    """指定EDINETコードの新規上場時の有価証券届出書（訂正含む）のメタデータを、
+    提出日時の新しい順（訂正があれば訂正が先）に全件返す。
 
     上場前の会社にはfind_latest_yuhoが前提とする決算期末情報が無いため、
     代わりに上場承認日を基準にした前後の窓（提出は承認発表の前後どちらも
     ありうるため両方向に取る）で走査する。
+
+    1件だけでなく全件返すのは、訂正有価証券届出書（040）が訂正箇所だけの
+    差分を含み、「事業の内容」欄自体は変更されていない場合その項目が
+    訂正後の書類には含まれないことがあるため。呼び出し側(fetch_ipo_business_
+    overview)で新しい順に試し、無ければより古い（原本を含む）書類に
+    フォールバックできるようにする（2026-09-29のCodexレビューで指摘・修正）。
     """
     key = _api_key()
     today = today_jst()
@@ -184,10 +191,8 @@ def find_latest_ipo_prospectus(edinet_code: str, approval_date: dt.date) -> dict
                 found.append(doc)
         d -= dt.timedelta(days=1)
 
-    if not found:
-        return None
-    found.sort(key=lambda x: x.get("submitDateTime", ""))
-    return found[-1]
+    found.sort(key=lambda x: x.get("submitDateTime", ""), reverse=True)
+    return found
 
 
 def fetch_ipo_business_overview(stock_code: str, approval_date: dt.date) -> str | None:
@@ -198,22 +203,31 @@ def fetch_ipo_business_overview(stock_code: str, approval_date: dt.date) -> str 
     EDINET_API_KEY未設定、その他取得エラーの場合はNoneを返し、呼び出し側は
     その項目を省略するだけにする（fetch_yuho_texts docstring同様、
     「無い」と「取得失敗」を区別せずNoneとして扱う）。
+
+    候補が複数ある場合（訂正有価証券届出書が出ている場合）は新しい順に試し、
+    最新の書類に「事業の内容」欄が含まれていなければ（訂正がその項目以外
+    だった場合等）より古い書類にフォールバックする
+    （find_ipo_prospectus_candidates docstring参照。2026-09-29の
+    Codexレビューで指摘・修正）。
     """
     try:
         edinet_code = get_edinet_code(stock_code)
         if edinet_code is None:
             return None
-        doc = find_latest_ipo_prospectus(edinet_code, approval_date)
-        if doc is None:
+        candidates = find_ipo_prospectus_candidates(edinet_code, approval_date)
+        if not candidates:
             return None
         key = _api_key()
-        zip_bytes = _download_xbrl_zip(doc["docID"], key)
+        for doc in candidates:
+            zip_bytes = _download_xbrl_zip(doc["docID"], key)
+            overview = _find_text_block(zip_bytes, _BUSINESS_OVERVIEW_TAGS)
+            if overview:
+                return overview
+        return None
     except EdinetAuthError:
         return None
     except Exception:
         return None
-
-    return _find_text_block(zip_bytes, _BUSINESS_OVERVIEW_TAGS)
 
 
 def _download_xbrl_zip(doc_id: str, key: str) -> bytes:

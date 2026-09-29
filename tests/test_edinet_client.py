@@ -52,8 +52,8 @@ class TestGetEdinetCodeAlphanumericStockCode(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class TestFindLatestIpoProspectus(unittest.TestCase):
-    def test_filters_by_doc_type_and_description_marker(self):
+class TestFindIpoProspectusCandidates(unittest.TestCase):
+    def test_filters_by_doc_type_and_description_marker_newest_first(self):
         approval_date = dt.date(2026, 9, 1)
         docs_by_date = {
             dt.date(2026, 8, 20): [
@@ -98,23 +98,23 @@ class TestFindLatestIpoProspectus(unittest.TestCase):
         with patch(f"{_MOD}._api_key", return_value="dummy-key"), \
                 patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 9, 5)), \
                 patch(f"{_MOD}._get_documents_for_date", side_effect=_get_documents):
-            result = edinet_client.find_latest_ipo_prospectus("E40756", approval_date)
+            result = edinet_client.find_ipo_prospectus_candidates("E40756", approval_date)
 
-        # 訂正後の届出書（より新しい提出日時）が選ばれる。
-        self.assertEqual(result["docID"], "S100CCC")
+        # 訂正後の届出書（より新しい提出日時）が先、原本が後に続く。
+        self.assertEqual([doc["docID"] for doc in result], ["S100CCC", "S100AAA"])
 
-    def test_no_matching_document_returns_none(self):
+    def test_no_matching_document_returns_empty_list(self):
         with patch(f"{_MOD}._api_key", return_value="dummy-key"), \
                 patch(f"{_MOD}.today_jst", return_value=dt.date(2026, 9, 5)), \
                 patch(f"{_MOD}._get_documents_for_date", return_value=[]):
-            result = edinet_client.find_latest_ipo_prospectus("E40756", dt.date(2026, 9, 1))
-        self.assertIsNone(result)
+            result = edinet_client.find_ipo_prospectus_candidates("E40756", dt.date(2026, 9, 1))
+        self.assertEqual(result, [])
 
 
 class TestFetchIpoBusinessOverview(unittest.TestCase):
     def test_happy_path_returns_extracted_text(self):
         with patch(f"{_MOD}.get_edinet_code", return_value="E40756"), \
-                patch(f"{_MOD}.find_latest_ipo_prospectus", return_value={"docID": "S100CCC"}), \
+                patch(f"{_MOD}.find_ipo_prospectus_candidates", return_value=[{"docID": "S100CCC"}]), \
                 patch(f"{_MOD}._api_key", return_value="dummy-key"), \
                 patch(f"{_MOD}._download_xbrl_zip", return_value=b"zip-bytes"), \
                 patch(f"{_MOD}._find_text_block", return_value="当社は、菓子小売事業を行っております。") as mock_find:
@@ -123,9 +123,32 @@ class TestFetchIpoBusinessOverview(unittest.TestCase):
         self.assertEqual(result, "当社は、菓子小売事業を行っております。")
         mock_find.assert_called_once_with(b"zip-bytes", edinet_client._BUSINESS_OVERVIEW_TAGS)
 
+    def test_falls_back_to_older_filing_when_latest_correction_lacks_the_block(self):
+        # 訂正有価証券届出書（新しい方）が訂正箇所だけの差分で「事業の内容」欄
+        # 自体を含まない場合、より古い（原本を含む）書類にフォールバックする
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        candidates = [{"docID": "S100CCC"}, {"docID": "S100AAA"}]
+
+        def _download(doc_id, key):
+            return f"zip-bytes-{doc_id}".encode()
+
+        def _find_text(zip_bytes, tags):
+            if zip_bytes == b"zip-bytes-S100AAA":
+                return "当社は、菓子小売事業を行っております。"
+            return None
+
+        with patch(f"{_MOD}.get_edinet_code", return_value="E40756"), \
+                patch(f"{_MOD}.find_ipo_prospectus_candidates", return_value=candidates), \
+                patch(f"{_MOD}._api_key", return_value="dummy-key"), \
+                patch(f"{_MOD}._download_xbrl_zip", side_effect=_download), \
+                patch(f"{_MOD}._find_text_block", side_effect=_find_text):
+            result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
+
+        self.assertEqual(result, "当社は、菓子小売事業を行っております。")
+
     def test_no_edinet_code_returns_none_without_further_calls(self):
         with patch(f"{_MOD}.get_edinet_code", return_value=None), \
-                patch(f"{_MOD}.find_latest_ipo_prospectus") as mock_find_doc:
+                patch(f"{_MOD}.find_ipo_prospectus_candidates") as mock_find_doc:
             result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
 
         self.assertIsNone(result)
@@ -133,7 +156,7 @@ class TestFetchIpoBusinessOverview(unittest.TestCase):
 
     def test_no_matching_document_returns_none(self):
         with patch(f"{_MOD}.get_edinet_code", return_value="E40756"), \
-                patch(f"{_MOD}.find_latest_ipo_prospectus", return_value=None), \
+                patch(f"{_MOD}.find_ipo_prospectus_candidates", return_value=[]), \
                 patch(f"{_MOD}._download_xbrl_zip") as mock_download:
             result = edinet_client.fetch_ipo_business_overview("634A", dt.date(2026, 9, 1))
 

@@ -637,6 +637,17 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
         result = wan._summarize_business_overview(text, max_len=100)
         self.assertEqual(result, "あ" * 100 + "…")
 
+    def test_english_phrase_word_boundaries_are_preserved(self):
+        # 全角文字の間の空白（HTML由来のレイアウト空白）は除去するが、
+        # 英数字の語の区切りとしての空白まで消して単語を連結してしまうと
+        # 開示内容を損なう（例: "Software as a Service"→"SoftwareasaService"、
+        # 2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社は、\nSoftware as a Service　を提供しております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、Software as a Serviceを提供しております。",
+        )
+
 
 class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
     def test_no_candidates_no_errors_still_saves_watermark(self):
