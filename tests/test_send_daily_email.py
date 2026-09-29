@@ -90,6 +90,22 @@ class TestPreviousBusinessDay(unittest.TestCase):
         self.assertEqual(sde._previous_business_day(dt.date(2026, 8, 31)), dt.date(2026, 8, 28))
 
 
+class TestEventDateFromKey(unittest.TestCase):
+    def test_date_only_suffix(self):
+        self.assertEqual(
+            sde._event_date_from_key("stop_high|1234|2026-08-28"), dt.date(2026, 8, 28)
+        )
+
+    def test_datetime_suffix_uses_date_part_only(self):
+        self.assertEqual(
+            sde._event_date_from_key("stock_split|1234|2026-08-28T15:30:00"),
+            dt.date(2026, 8, 28),
+        )
+
+    def test_malformed_suffix_returns_none(self):
+        self.assertIsNone(sde._event_date_from_key("stop_high|1234|not-a-date"))
+
+
 class TestCollectDigestMessages(unittest.TestCase):
     def test_filters_by_sent_at_date_in_jst(self):
         target = dt.date(2026, 8, 28)
@@ -110,11 +126,12 @@ class TestCollectDigestMessages(unittest.TestCase):
 
     def test_utc_sent_at_is_converted_to_jst_before_comparing(self):
         # 2026-08-27T15:30:00Z はJSTで2026-08-28 00:30。日付境界のズレを
-        # 誤らないことを確認する。
+        # 誤らないことを確認する（対象銘柄・事象自体の日付も同じ08-28、
+        # つまりJST日付を跨いだ直後に同日分として送信された想定）。
         target = dt.date(2026, 8, 28)
         state = {
             "notified": {
-                "stop_high|1234|2026-08-27": {
+                "stop_high|1234|2026-08-28": {
                     "sent_at": "2026-08-27T15:30:00+00:00",
                     "message": "UTC跨ぎの通知",
                 },
@@ -129,6 +146,26 @@ class TestCollectDigestMessages(unittest.TestCase):
         state = {"notified": {"stop_high|1234|2026-08-28": True}}
         messages = sde._collect_digest_messages(state, target)
         self.assertEqual(messages, [])
+
+    def test_catch_up_entry_for_an_older_date_is_excluded(self):
+        # 土日を挟んで金曜分のストップ高が月曜(target)にcatch-up送信された
+        # 場合、sent_atは月曜だが対象は金曜のデータなので、月曜分のまとめ
+        # メールには含めない（2026-09-29にユーザー指摘・修正）。
+        target = dt.date(2026, 8, 31)  # 月曜
+        state = {
+            "notified": {
+                "stop_high|1234|2026-08-31": {
+                    "sent_at": dt.datetime(2026, 8, 31, 16, 10, tzinfo=JST).isoformat(),
+                    "message": "月曜分のストップ高",
+                },
+                "stop_high|5678|2026-08-28": {
+                    "sent_at": dt.datetime(2026, 8, 31, 13, 5, tzinfo=JST).isoformat(),
+                    "message": "金曜分のcatch-upストップ高",
+                },
+            }
+        }
+        messages = sde._collect_digest_messages(state, target)
+        self.assertEqual(messages, ["月曜分のストップ高"])
 
     def test_ordered_by_rule_then_time(self):
         target = dt.date(2026, 8, 28)
