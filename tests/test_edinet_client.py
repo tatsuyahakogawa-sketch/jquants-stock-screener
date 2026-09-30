@@ -65,19 +65,19 @@ class TestElementToText(unittest.TestCase):
         self.assertIn("Foo", result)
         self.assertIn("Bar", result)
 
-    def test_block_boundary_uses_the_separator_marker_not_a_plain_newline(self):
-        # 単なる改行"\n"を区切りに使うと、呼び出し側
-        # (scripts/watch_and_notify.py _collapse_whitespace)が「前後が
-        # 日本語の文字かどうか」でレイアウト空白と構造的な区切りを見分ける
-        # 際に、日本語の文字同士に挟まれた構造的な区切り（隣接する日本語の
-        # 表セル等）までレイアウト空白と誤認して除去してしまう
-        # （"国内海外"のように結合される）。除去されてはならない区切りだと
-        # 判別できるよう、専用のマーカー文字(BLOCK_SEPARATOR_MARKER)を
-        # 使う（2026-09-30のCodexレビューで指摘・修正）。
+    def test_block_boundary_is_a_plain_space_usable_by_any_caller(self):
+        # ブロック要素の境界には半角スペース(BLOCK_SEPARATOR)を挿入する。
+        # _element_to_textは大株主・事業概要のテキストブロック抽出全般で
+        # 使われる共通処理で、fetch_yuho_texts()経由でexcel_export.pyが
+        # 企業詳細Excelのセルへ値をそのまま書き込む用途にも使われるため、
+        # ここで返す値自体が誰にとっても意味の通る文字でなければならない
+        # （以前はUnicode専用領域の専用マーカー文字を使っており、
+        # watch_and_notify.py以外の呼び出し元ではそのマーカー文字が
+        # そのまま出力に混入してしまっていた。2026-09-30のCodexレビューで
+        # 指摘・修正）。
         elem = etree.fromstring("<block><td>国内</td><td>海外</td></block>")
         result = edinet_client._element_to_text(elem)
-        self.assertIn(edinet_client.BLOCK_SEPARATOR_MARKER, result)
-        self.assertNotIn("\n", result)
+        self.assertEqual(result, "国内" + edinet_client.BLOCK_SEPARATOR + "海外")
 
     def test_escaped_html_stored_as_literal_text_is_reparsed(self):
         # XBRLのescapedItemType仕様により、要素のテキスト自体が一段

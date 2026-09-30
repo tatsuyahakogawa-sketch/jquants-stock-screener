@@ -302,22 +302,26 @@ _BLOCK_LEVEL_TAGS = frozenset(
     {"p", "div", "tr", "td", "th", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
 )
 
-# ブロック要素の境界を示すための区切りマーカー。単純な改行"\n"を使うと、
-# 呼び出し側(scripts/watch_and_notify.py _collapse_whitespace)が「前後が
-# 日本語の文字かどうか」でレイアウト目的の空白と意味のある区切りを見分ける
-# 際に、日本語の文字同士に挟まれた構造的な区切り（例: 隣接する日本語の
-# 表セル"<td>国内</td><td>海外</td>"）まで単なるレイアウト空白と誤認して
-# 除去してしまい、"国内海外"のように結合されてしまう（2026-09-30の
-# Codexレビューで指摘・修正）。Unicode専用領域(Private Use Area)の1文字を
-# 「除去してはならない構造的な区切り」の目印として使う。呼び出し側は
-# このマーカーを見つけたら常に区切りとして扱う。制御文字(NUL等)はXMLの
-# 文字データとして不正でlxmlがtailへの設定自体を拒否する
-# （ValueError: All strings must be XML compatible...）ため使えない。
-BLOCK_SEPARATOR_MARKER = ""
+# ブロック要素の境界を示すため、直後に半角スペースを挿入する。
+# 以前はUnicode専用領域(Private Use Area)の専用マーカー文字を使い、
+# 呼び出し側(scripts/watch_and_notify.py)がそれを「除去してはならない
+# 構造的な区切り」として特別扱いしてから表示用のスペースへ変換して
+# いたが、_element_to_textは大株主・事業概要のテキストブロック抽出全般で
+# 使われる共通処理であり、fetch_yuho_texts()経由でexcel_export.pyが
+# 企業詳細Excelのセルへ値をそのまま書き込む用途にも使われる。マーカー
+# 文字への変換をwatch_and_notify.py側でしか行っていなかったため、
+# それ以外の呼び出し元ではマーカー文字（豆腐文字として表示されうる）が
+# そのまま出力に混入してしまっていた（2026-09-30のCodexレビューで指摘・
+# 修正）。_element_to_textの時点で誰が見ても意味の通る半角スペースに
+# 変換しておくことでこの問題自体を無くす。scripts/watch_and_notify.py側の
+# _collapse_whitespaceも、日本語の文字同士に挟まれた空白を無条件に
+# 除去せず常に1つの半角スペースへ圧縮するよう単純化した（構造的な区切りと
+# レイアウト空白を区別する必要が無くなったため）。
+BLOCK_SEPARATOR = " "
 
 
 def _insert_block_separators(root) -> None:
-    """ブロック要素(<p>等)の直後にBLOCK_SEPARATOR_MARKERを挿入する
+    """ブロック要素(<p>等)の直後にBLOCK_SEPARATORを挿入する
     （rootの子孫要素のtailを書き換える副作用がある）。
 
     隣接するブロック要素間に元のHTML側で改行・空白等の区切りが無い場合、
@@ -340,7 +344,7 @@ def _insert_block_separators(root) -> None:
             continue  # コメント・処理命令等（tagが関数になっている）は対象外
         local_name = tag.rsplit("}", 1)[-1].lower()
         if local_name in _BLOCK_LEVEL_TAGS:
-            elem.tail = BLOCK_SEPARATOR_MARKER + (elem.tail or "")
+            elem.tail = BLOCK_SEPARATOR + (elem.tail or "")
 
 
 def _element_to_text(elem) -> str | None:

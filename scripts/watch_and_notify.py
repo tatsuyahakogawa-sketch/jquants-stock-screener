@@ -87,7 +87,6 @@ import logging
 import os
 import re
 import sys
-import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -373,50 +372,35 @@ _BUSINESS_OVERVIEW_MAX_LEN = 200
 # 【事業の内容】は..."のように本文の一部が見出しの前置きと誤認されて
 # 削られてしまうため。同2026-09-29のCodexレビューで指摘・修正）。
 _SECTION_HEADER_PATTERN = re.compile(r"^[\d０-９\s().（）．、]{0,10}【事業の内容】")
-# 開示のHTML由来の改行・空白（表組みの空セル等）を除去する際、"Software as a
-# Service"や"Foo, Inc."のような英語表現中の空白（意味を持つ区切り）まで
-# 消してしまうと単語が連結されて開示内容を損なう
-# （例: "SoftwareasaService"・"Foo,Inc."）。日本語の文章自体は元々語間に
-# 空白を持たないため、前後どちらも日本語の文字（ひらがな・カタカナ・
-# 漢字・全角記号等）ではない空白だけを1つの半角スペースに圧縮して残し、
-# それ以外（前後どちらかが日本語の文字である空白）は除去する
-# （2026-09-30のCodexレビューで指摘・修正。当初は前後が半角(ASCII)文字か
-# どうかで判定していたため、"Café au lait"のような非ASCIIのラテン文字
-# （例: "é"）やアンダッシュ等を含む語では該当の空白まで消えてしまって
-# いた。「半角/全角」ではなく「日本語の文字かどうか」で判定する）。
+# 開示のHTML由来の改行・空白（表組みの空セル・段落や表セルの境界に
+# edinet_client._insert_block_separatorsが挿入する半角スペース等）は
+# 全て1つの半角スペースに圧縮する（連続する空白・改行をまとめるだけで、
+# 完全に除去はしない）。
+#
+# 以前は「前後どちらも日本語の文字でなければ1つの半角スペースに圧縮し、
+# それ以外は完全に除去する」という、日本語の文章は元々語間に空白を
+# 持たないことを利用した方式だったが、これは繰り返しCodexレビューで
+# 指摘を受けた: (1) 前後がASCII文字かどうかで判定すると"Café au lait"の
+# ような非ASCIIラテン文字を含む語の空白が消える、(2) 前後が半角文字かで
+# 判定すると"Foo & Bar"のような記号隣接の空白が消える、(3) 全角ラテン文字
+# ("ＡＩ　ＣＲＯＳＳ"のような社名)はUnicode名に"FULLWIDTH"を含むため
+# 日本語の文字と誤判定され空白が消える、(4) 最大の問題として、この
+# 「日本語文字同士に挟まれた空白は除去してよい」という判定は、
+# _insert_block_separatorsが挿入する構造的な区切り（隣接する日本語の
+# 表セル等）と、単なるレイアウト空白（表組みの空セル等）を原理的に
+# 区別できず、前者まで除去して"国内海外"のように結合してしまっていた。
+# 際限なく特殊ケースが増え続けたため、2026-09-30のCodexレビューで
+# 複数回にわたり指摘・修正した末に、「完全除去」自体をやめて常に
+# 1つの半角スペースへ圧縮する方式に単純化した。日本語の文章の語間に
+# 多少の余分な半角スペースが残ることはあるが（例:
+# "当社は 菓子小売事業を 行っております。"）、これは見た目の些細な問題に
+# すぎず、単語同士が連結されて意味を誤読する（"国内海外"等）よりも
+# 明確に安全である（CLAUDE.md「データの正確性を最優先」参照）。
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
-_JAPANESE_CHAR_NAME_MARKERS = ("CJK", "HIRAGANA", "KATAKANA", "FULLWIDTH", "IDEOGRAPHIC")
-
-
-def _is_japanese_char(ch: str) -> bool:
-    try:
-        name = unicodedata.name(ch)
-    except ValueError:
-        # 名前を持たない制御文字等。日本語の文字ではないため除去対象にはしない。
-        return False
-    if name.startswith("FULLWIDTH LATIN"):
-        # 全角ラテン文字（"ＡＩ ＣＲＯＳＳ株式会社"のような社名で使われる）は
-        # Unicode名に"FULLWIDTH"を含むため、他の全角文字（全角数字・全角
-        # 記号等）と同列に「日本語の文字」と誤判定され、"ＡＩ"と"ＣＲＯＳＳ"の
-        # 間の意味のある空白まで消えてしまっていた（"ＡＩＣＲＯＳＳ"になる）。
-        # 全角ラテン文字だけは除外する（2026-09-30のCodexレビューで指摘・
-        # 修正。全角数字・全角記号は「３　【事業の内容】」のような見出し
-        # 前の空白除去に必要なため、"FULLWIDTH"全体ではなく"FULLWIDTH LATIN"
-        # だけを狙い撃ちする）。
-        return False
-    return any(marker in name for marker in _JAPANESE_CHAR_NAME_MARKERS)
 
 
 def _collapse_whitespace(text: str) -> str:
-    def _replace(m: re.Match) -> str:
-        start, end = m.span()
-        before = text[start - 1] if start > 0 else ""
-        after = text[end] if end < len(text) else ""
-        if before and after and not _is_japanese_char(before) and not _is_japanese_char(after):
-            return " "
-        return ""
-
-    return _WHITESPACE_RUN_PATTERN.sub(_replace, text)
+    return _WHITESPACE_RUN_PATTERN.sub(" ", text).strip()
 
 
 def _summarize_business_overview(text: str, max_len: int = _BUSINESS_OVERVIEW_MAX_LEN) -> str:
@@ -425,23 +409,11 @@ def _summarize_business_overview(text: str, max_len: int = _BUSINESS_OVERVIEW_MA
     LLMによる要約・言い換えは行わず、開示された原文をそのまま短く切り出すだけ
     にする（CLAUDE.md「データの正確性を最優先」参照。数値・事実を含む開示文を
     独自に要約すると誤った印象を与えかねないため）。開示のHTML由来の改行・
-    空白（表組みの空セル等）は除去するが、英数字の語の区切りとしての空白は
-    残す（_collapse_whitespace参照）。max_len文字を超える場合は最後の「。」で
-    自然に区切れればそこまでを使い、区切れなければ「…」を付けて機械的に
-    切り詰める。
+    空白は1つの半角スペースに圧縮する（_collapse_whitespace参照）。
+    max_len文字を超える場合は最後の「。」で自然に区切れればそこまでを使い、
+    区切れなければ「…」を付けて機械的に切り詰める。
     """
     collapsed = _collapse_whitespace(text)
-    # edinet_client.BLOCK_SEPARATOR_MARKERは"<td>国内</td><td>海外</td>"の
-    # ような隣接ブロック要素の構造的な区切りを示す（_collapse_whitespaceの
-    # 対象である\s+には一致しない制御文字のため、ここまでは手つかずのまま
-    # 残っている）。表示用の半角スペースに変換するのは_collapse_whitespace
-    # より後でなければならない。先に変換すると、変換後の半角スペースが
-    # 日本語の文字同士に挟まれた「除去してよいレイアウト空白」だと誤認され、
-    # 消されてしまう（2026-09-30のCodexレビューで指摘・修正。以前は単なる
-    # 改行"\n"をブロック区切りに使っていたため、この誤認除去で
-    # "国内海外"のように結合されてしまっていた）。
-    collapsed = collapsed.replace(edinet_client.BLOCK_SEPARATOR_MARKER, " ")
-    collapsed = re.sub(r" {2,}", " ", collapsed).strip()
     collapsed = _SECTION_HEADER_PATTERN.sub("", collapsed, count=1)
     if len(collapsed) <= max_len:
         return collapsed

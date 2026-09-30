@@ -614,11 +614,17 @@ class TestIpoNotifications(_WatchAndNotifyTestCase):
 
 
 class TestSummarizeBusinessOverview(unittest.TestCase):
-    def test_short_text_is_returned_as_is_with_whitespace_collapsed(self):
+    def test_short_text_has_whitespace_runs_collapsed_to_a_single_space(self):
+        # 開示のHTML由来の改行・空白は完全に除去するのではなく、常に1つの
+        # 半角スペースへ圧縮する（2026-09-30のCodexレビューで複数回にわたり
+        # 指摘を受けた末に、「日本語の文字同士に挟まれた空白は完全に除去する」
+        # という以前の方式をやめて単純化した。日本語の文章に多少の余分な
+        # 半角スペースが残ることはあるが、単語同士が連結されて意味を
+        # 誤読するよりも明確に安全）。
         text = "当社は、\n菓子小売事業を 　行っております。"
         self.assertEqual(
             wan._summarize_business_overview(text),
-            "当社は、菓子小売事業を行っております。",
+            "当社は、 菓子小売事業を 行っております。",
         )
 
     def test_leading_section_header_is_stripped(self):
@@ -655,62 +661,51 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
         self.assertEqual(result, "あ" * 100 + "…")
 
     def test_english_phrase_word_boundaries_are_preserved(self):
-        # 全角文字の間の空白（HTML由来のレイアウト空白）は除去するが、
-        # 英数字の語の区切りとしての空白まで消して単語を連結してしまうと
-        # 開示内容を損なう（例: "Software as a Service"→"SoftwareasaService"、
-        # 2026-09-29のCodexレビューで指摘・修正）。
+        # 英数字の語の区切りとしての空白を消して単語を連結してしまうと
+        # 開示内容を損なう（例: "Software as a Service"→"SoftwareasaService"）。
+        # 常に1つの半角スペースへ圧縮する現在の方式では、この種の空白は
+        # 単純に保たれる（2026-09-29のCodexレビューで指摘・修正）。
         text = "当社は、\nSoftware as a Service　を提供しております。"
         self.assertEqual(
             wan._summarize_business_overview(text),
-            "当社は、Software as a Serviceを提供しております。",
+            "当社は、 Software as a Service を提供しております。",
         )
 
     def test_whitespace_adjacent_to_english_punctuation_is_preserved(self):
-        # 空白の前後が英数字同士の場合だけを対象にすると、"Foo & Bar"や
-        # "Foo, Inc."のような句読点・記号が隣接する英語表現の空白まで
-        # 消えてしまう（"Foo&Bar"・"Foo,Inc."になる）。半角文字同士で
-        # あれば記号でも空白を残すよう修正した
-        # （2026-09-29のCodexレビューで指摘・修正）。
+        # "Foo & Bar"や"Foo, Inc."のような句読点・記号が隣接する英語表現の
+        # 空白も同様に保たれる（2026-09-29のCodexレビューで指摘・修正）。
         text = "当社は、\nFoo & Bar、Foo, Inc.　との提携を行っております。"
         self.assertEqual(
             wan._summarize_business_overview(text),
-            "当社は、Foo & Bar、Foo, Inc.との提携を行っております。",
+            "当社は、 Foo & Bar、Foo, Inc. との提携を行っております。",
         )
 
     def test_whitespace_around_non_ascii_latin_characters_is_preserved(self):
-        # 前後が半角(ASCII)文字かどうかで判定すると、"Café au lait"のような
-        # 非ASCIIのラテン文字（アクセント付き文字"é"等）を含む語では、
-        # その空白まで日本語の文章と同様に除去されてしまう
-        # （"Caféau lait"になる）。「半角か」ではなく「日本語の文字か」で
-        # 判定するよう修正した（2026-09-30のCodexレビューで指摘・修正）。
+        # "Café au lait"のような非ASCIIのラテン文字（アクセント付き文字
+        # "é"等）を含む語の空白も同様に保たれる
+        # （2026-09-30のCodexレビューで指摘・修正）。
         text = "当社は、\nCafé au lait　を提供しております。"
         self.assertEqual(
             wan._summarize_business_overview(text),
-            "当社は、Café au laitを提供しております。",
+            "当社は、 Café au lait を提供しております。",
         )
 
     def test_whitespace_between_fullwidth_latin_words_is_preserved(self):
-        # 全角ラテン文字のUnicode名は"FULLWIDTH LATIN CAPITAL LETTER A"の
-        # ように"FULLWIDTH"を含むため、他の全角文字（全角数字・全角記号等）
-        # と同列に「日本語の文字」と誤判定され、"ＡＩ　ＣＲＯＳＳ"のような
-        # 全角ラテン文字の社名では単語間の空白まで消えてしまっていた
-        # （"ＡＩＣＲＯＳＳ"になる。2026-09-30のCodexレビューで指摘・修正）。
+        # "ＡＩ　ＣＲＯＳＳ"のような全角ラテン文字の社名の単語間の空白も
+        # 同様に保たれる（2026-09-30のCodexレビューで指摘・修正）。
         text = "当社は、\nＡＩ　ＣＲＯＳＳ株式会社との提携を行っております。"
         self.assertEqual(
             wan._summarize_business_overview(text),
-            "当社は、ＡＩ ＣＲＯＳＳ株式会社との提携を行っております。",
+            "当社は、 ＡＩ ＣＲＯＳＳ株式会社との提携を行っております。",
         )
 
-    def test_block_separator_marker_between_japanese_text_is_not_removed(self):
-        # edinet_client.BLOCK_SEPARATOR_MARKERは、隣接する表セル等の構造的な
-        # 区切りを示すために_element_to_textが挿入する目印。前後がどちらも
-        # 日本語の文字であっても、単なるレイアウト空白と違って除去して
-        # はならない（2026-09-30のCodexレビューで指摘・修正。以前は単なる
-        # 改行"\n"を区切りに使っており、日本語の文字同士に挟まれると
-        # レイアウト空白と誤認されて除去され、"国内海外"のように結合されて
-        # しまっていた）。
-        marker = edinet_client.BLOCK_SEPARATOR_MARKER
-        text = f"国内{marker}海外の店舗数は以下の通りです。"
+    def test_block_separator_between_japanese_text_is_preserved(self):
+        # edinet_client.BLOCK_SEPARATORは、隣接する表セル等の構造的な区切りを
+        # 示すために_element_to_textが挿入する半角スペース。前後がどちらも
+        # 日本語の文字であっても、常に1つの半角スペースへ圧縮する現在の
+        # 方式では単純に保たれ、"国内海外"のように結合されない
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        text = f"国内{edinet_client.BLOCK_SEPARATOR}海外の店舗数は以下の通りです。"
         self.assertEqual(
             wan._summarize_business_overview(text),
             "国内 海外の店舗数は以下の通りです。",
