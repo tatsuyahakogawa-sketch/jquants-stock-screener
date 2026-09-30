@@ -1,12 +1,26 @@
-"""当日にDiscordへ送信した内容をまとめて、平日16:30 JSTに1日1回メールで
+"""当日にDiscordへ送信した内容をまとめて、平日16:30 JST以降に1日1回メールで
 再掲するバッチ。GitHub Actions(.github/workflows/daily_email_digest.yml)から
 実行される想定（2026-09-01にユーザー指定。以前は毎朝9:00 JSTに前営業日分を
 まとめる仕様だったが、(1) GitHub Actionsのschedule実行はしばしば遅延し、
 2026-09-30に9:00→11:30 JSTまで遅延した実例が発生、(2) 定刻通りに動いても
 そもそも「前日分」しか載らず鮮度が低い、という2つの問題をユーザーに指摘され、
-2026-09-30に「当日16:30に当日分を1回で」に変更した。16:30 JSTはstop_high等の
-当日中通知を担うwatch_and_notify.pyの最終実行枠(16:10 JST。CLAUDE.md参照)の
-後に、その回の送信・状態保存が完了しているはずの猶予を見込んだ時刻）。
+2026-09-30に「当日16:30に当日分を1回で」に変更した）。
+
+16:30 JSTは、stop_high等の当日中通知を担うwatch_and_notify.pyの最終実行枠
+(16:10 JST。CLAUDE.md参照)の後に、その回の送信・状態保存が完了しているはず
+の猶予を見込んだ時刻として選んだが、それでもwatch_and_notify.py側の
+schedule実行自体がGitHub Actionsのschedule遅延で16:30より後にずれ込んだ
+場合（このリポジトリで10:00・13:00枠・旧9:00枠のいずれも数時間規模の
+遅延実績があり、16:10枠だけが遅延しない保証は無い）、まとめメールが
+その日の状態更新前の古い状態を読んでしまい、当日分の一部が「target_dayが
+変わる翌日の実行では二度と対象にならない」ため永久にメールから漏れる
+（2026-09-30のCodexレビューで指摘）。この時刻差だけに頼らず、
+watch-and-notifyワークフロー自体の完了イベントでもこのワークフローが
+起動するようにし（.github/workflows/daily_email_digest.yml参照）、
+実際に状態が更新された直後に追いつけるようにした。ただしwatch-and-notifyは
+平日中に10:00/13:00/16:10 JSTの3回完了するため、10:00・13:00枠の完了時点で
+送ってしまわないよう、_is_after_final_notifier_slotで15:00 JST以降の
+起動だけを対象にする（それより早い起動は何もせず終了する）。
 
 scripts/watch_and_notify.pyがDiscordへ送信するたびに
 state["notified"][key] = {"sent_at": ..., "message": ...} として記録する
@@ -60,6 +74,30 @@ _RULE_ORDER = [
     "ipo_approval",
     "ipo_listed",
 ]
+
+
+def _now_jst() -> dt.datetime:
+    # テストでtoday_jst()と同様にpatchできるよう、dt.datetime.now(JST)を
+    # 薄いラッパー関数に切り出す（scripts/watch_and_notify.pyの_now_jst()と
+    # 同じ理由）。
+    return dt.datetime.now(JST)
+
+
+# watch_and_notify.pyの最終実行枠(16:10 JST)を狙う。それより早いと
+# 10:00・13:00枠の完了イベントで送ってしまい、当日分がまだ揃っていない
+# 状態で送信することになる。
+_FINAL_NOTIFIER_SLOT_THRESHOLD = dt.time(15, 0)
+
+
+def _is_after_final_notifier_slot(now: dt.datetime) -> bool:
+    """watch_and_notify.pyの最終実行枠(16:10 JST)相当の時刻を過ぎているか。
+
+    このワークフローはwatch-and-notifyワークフローの完了イベントでも
+    起動されるが（モジュールdocstring参照）、watch-and-notify自体は平日中
+    10:00/13:00/16:10 JSTの3回完了する。10:00・13:00枠の完了時点で送って
+    しまわないよう、この関数で15:00 JST以降の起動だけに絞る。
+    """
+    return now.time() >= _FINAL_NOTIFIER_SLOT_THRESHOLD
 
 
 def _load_state() -> dict:
@@ -233,6 +271,16 @@ def main() -> int:
     today = today_jst()
     if is_market_holiday(today):
         logger.info("%s は休日のためスキップします。", today)
+        return 0
+
+    # workflow_dispatch（手動実行）の場合は時刻ガードを無効化し、いつでも
+    # 強制送信できるようにする（.github/workflows/daily_email_digest.yml参照。
+    # 動作確認や手動リカバリ用）。
+    force_send = os.environ.get("FORCE_SEND", "").lower() == "true"
+    if not force_send and not _is_after_final_notifier_slot(_now_jst()):
+        logger.info(
+            "watch_and_notifyの最終実行枠(16:10 JST)より前の起動のためスキップします。"
+        )
         return 0
 
     smtp_user = os.environ.get("GMAIL_ADDRESS")
