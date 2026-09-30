@@ -40,6 +40,31 @@ class TestElementToText(unittest.TestCase):
         self.assertIn("Foo", result)
         self.assertIn("Bar", result)
 
+    def test_namespaced_xhtml_block_elements_are_separated(self):
+        # inline XBRLの<html>本文は標準のXHTML名前空間を使うことが多く、
+        # その場合lxmlはタグ名を"{http://www.w3.org/1999/xhtml}p"のような
+        # 修飾名として保持する。単純な文字列一致("p"等)では該当せず区切りが
+        # 入らなかった（2026-09-30のCodexレビューで指摘・修正）。
+        xml = (
+            '<block xmlns:x="http://www.w3.org/1999/xhtml">'
+            "<x:p>Foo</x:p><x:p>Bar</x:p></block>"
+        )
+        elem = etree.fromstring(xml)
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("FooBar", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
+    def test_adjacent_table_cells_are_separated(self):
+        # <tr>の直後だけでなく、同じ行内で隣接する<td>同士も区切る
+        # （例: "<tr><td>Foo</td><td>Bar</td></tr>"→"FooBar"のまま
+        # 連結されないようにする。2026-09-30のCodexレビューで指摘・修正）。
+        elem = etree.fromstring("<block><tr><td>Foo</td><td>Bar</td></tr></block>")
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("FooBar", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
     def test_escaped_html_stored_as_literal_text_is_reparsed(self):
         # XBRLのescapedItemType仕様により、要素のテキスト自体が一段
         # エスケープされたXHTML文字列として格納されている場合、

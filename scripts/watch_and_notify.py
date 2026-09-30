@@ -87,6 +87,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -376,13 +377,24 @@ _SECTION_HEADER_PATTERN = re.compile(r"^[\d０-９\s().（）．、]{0,10}【事
 # Service"や"Foo, Inc."のような英語表現中の空白（意味を持つ区切り）まで
 # 消してしまうと単語が連結されて開示内容を損なう
 # （例: "SoftwareasaService"・"Foo,Inc."）。日本語の文章自体は元々語間に
-# 空白を持たないため、前後がどちらも半角文字（英数字に限らず、カンマ・
-# アンパサンド等の半角記号も含む）である空白だけを1つの半角スペースに
-# 圧縮して残し、それ以外（全角文字が隣接する空白）は除去する
-# （2026-09-29のCodexレビューで指摘・修正。当初は英数字同士の場合だけを
-# 対象にしていたため"Foo & Bar"や"Foo, Inc."のような句読点隣接の空白は
-# 依然として消えてしまっていた）。
+# 空白を持たないため、前後どちらも日本語の文字（ひらがな・カタカナ・
+# 漢字・全角記号等）ではない空白だけを1つの半角スペースに圧縮して残し、
+# それ以外（前後どちらかが日本語の文字である空白）は除去する
+# （2026-09-30のCodexレビューで指摘・修正。当初は前後が半角(ASCII)文字か
+# どうかで判定していたため、"Café au lait"のような非ASCIIのラテン文字
+# （例: "é"）やアンダッシュ等を含む語では該当の空白まで消えてしまって
+# いた。「半角/全角」ではなく「日本語の文字かどうか」で判定する）。
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
+_JAPANESE_CHAR_NAME_MARKERS = ("CJK", "HIRAGANA", "KATAKANA", "FULLWIDTH", "IDEOGRAPHIC")
+
+
+def _is_japanese_char(ch: str) -> bool:
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        # 名前を持たない制御文字等。日本語の文字ではないため除去対象にはしない。
+        return False
+    return any(marker in name for marker in _JAPANESE_CHAR_NAME_MARKERS)
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -390,7 +402,7 @@ def _collapse_whitespace(text: str) -> str:
         start, end = m.span()
         before = text[start - 1] if start > 0 else ""
         after = text[end] if end < len(text) else ""
-        if before and after and before.isascii() and after.isascii():
+        if before and after and not _is_japanese_char(before) and not _is_japanese_char(after):
             return " "
         return ""
 

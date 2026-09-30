@@ -294,8 +294,13 @@ def _find_text_block(zip_bytes: bytes, tag_names: list[str]) -> str | None:
 
 
 _LOOKS_LIKE_HTML_MARKUP_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
-# 隣接するブロック要素の間で改行を挿入するために使うタグ名。
-_BLOCK_LEVEL_TAGS = ("p", "div", "tr", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6")
+# 隣接するブロック要素の間で改行を挿入するために使うタグ名（小文字、
+# 名前空間prefix無し）。tdとthはtr内で隣接するセル同士を区切るために必要
+# （2026-09-30のCodexレビューで指摘・修正。以前はtrの直後にしか改行を
+# 挿入しておらず、同じ行内の"<td>Foo</td><td>Bar</td>"は区切られなかった）。
+_BLOCK_LEVEL_TAGS = frozenset(
+    {"p", "div", "tr", "td", "th", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
+)
 
 
 def _insert_block_separators(root) -> None:
@@ -309,9 +314,20 @@ def _insert_block_separators(root) -> None:
     escapedItemTypeのケース（同関数内のreparsed）の両方に必要
     （2026-09-29・30のCodexレビューで指摘・修正。当初はescapedItemType
     再解析側にしか適用しておらず、より一般的な通常経路の方は未対応だった）。
+
+    タグ名は名前空間prefixを無視したローカル名で比較する。inline XBRLの
+    <html>本文は標準のXHTML名前空間を使うことが多く、lxmlはその場合
+    タグ名を"{http://www.w3.org/1999/xhtml}p"のような修飾名として保持
+    するため、"p"との単純な文字列一致では該当せず区切りが入らなかった
+    （2026-09-30のCodexレビューで指摘・修正）。
     """
-    for block in root.iter(*_BLOCK_LEVEL_TAGS):
-        block.tail = "\n" + (block.tail or "")
+    for elem in root.iter():
+        tag = elem.tag
+        if not isinstance(tag, str):
+            continue  # コメント・処理命令等（tagが関数になっている）は対象外
+        local_name = tag.rsplit("}", 1)[-1].lower()
+        if local_name in _BLOCK_LEVEL_TAGS:
+            elem.tail = "\n" + (elem.tail or "")
 
 
 def _element_to_text(elem) -> str | None:

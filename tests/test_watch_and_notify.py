@@ -676,6 +676,18 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
             "当社は、Foo & Bar、Foo, Inc.との提携を行っております。",
         )
 
+    def test_whitespace_around_non_ascii_latin_characters_is_preserved(self):
+        # 前後が半角(ASCII)文字かどうかで判定すると、"Café au lait"のような
+        # 非ASCIIのラテン文字（アクセント付き文字"é"等）を含む語では、
+        # その空白まで日本語の文章と同様に除去されてしまう
+        # （"Caféau lait"になる）。「半角か」ではなく「日本語の文字か」で
+        # 判定するよう修正した（2026-09-30のCodexレビューで指摘・修正）。
+        text = "当社は、\nCafé au lait　を提供しております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、Café au laitを提供しております。",
+        )
+
 
 class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
     def test_no_candidates_no_errors_still_saves_watermark(self):
