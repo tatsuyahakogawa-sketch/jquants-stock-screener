@@ -572,14 +572,22 @@ def main() -> int:
             had_error = True
             error_messages.append(f"⚠️ Discordへの送信に失敗しました: {e}")
 
-    if error_messages:
-        discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
-
     # 送信ループ中の失敗でhad_errorが変わりうるため、最終確定値をここで
     # 改めて保存する（_no_hits分岐と同じ理由。2026-09-30のCodexレビューで
-    # 指摘・修正）。
+    # 指摘・修正）。この保存は、直後のエラーまとめ送信（Discordへの
+    # ネットワーク呼び出し）より前に行う。後にすると、そのエラーまとめ
+    # 送信自体が例外を送出した場合にこの保存へ到達できず、既に成功した
+    # 情報源のウォーターマーク保存によってlast_run_schedule/last_run_id等は
+    # 「当日の最終実行枠が完了した」ことを示しているのに、last_run_had_error
+    # だけは前回以前の値のまま（またはキー自体が無い状態）で取り残されて
+    # しまい、scripts/send_daily_email.pyが実際にはエラーがあった日を
+    # 「該当銘柄なし」の確認済み0件と誤って伝えてしまう
+    # （2026-09-30のCodexレビューで指摘・修正）。
     state["last_run_had_error"] = had_error
     _save_state(state)
+
+    if error_messages:
+        discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
 
     return 1 if had_error else 0
 

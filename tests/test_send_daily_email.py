@@ -410,6 +410,17 @@ class TestBuildEmailBody(unittest.TestCase):
         )
         self.assertIn("🔴 ストップ高\n1234 テスト株式", body)
 
+    def test_messages_present_with_error_still_shows_the_caveat(self):
+        # 検出・送信済みの内容が一部あっても、他の情報源が失敗していた
+        # ことを示す注記は省略してはならない。省略すると、一部の情報源が
+        # 失敗しつつ別の情報源は成功した日に、何も欠けていない完全な
+        # まとめだと誤解を与える（2026-09-30のCodexレビューで指摘・修正。
+        # 以前はmessagesが空の場合にしかこの注記を出していなかった）。
+        body = sde._build_email_body(
+            dt.date(2026, 8, 28), ["🔴 ストップ高\n1234 テスト株式"], had_error=True
+        )
+        self.assertIn("完了できなかった可能性があります", body)
+
 
 class TestMain(_SendDailyEmailTestCase):
     def test_holiday_skips_without_sending(self):
@@ -426,6 +437,66 @@ class TestMain(_SendDailyEmailTestCase):
         result, smtp_instance = self._run(env=env, holiday=True)
         self.assertEqual(result, 0)
         smtp_instance.send_message.assert_called_once()
+
+    def test_holiday_is_evaluated_on_the_resolved_target_day_not_today(self):
+        # 金曜深夜近くまで遅延した最終実行枠の完了をきっかけに、土曜に
+        # なってからこのスクリプトが起動された場合。today_jst()（土曜）
+        # ではなく解決済みのtarget_day（マーカーの金曜）に対して休日判定
+        # しなければならない。today基準で判定すると、前後1日許容している
+        # はずのtarget_day解決が正しく機能していても、この休日チェック
+        # 自体が誤って土曜日を見てスキップしてしまう
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        friday = dt.date(2026, 8, 28)
+        saturday = dt.date(2026, 8, 29)
+        self._write_state(
+            {
+                f"stop_high|1234|{friday.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 28, 23, 55, tzinfo=JST).isoformat(),
+                    "message": "🔴 ストップ高\n1234 テスト株式",
+                }
+            },
+            last_run_schedule="10 7 * * 1-5",
+            last_run_date=friday.isoformat(),
+        )
+        with ExitStack() as stack:
+            def _patch(target, **kwargs):
+                return stack.enter_context(patch(f"{_MOD}.{target}", **kwargs))
+
+            stack.enter_context(patch.dict(f"{_MOD}.os.environ", _DEFAULT_ENV, clear=True))
+            _patch("today_jst", return_value=saturday)
+            # today(土曜)は休日だが、target_day(金曜)は休日ではない。
+            _patch("is_market_holiday", side_effect=lambda d: d != friday)
+            smtp_cls = _patch("smtplib.SMTP")
+            smtp_instance = smtp_cls.return_value
+            smtp_instance.__enter__.return_value = smtp_instance
+            result = sde.main()
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_called_once()
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertIn(friday.isoformat(), sent_msg["Subject"])
+
+    def test_force_send_uses_the_persisted_notifier_date_for_recovery(self):
+        # workflow_dispatchによる手動リカバリ（例: 前日にwatch_and_notify
+        # 自体が失敗し、修正後に前日分を送り直したい場合）で、target_dayを
+        # todayに固定していると本来確認したかった前日分ではなく空の
+        # 「今日分」を送ってしまう。last_run_dateがあればそれを使う
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        yesterday = _TODAY - dt.timedelta(days=1)
+        self._write_state(
+            {
+                f"stop_high|1234|{yesterday.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 31, 16, 10, tzinfo=JST).isoformat(),
+                    "message": "🔴 ストップ高\n1234 テスト株式",
+                }
+            },
+            last_run_date=yesterday.isoformat(),
+        )
+        env = dict(_DEFAULT_ENV, FORCE_SEND="true")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertIn(yesterday.isoformat(), sent_msg["Subject"])
+        self.assertIn("1234 テスト株式", sent_msg.get_content())
 
     def test_early_workflow_run_trigger_skips_without_sending(self):
         # watch-and-notifyの10:00・13:00枠の完了イベントで起動された場合、

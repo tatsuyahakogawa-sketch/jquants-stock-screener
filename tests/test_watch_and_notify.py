@@ -636,6 +636,33 @@ class TestLastRunMarker(_WatchAndNotifyTestCase):
         state = self._load_state()
         self.assertTrue(state["last_run_had_error"])
 
+    def test_had_error_marker_is_saved_even_if_the_error_summary_send_fails(self):
+        # 送信ループ完了後、エラーまとめのDiscord送信自体がネットワーク
+        # エラー等で例外を送出しても、last_run_had_errorの保存はそれより
+        # 前に行っているため正しく反映される。以前は保存がこの送信より
+        # 後だったため、送信が例外を送出すると保存に到達できず、既に
+        # 成功した情報源のウォーターマーク保存で「当日の最終実行枠が
+        # 完了した」ことを示すマーカーだけが残り、last_run_had_errorは
+        # 更新されないまま（scripts/send_daily_email.pyが実際にはエラーが
+        # あった日を「該当銘柄なし」の確認済み0件と誤って伝えてしまう）に
+        # なっていた（2026-09-30のCodexレビューで指摘・修正）。
+        def _fail_only_on_error_summary(webhook_url, message):
+            if message.startswith("⚠️"):
+                raise RuntimeError("discord down")
+
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        with self.assertRaises(RuntimeError):
+            self._run(
+                stop_high=stop_high_hit,
+                disclosures_error=RuntimeError("tdnet mirror down"),
+                send_error=_fail_only_on_error_summary,
+            )
+
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
 
 class TestPruneState(unittest.TestCase):
     def test_plain_date_keys_are_pruned_by_cutoff(self):

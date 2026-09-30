@@ -379,18 +379,21 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
 
 def _build_email_body(target_day: dt.date, messages: list[str], had_error: bool = False) -> str:
     lines = [f"{target_day:%Y-%m-%d}（本日）にDiscordへ通知した内容のまとめです。", ""]
+    # watch_and_notify.py側でいずれかの情報源の取得に失敗した日は、0件の
+    # ときだけでなく、他の情報源が検出・送信できた分がある場合でも
+    # その旨を明記する。「一部の情報源が失敗しつつ別の情報源は成功した」
+    # 日に、成功分だけを見せて何も欠けていないかのような完全な日次
+    # まとめだと誤解させてはならない（CLAUDE.md「データの正確性を最優先」
+    # 参照。2026-09-30のCodexレビューで指摘・修正。以前は messages が
+    # 空の場合にしかこの注記を出していなかった）。
+    if had_error:
+        lines.append(
+            "⚠️ 一部の情報源でチェックが完了できなかった可能性があります。"
+            "Discordに送信されたエラー通知をご確認ください。"
+        )
+        lines.append("")
     if not messages:
-        if had_error:
-            # watch_and_notify.py側でいずれかの情報源の取得に失敗した日。
-            # 「確認した上で0件だった」と「一部を確認できていない」は
-            # 全く違う情報なので、後者を「該当銘柄はありませんでした」と
-            # 断定的に伝えてはならない（CLAUDE.md「データの正確性を
-            # 最優先」参照。2026-09-30のCodexレビューで指摘・修正）。
-            lines.append(
-                "一部の情報源でチェックが完了できなかった可能性があります。"
-                "Discordに送信されたエラー通知をご確認ください。"
-            )
-        else:
+        if not had_error:
             lines.append("該当銘柄はありませんでした。")
     else:
         for message in messages:
@@ -416,25 +419,32 @@ def _send_email(
         smtp.send_message(msg, to_addrs=to_addrs)
 
 
+def _parse_iso_date(value: object) -> dt.date | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     today = today_jst()
 
-    # workflow_dispatch（手動実行）の場合はホリデーガード・マーカーガードの
+    # workflow_dispatch（手動実行）の場合はマーカーガード・休日ガードの
     # 両方を無効化し、いつでも強制送信できるようにする（.github/workflows/
-    # daily_email_digest.yml参照。動作確認や手動リカバリ用）。休日チェックを
-    # 先に行ってしまうと、休日にFORCE_SENDで動作確認しようとしても何も
-    # せず終了してしまう（2026-09-30のCodexレビューで指摘・修正）。
+    # daily_email_digest.yml参照。動作確認や手動リカバリ用）。
     force_send = os.environ.get("FORCE_SEND", "").lower() == "true"
-
-    if not force_send and is_market_holiday(today):
-        logger.info("%s は休日のためスキップします。", today)
-        return 0
-
     state = _load_state()
 
     if force_send:
-        target_day = today
+        # target_dayにtodayを固定していたため、翌日以降にworkflow_dispatch
+        # で前日分の手動リカバリを試みても「今日」分（まだ何も無い）を
+        # 対象にしてしまい、本来確認したかった前日分ではなく空の「今日分」
+        # を送ってしまっていた。last_run_dateがあればそれを使う
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        target_day = _parse_iso_date(state.get("last_run_date")) or today
     else:
         # TRIGGERING_RUN_ID: workflow_run経由の起動時、自身を起動した
         # watch-and-notifyの実行ID(github.event.workflow_run.id)。
@@ -449,6 +459,19 @@ def main() -> int:
             )
             return 0
         target_day = resolved_target_day
+
+        # 休日チェックはtoday_jst()ではなく解決済みのtarget_dayに対して
+        # 行う。通常watch_and_notify.py自体が休日はスキップするため
+        # マーカーが更新されず、上のNone判定で既にスキップされているはず
+        # だが、念のための防御。today_jst()で判定すると、例えば金曜深夜
+        # 近くまで遅延した最終実行枠の完了をきっかけに土曜になってから
+        # このスクリプトが起動された場合、_resolve_todays_final_notifier_run
+        # 側の前後1日許容は正しく機能していても、この休日チェック自体が
+        # 誤って土曜日（today）を見てスキップしてしまう
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        if is_market_holiday(target_day):
+            logger.info("%s は休日のためスキップします。", target_day)
+            return 0
 
     smtp_user = os.environ.get("GMAIL_ADDRESS")
     smtp_password = os.environ.get("GMAIL_APP_PASSWORD")
