@@ -334,15 +334,24 @@ def _insert_block_separators(root) -> None:
 
     タグ名は名前空間prefixを無視したローカル名で比較する。inline XBRLの
     <html>本文は標準のXHTML名前空間を使うことが多く、lxmlはその場合
-    タグ名を"{http://www.w3.org/1999/xhtml}p"のような修飾名として保持
-    するため、"p"との単純な文字列一致では該当せず区切りが入らなかった
-    （2026-09-30のCodexレビューで指摘・修正）。
+    タグ名を"{http://www.w3.org/1999/xhtml}p"のような修飾名（Clark記法）
+    として保持するため、"p"との単純な文字列一致では該当せず区切りが
+    入らなかった（2026-09-30のCodexレビューで指摘・修正）。
+
+    escapedItemType再解析側（lxml_html.fromstring）で"<xhtml:p>"のような
+    コロン付きの名前空間prefixがエスケープ後の文字列にそのまま含まれて
+    いる場合、lxml_html（XMLではなくHTMLパーサ）はこれをClark記法に
+    解決せず"xhtml:p"という1つのタグ名文字列としてそのまま保持するため、
+    Clark記法(`}`)だけを見る上記の対処では区切りが入らなかった
+    （2026-09-30のCodexレビューで指摘・修正）。Clark記法・コロンprefix
+    のどちらであっても、最後の`}`または`:`より後ろだけを見ることで
+    ローカル名を取り出す。
     """
     for elem in root.iter():
         tag = elem.tag
         if not isinstance(tag, str):
             continue  # コメント・処理命令等（tagが関数になっている）は対象外
-        local_name = tag.rsplit("}", 1)[-1].lower()
+        local_name = tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1].lower()
         if local_name in _BLOCK_LEVEL_TAGS:
             elem.tail = BLOCK_SEPARATOR + (elem.tail or "")
 

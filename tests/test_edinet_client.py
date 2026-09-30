@@ -55,6 +55,20 @@ class TestElementToText(unittest.TestCase):
         self.assertIn("Foo", result)
         self.assertIn("Bar", result)
 
+    def test_escaped_html_with_colon_prefixed_namespace_is_separated(self):
+        # escapedItemType再解析側(lxml_html.fromstring)は、エスケープ後の
+        # 文字列に含まれる"<xhtml:p>"のようなコロン付き名前空間prefixを
+        # Clark記法("{uri}p")には解決せず、"xhtml:p"という1つのタグ名
+        # 文字列としてそのまま保持する。Clark記法(}）だけを見る対処では
+        # このケースの区切りが入らなかった（2026-09-30のCodexレビューで
+        # 指摘・修正）。
+        xml = "<block>&lt;xhtml:p&gt;Foo&lt;/xhtml:p&gt;&lt;xhtml:p&gt;Bar&lt;/xhtml:p&gt;</block>"
+        elem = etree.fromstring(xml)
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("FooBar", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
     def test_adjacent_table_cells_are_separated(self):
         # <tr>の直後だけでなく、同じ行内で隣接する<td>同士も区切る
         # （例: "<tr><td>Foo</td><td>Bar</td></tr>"→"FooBar"のまま
