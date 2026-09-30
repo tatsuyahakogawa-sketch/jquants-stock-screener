@@ -254,6 +254,19 @@ class TestIsWithinAllowedLag(unittest.TestCase):
         key = "stock_split|1|2026-08-27T17:00:00"  # 2営業日前
         self.assertFalse(sde._is_within_allowed_lag(key, "stock_split", target))
 
+    def test_ipo_approval_whole_previous_day_is_allowed(self):
+        # ipo_approvalはipo_listedと異なりwatermarkによるcatch-upの対象
+        # （scripts/watch_and_notify.py _ipo_candidates参照）で、JPX新規
+        # 上場会社情報ページの取得が一時的に失敗した場合等、ApprovalDateより
+        # 後に検出・送信されることがある(tests/test_watch_and_notify.pyの
+        # test_approval_and_listing_tomorrow_are_both_notifiedが実際に
+        # モデル化している)。他のruleと同じ完全一致だと、この正常な
+        # catch-up検出分がまとめメールから漏れる
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        target = dt.date(2026, 8, 31)  # 月曜
+        key = "ipo_approval|634A|2026-08-28"  # 前営業日(金曜)承認
+        self.assertTrue(sde._is_within_allowed_lag(key, "ipo_approval", target))
+
 
 class TestCollectDigestMessages(unittest.TestCase):
     def test_filters_by_sent_at_date_in_jst(self):
@@ -422,6 +435,17 @@ class TestBuildEmailBody(unittest.TestCase):
         self.assertNotIn("該当銘柄はありませんでした。", body)
         self.assertIn("完了できなかった可能性があります", body)
 
+    def test_error_caveat_does_not_presuppose_discord_delivery_succeeded(self):
+        # watch_and_notify.py側のエラーまとめのDiscord送信自体が失敗する
+        # 場合もありうる（last_run_had_errorはその送信より前に保存される
+        # ため、その場合でもこの注記には到達する。watch_and_notify.py
+        # 参照）。「Discordの通知を確認してください」と断定すると、その
+        # 通知自体が届いていない場合に存在しないものを見るよう案内して
+        # しまうため、Discordに限定しない文言にする
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        body = sde._build_email_body(dt.date(2026, 8, 28), [], had_error=True)
+        self.assertIn("GitHub Actions", body)
+
     def test_messages_present_with_error_still_shows_the_messages(self):
         # 一部の情報源が失敗していても、他の情報源で実際に検出・送信済み
         # の内容はそのまま正しく載せる。
@@ -546,6 +570,37 @@ class TestMain(_SendDailyEmailTestCase):
         sent_msg = smtp_instance.send_message.call_args[0][0]
         self.assertIn(two_days_ago.isoformat(), sent_msg["Subject"])
         self.assertIn("1234 テスト株式", sent_msg.get_content())
+
+    def test_malformed_recovery_date_fails_loudly_instead_of_falling_back(self):
+        # RECOVERY_DATEが指定されているが不正な形式（例: "2026/09/29"）の
+        # 場合、無言でlast_run_date/todayへフォールバックすると、担当者が
+        # 意図した日付とは違う内容を送ってしまう。未指定と指定されたが
+        # 不正な場合を区別し、後者はエラーとして送信自体を中断する
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        env = dict(_DEFAULT_ENV, FORCE_SEND="true", RECOVERY_DATE="2026/09/29")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 1)
+        smtp_instance.send_message.assert_not_called()
+
+    def test_recovery_date_suppresses_unattributable_had_error_caveat(self):
+        # RECOVERY_DATEで過去の日付をリカバリする場合、
+        # state["last_run_had_error"]は直近の実行1件分の値でしかなく、
+        # target_dayに対応する実際のエラー有無を表さない。誤った注記を
+        # 付けるよりは注記自体を出さない方が安全（2026-09-30のCodex
+        # レビューで指摘・修正）。
+        two_days_ago = _TODAY - dt.timedelta(days=2)
+        self._write_state(
+            {},
+            last_run_date=_TODAY.isoformat(),
+            # 直近(当日)の実行はエラーだったが、これはリカバリ対象の
+            # two_days_ago分のエラー状況とは無関係。
+            last_run_had_error=True,
+        )
+        env = dict(_DEFAULT_ENV, FORCE_SEND="true", RECOVERY_DATE=two_days_ago.isoformat())
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertNotIn("完了できなかった可能性があります", sent_msg.get_content())
 
     def test_manual_notifier_run_does_not_auto_trigger_the_digest(self):
         # watch_and_notify.pyのworkflow_dispatchによる手動実行（動作確認・

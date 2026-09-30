@@ -327,8 +327,21 @@ _NO_CATCH_UP_RULES = {"ipo_listed"}
 # 財務情報が元々日付単位の情報しか無く、開示"時刻"という概念自体が
 # 無いため、この時刻による絞り込みは適用できず従来通り前営業日全体を
 # 許容する。
+# ipo_approval（新規上場承認）もwatermarkによるcatch-upの対象
+# （scripts/watch_and_notify.py _ipo_candidates・_scan_start参照。
+# ipo_listedと異なりこのruleは意図的なcatch-up無効化の対象外）で、
+# JPX新規上場会社情報ページの取得が一時的に失敗した場合等、
+# ApprovalDate（キーの日付）より後に検出・送信されることがある
+# （tests/test_watch_and_notify.pyのtest_approval_and_listing_tomorrow_
+# are_both_notifiedがApprovalDateを前日にした状況を実際にモデル化して
+# いる）。他のruleと同じ完全一致だと、この正常なcatch-up検出分が
+# まとめメールから漏れてしまう（2026-09-30のCodexレビューで指摘・修正）。
+# JPXページのApprovalDateも元々日付単位の情報のため、profit_growth_major
+# と同じく前営業日全体を許容する（catch-up自体は最大30日まで遡りうるが、
+# それより古い分をまとめメールに含めると本来防ぎたかった古い情報の再掲に
+# なるため、他のruleと同じく1営業日までに絞る）。
 _TDNET_NEXT_DAY_LAG_RULES = {"stock_split", "stock_consolidation"}
-_DATE_ONLY_NEXT_DAY_LAG_RULES = {"profit_growth_major"}
+_DATE_ONLY_NEXT_DAY_LAG_RULES = {"profit_growth_major", "ipo_approval"}
 _NEXT_DAY_LAG_RULES = _TDNET_NEXT_DAY_LAG_RULES | _DATE_ONLY_NEXT_DAY_LAG_RULES
 _FINAL_NOTIFIER_SLOT_TIME = dt.time(16, 10)
 
@@ -419,9 +432,16 @@ def _build_email_body(
     # 参照。2026-09-30のCodexレビューで指摘・修正。以前は messages が
     # 空の場合にしかこの注記を出していなかった）。
     if had_error:
+        # watch_and_notify.py側はエラーまとめをDiscordへ送信するが、その
+        # 送信自体が失敗する場合もありうる（この場合でもlast_run_had_error
+        # は失敗より前に保存されるため、ここには到達する。watch_and_notify.py
+        # 参照）。「Discordの通知を確認してください」と断定すると、その
+        # 通知自体が届いていない場合に存在しないものを見るよう案内して
+        # しまうため、Discordに限定せずActionsの実行ログも案内する
+        # （2026-09-30のCodexレビューで指摘・修正）。
         lines.append(
             "⚠️ 一部の情報源でチェックが完了できなかった可能性があります。"
-            "Discordに送信されたエラー通知をご確認ください。"
+            "Discordの通知、またはGitHub Actionsの実行ログをご確認ください。"
         )
         lines.append("")
     if not messages:
@@ -484,8 +504,35 @@ def main() -> int:
         # （.github/workflows/daily_email_digest.ymlのworkflow_dispatch
         # 入力`recovery_date`）を明示的に指定できるようにし、指定時は
         # last_run_dateより優先する。
-        recovery_date = _parse_iso_date(os.environ.get("RECOVERY_DATE"))
+        #
+        # RECOVERY_DATEが指定されているが不正な形式（例: "2026/09/29"）の
+        # 場合、_parse_iso_dateはNoneを返すだけなので、そのまま
+        # last_run_date/todayへ無言でフォールバックすると、担当者が意図した
+        # 日付とは違う内容を送ってしまう（当日分と重複したり、本来
+        # リカバリしたかった日付が結局送られないまま気付かれない）。
+        # 「未指定」と「指定されたが不正」を区別し、後者はエラーとして
+        # 送信自体を中断する（2026-09-30のCodexレビューで指摘・修正）。
+        recovery_date_raw = os.environ.get("RECOVERY_DATE", "").strip()
+        recovery_date = None
+        if recovery_date_raw:
+            recovery_date = _parse_iso_date(recovery_date_raw)
+            if recovery_date is None:
+                logger.error(
+                    "RECOVERY_DATEの形式が不正です（YYYY-MM-DD形式で指定してください）: %r",
+                    recovery_date_raw,
+                )
+                return 1
         target_day = recovery_date or _parse_iso_date(state.get("last_run_date")) or today
+        # RECOVERY_DATEを明示的に指定した場合、state["last_run_had_error"]は
+        # 直近の実行1件分の値でしかなく、target_dayに対応する実際のエラー
+        # 有無を表さない（例: 月曜分をリカバリする時点で火曜の実行が既に
+        # クリーンに完了していればFalseになっているが、月曜自体は本来
+        # エラーがあったからこそリカバリが必要だったかもしれない。逆に
+        # 火曜分がエラーだった場合、クリーンな月曜のリカバリに誤った注記が
+        # 付いてしまう）。日付ごとのエラー記録を別途持たない限り正しく
+        # 対応付けられないため、この場合はhad_errorマーカーを使わない
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        had_error_is_attributable = recovery_date is None
     else:
         # TRIGGERING_RUN_ID: workflow_run経由の起動時、自身を起動した
         # watch-and-notifyの実行ID(github.event.workflow_run.id)。
@@ -514,6 +561,10 @@ def main() -> int:
             logger.info("%s は休日のためスキップします。", target_day)
             return 0
 
+        # 自動送信経路ではtarget_dayは常にこの実行が実際に処理した対象日
+        # そのものなので、last_run_had_errorはtarget_dayに正しく対応する。
+        had_error_is_attributable = True
+
     smtp_user = os.environ.get("GMAIL_ADDRESS")
     smtp_password = os.environ.get("GMAIL_APP_PASSWORD")
     to_addrs_raw = os.environ.get("NOTIFY_EMAIL_TO")
@@ -526,7 +577,7 @@ def main() -> int:
         return 1
 
     messages = _collect_digest_messages(state, target_day)
-    had_error = bool(state.get("last_run_had_error"))
+    had_error = had_error_is_attributable and bool(state.get("last_run_had_error"))
 
     subject = f"📈 株式スクリーニング日次まとめ（{target_day:%Y-%m-%d}分）"
     body = _build_email_body(target_day, messages, had_error, is_today=(target_day == today))
