@@ -394,6 +394,16 @@ def _is_japanese_char(ch: str) -> bool:
     except ValueError:
         # 名前を持たない制御文字等。日本語の文字ではないため除去対象にはしない。
         return False
+    if name.startswith("FULLWIDTH LATIN"):
+        # 全角ラテン文字（"ＡＩ ＣＲＯＳＳ株式会社"のような社名で使われる）は
+        # Unicode名に"FULLWIDTH"を含むため、他の全角文字（全角数字・全角
+        # 記号等）と同列に「日本語の文字」と誤判定され、"ＡＩ"と"ＣＲＯＳＳ"の
+        # 間の意味のある空白まで消えてしまっていた（"ＡＩＣＲＯＳＳ"になる）。
+        # 全角ラテン文字だけは除外する（2026-09-30のCodexレビューで指摘・
+        # 修正。全角数字・全角記号は「３　【事業の内容】」のような見出し
+        # 前の空白除去に必要なため、"FULLWIDTH"全体ではなく"FULLWIDTH LATIN"
+        # だけを狙い撃ちする）。
+        return False
     return any(marker in name for marker in _JAPANESE_CHAR_NAME_MARKERS)
 
 
@@ -421,6 +431,17 @@ def _summarize_business_overview(text: str, max_len: int = _BUSINESS_OVERVIEW_MA
     切り詰める。
     """
     collapsed = _collapse_whitespace(text)
+    # edinet_client.BLOCK_SEPARATOR_MARKERは"<td>国内</td><td>海外</td>"の
+    # ような隣接ブロック要素の構造的な区切りを示す（_collapse_whitespaceの
+    # 対象である\s+には一致しない制御文字のため、ここまでは手つかずのまま
+    # 残っている）。表示用の半角スペースに変換するのは_collapse_whitespace
+    # より後でなければならない。先に変換すると、変換後の半角スペースが
+    # 日本語の文字同士に挟まれた「除去してよいレイアウト空白」だと誤認され、
+    # 消されてしまう（2026-09-30のCodexレビューで指摘・修正。以前は単なる
+    # 改行"\n"をブロック区切りに使っていたため、この誤認除去で
+    # "国内海外"のように結合されてしまっていた）。
+    collapsed = collapsed.replace(edinet_client.BLOCK_SEPARATOR_MARKER, " ")
+    collapsed = re.sub(r" {2,}", " ", collapsed).strip()
     collapsed = _SECTION_HEADER_PATTERN.sub("", collapsed, count=1)
     if len(collapsed) <= max_len:
         return collapsed

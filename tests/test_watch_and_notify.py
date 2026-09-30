@@ -23,6 +23,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts import watch_and_notify as wan
+from src import edinet_client
 
 _MOD = "scripts.watch_and_notify"
 
@@ -686,6 +687,33 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
         self.assertEqual(
             wan._summarize_business_overview(text),
             "当社は、Café au laitを提供しております。",
+        )
+
+    def test_whitespace_between_fullwidth_latin_words_is_preserved(self):
+        # 全角ラテン文字のUnicode名は"FULLWIDTH LATIN CAPITAL LETTER A"の
+        # ように"FULLWIDTH"を含むため、他の全角文字（全角数字・全角記号等）
+        # と同列に「日本語の文字」と誤判定され、"ＡＩ　ＣＲＯＳＳ"のような
+        # 全角ラテン文字の社名では単語間の空白まで消えてしまっていた
+        # （"ＡＩＣＲＯＳＳ"になる。2026-09-30のCodexレビューで指摘・修正）。
+        text = "当社は、\nＡＩ　ＣＲＯＳＳ株式会社との提携を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、ＡＩ ＣＲＯＳＳ株式会社との提携を行っております。",
+        )
+
+    def test_block_separator_marker_between_japanese_text_is_not_removed(self):
+        # edinet_client.BLOCK_SEPARATOR_MARKERは、隣接する表セル等の構造的な
+        # 区切りを示すために_element_to_textが挿入する目印。前後がどちらも
+        # 日本語の文字であっても、単なるレイアウト空白と違って除去して
+        # はならない（2026-09-30のCodexレビューで指摘・修正。以前は単なる
+        # 改行"\n"を区切りに使っており、日本語の文字同士に挟まれると
+        # レイアウト空白と誤認されて除去され、"国内海外"のように結合されて
+        # しまっていた）。
+        marker = edinet_client.BLOCK_SEPARATOR_MARKER
+        text = f"国内{marker}海外の店舗数は以下の通りです。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "国内 海外の店舗数は以下の通りです。",
         )
 
 

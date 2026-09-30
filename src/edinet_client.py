@@ -302,10 +302,23 @@ _BLOCK_LEVEL_TAGS = frozenset(
     {"p", "div", "tr", "td", "th", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
 )
 
+# ブロック要素の境界を示すための区切りマーカー。単純な改行"\n"を使うと、
+# 呼び出し側(scripts/watch_and_notify.py _collapse_whitespace)が「前後が
+# 日本語の文字かどうか」でレイアウト目的の空白と意味のある区切りを見分ける
+# 際に、日本語の文字同士に挟まれた構造的な区切り（例: 隣接する日本語の
+# 表セル"<td>国内</td><td>海外</td>"）まで単なるレイアウト空白と誤認して
+# 除去してしまい、"国内海外"のように結合されてしまう（2026-09-30の
+# Codexレビューで指摘・修正）。Unicode専用領域(Private Use Area)の1文字を
+# 「除去してはならない構造的な区切り」の目印として使う。呼び出し側は
+# このマーカーを見つけたら常に区切りとして扱う。制御文字(NUL等)はXMLの
+# 文字データとして不正でlxmlがtailへの設定自体を拒否する
+# （ValueError: All strings must be XML compatible...）ため使えない。
+BLOCK_SEPARATOR_MARKER = ""
+
 
 def _insert_block_separators(root) -> None:
-    """ブロック要素(<p>等)の直後に改行を挿入する（rootの子孫要素のtailを
-    書き換える副作用がある）。
+    """ブロック要素(<p>等)の直後にBLOCK_SEPARATOR_MARKERを挿入する
+    （rootの子孫要素のtailを書き換える副作用がある）。
 
     隣接するブロック要素間に元のHTML側で改行・空白等の区切りが無い場合、
     テキストだけを単純に連結すると単語同士がくっついてしまう
@@ -327,7 +340,7 @@ def _insert_block_separators(root) -> None:
             continue  # コメント・処理命令等（tagが関数になっている）は対象外
         local_name = tag.rsplit("}", 1)[-1].lower()
         if local_name in _BLOCK_LEVEL_TAGS:
-            elem.tail = "\n" + (elem.tail or "")
+            elem.tail = BLOCK_SEPARATOR_MARKER + (elem.tail or "")
 
 
 def _element_to_text(elem) -> str | None:

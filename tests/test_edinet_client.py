@@ -65,6 +65,20 @@ class TestElementToText(unittest.TestCase):
         self.assertIn("Foo", result)
         self.assertIn("Bar", result)
 
+    def test_block_boundary_uses_the_separator_marker_not_a_plain_newline(self):
+        # 単なる改行"\n"を区切りに使うと、呼び出し側
+        # (scripts/watch_and_notify.py _collapse_whitespace)が「前後が
+        # 日本語の文字かどうか」でレイアウト空白と構造的な区切りを見分ける
+        # 際に、日本語の文字同士に挟まれた構造的な区切り（隣接する日本語の
+        # 表セル等）までレイアウト空白と誤認して除去してしまう
+        # （"国内海外"のように結合される）。除去されてはならない区切りだと
+        # 判別できるよう、専用のマーカー文字(BLOCK_SEPARATOR_MARKER)を
+        # 使う（2026-09-30のCodexレビューで指摘・修正）。
+        elem = etree.fromstring("<block><td>国内</td><td>海外</td></block>")
+        result = edinet_client._element_to_text(elem)
+        self.assertIn(edinet_client.BLOCK_SEPARATOR_MARKER, result)
+        self.assertNotIn("\n", result)
+
     def test_escaped_html_stored_as_literal_text_is_reparsed(self):
         # XBRLのescapedItemType仕様により、要素のテキスト自体が一段
         # エスケープされたXHTML文字列として格納されている場合、
