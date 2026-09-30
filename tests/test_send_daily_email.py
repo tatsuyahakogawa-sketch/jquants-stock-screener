@@ -520,6 +520,33 @@ class TestMain(_SendDailyEmailTestCase):
         # 対象日は実行日(today)ではなく前日のため「（本日）」とは表示しない。
         self.assertNotIn("（本日）", sent_msg.get_content())
 
+    def test_recovery_date_takes_precedence_over_last_run_date(self):
+        # last_run_dateはwatch_and_notify.pyの実行のたびに（最終実行枠か
+        # どうかを問わず）更新される単一の値のため、前日分の送信に失敗した
+        # 後、リカバリ操作前に当日の10:00・13:00枠が実行されるとlast_run_date
+        # が当日に上書きされてしまい、本来リカバリしたかった前日分ではなく
+        # 不完全な当日分を対象にしてしまう。RECOVERY_DATE環境変数
+        # （.github/workflows/daily_email_digest.ymlのworkflow_dispatch入力
+        # recovery_date）を明示的に指定できれば、last_run_dateが上書きされて
+        # いてもこの問題を避けられる（2026-09-30のCodexレビューで指摘・修正）。
+        two_days_ago = _TODAY - dt.timedelta(days=2)
+        self._write_state(
+            {
+                f"stop_high|1234|{two_days_ago.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 8, 30, 16, 10, tzinfo=JST).isoformat(),
+                    "message": "🔴 ストップ高\n1234 テスト株式",
+                }
+            },
+            # last_run_dateは（10:00枠の実行等で）当日に上書きされている想定。
+            last_run_date=_TODAY.isoformat(),
+        )
+        env = dict(_DEFAULT_ENV, FORCE_SEND="true", RECOVERY_DATE=two_days_ago.isoformat())
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertIn(two_days_ago.isoformat(), sent_msg["Subject"])
+        self.assertIn("1234 テスト株式", sent_msg.get_content())
+
     def test_manual_notifier_run_does_not_auto_trigger_the_digest(self):
         # watch_and_notify.pyのworkflow_dispatchによる手動実行（動作確認・
         # 当日中の即時確認等で頻繁に行う）の完了イベントでは自動送信しない。

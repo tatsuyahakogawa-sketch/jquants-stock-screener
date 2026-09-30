@@ -107,6 +107,16 @@ watch_and_notify.py自体の送信スケジュール（平日10:00・13:00・16:
 NOTIFY_EMAIL_TOは複数の宛先をカンマ区切りで指定できる（2026-09-01にユーザーが
 社内の複数アドレスへの同報を指定したため）。
 
+FORCE_SEND=true（.github/workflows/daily_email_digest.ymlのworkflow_dispatch）
+は上記のマーカーガード・休日ガードを無効化する。target_dayは通常
+state["last_run_date"]を使うが、この値はwatch_and_notify.pyの実行のたびに
+（最終実行枠かどうかを問わず）更新される単一の値のため、前日分の送信に
+失敗した後、リカバリ操作前に当日の10:00・13:00枠が実行されると
+last_run_dateが当日に上書きされてしまい、本来リカバリしたかった前日分では
+なく不完全な当日分を対象にしてしまうことがある（2026-09-30のCodexレビューで
+指摘・修正）。RECOVERY_DATE環境変数（同workflow_dispatchの`recovery_date`
+入力）を明示的に指定した場合はそちらを優先する。
+
 実行方法（ローカル確認用。通常はGitHub Actionsから実行される）:
     GMAIL_ADDRESS=... GMAIL_APP_PASSWORD=... NOTIFY_EMAIL_TO=a@example.com,b@example.com \
         python scripts/send_daily_email.py
@@ -464,9 +474,18 @@ def main() -> int:
         # target_dayにtodayを固定していたため、翌日以降にworkflow_dispatch
         # で前日分の手動リカバリを試みても「今日」分（まだ何も無い）を
         # 対象にしてしまい、本来確認したかった前日分ではなく空の「今日分」
-        # を送ってしまっていた。last_run_dateがあればそれを使う
-        # （2026-09-30のCodexレビューで指摘・修正）。
-        target_day = _parse_iso_date(state.get("last_run_date")) or today
+        # を送ってしまっていた。last_run_dateがあればそれを使うよう修正
+        # したが、last_run_dateはwatch_and_notify.pyの実行のたびに（最終
+        # 実行枠かどうかを問わず）更新される単一の値のため、前日分の送信に
+        # 失敗した後、リカバリ操作前に当日の10:00・13:00枠が実行されると
+        # last_run_dateが当日に上書きされてしまい、本来リカバリしたかった
+        # 前日分ではなく不完全な当日分を対象にしてしまう
+        # （2026-09-30のCodexレビューで指摘・修正）。RECOVERY_DATE環境変数
+        # （.github/workflows/daily_email_digest.ymlのworkflow_dispatch
+        # 入力`recovery_date`）を明示的に指定できるようにし、指定時は
+        # last_run_dateより優先する。
+        recovery_date = _parse_iso_date(os.environ.get("RECOVERY_DATE"))
+        target_day = recovery_date or _parse_iso_date(state.get("last_run_date")) or today
     else:
         # TRIGGERING_RUN_ID: workflow_run経由の起動時、自身を起動した
         # watch-and-notifyの実行ID(github.event.workflow_run.id)。

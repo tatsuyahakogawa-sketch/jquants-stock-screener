@@ -32,11 +32,24 @@ name: daily-email-digest
 # TRIGGERING_RUN_ID（このワークフローを起動したwatch-and-notify実行の
 # ID）をstate["last_run_id"]と突き合わせる相関チェックを追加した。
 # 詳細はscripts/send_daily_email.pyのモジュールdocstring参照。
+# recovery_date（手動リカバリで対象にしたい日付、YYYY-MM-DD）: 省略時は
+# state["last_run_date"]をそのまま使う。last_run_dateはwatch_and_notify.py
+# の実行のたびに（最終実行枠かどうかを問わず）更新される単一の値のため、
+# 前日分の送信に失敗した後、リカバリ操作前に当日の10:00・13:00枠が実行
+# されるとlast_run_dateが当日に上書きされてしまい、本来リカバリしたかった
+# 前日分ではなく不完全な当日分を対象にしてしまう可能性がある
+# （2026-09-30のCodexレビューで指摘・修正）。前日分等を明示的にリカバリ
+# したい場合はこの入力に日付を指定して手動実行する。
 on:
   workflow_run:
     workflows: ["watch-and-notify"]
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      recovery_date:
+        description: "手動リカバリで対象にする日付(YYYY-MM-DD、省略可)"
+        required: false
+        type: string
 
 # data/notify_state.jsonを読むだけで書き換えない（notify-stateブランチへの
 # pushはwatch_and_notify.yml側のみが行う）ため、書き込み権限は不要。
@@ -94,4 +107,5 @@ jobs:
           # 指摘・修正。scripts/send_daily_email.pyのモジュールdocstring
           # 参照）。workflow_run以外のイベントでは空になる。
           TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          RECOVERY_DATE: ${{ github.event.inputs.recovery_date }}
         run: python scripts/send_daily_email.py
