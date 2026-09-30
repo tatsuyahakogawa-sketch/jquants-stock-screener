@@ -635,6 +635,14 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
         text = "当社は【Foo】ブランドを運営する。"
         self.assertEqual(wan._summarize_business_overview(text), text)
 
+    def test_text_content_before_the_heading_is_not_mistaken_for_a_numbering_prefix(self):
+        # 見出しの前置き部分も項目番号・空白・記号だけに限定する。任意の
+        # 文字列を許すと"当社の【事業の内容】は..."のように本文の一部
+        # （"当社の"）が見出しの前置きと誤認されて削られてしまう
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社の【事業の内容】は多岐にわたる。"
+        self.assertEqual(wan._summarize_business_overview(text), text)
+
     def test_long_text_is_cut_at_the_last_sentence_boundary(self):
         text = "あ" * 50 + "。" + "い" * 300
         result = wan._summarize_business_overview(text, max_len=100)

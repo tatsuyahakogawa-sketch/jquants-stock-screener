@@ -44,6 +44,19 @@ class TestElementToText(unittest.TestCase):
         elem = etree.fromstring("<block>   </block>")
         self.assertIsNone(edinet_client._element_to_text(elem))
 
+    def test_escaped_html_adjacent_block_elements_are_separated(self):
+        # <p>Foo</p><p>Bar</p>のように隣接するブロック要素の間に元の
+        # HTML側の区切り（空白・改行）が無い場合、単純に結合すると
+        # "FooBar"のように単語が連結されてしまう。ブロック要素の直後に
+        # 改行を挿入してから結合することでこれを防ぐ
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        xml = "<block>&lt;p&gt;Foo&lt;/p&gt;&lt;p&gt;Bar&lt;/p&gt;</block>"
+        elem = etree.fromstring(xml)
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("FooBar", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
 
 class TestGetEdinetCodeAlphanumericStockCode(unittest.TestCase):
     """2024年以降のTSEの新形式コード（数字3桁+英字1桁）への対応の回帰テスト。

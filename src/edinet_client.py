@@ -294,6 +294,8 @@ def _find_text_block(zip_bytes: bytes, tag_names: list[str]) -> str | None:
 
 
 _LOOKS_LIKE_HTML_MARKUP_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
+# 隣接するブロック要素の間で改行を挿入するために使うタグ名。
+_BLOCK_LEVEL_TAGS = ("p", "div", "tr", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6")
 
 
 def _element_to_text(elem) -> str | None:
@@ -311,6 +313,12 @@ def _element_to_text(elem) -> str | None:
         # ため、このパターンに一致しない場合は元の処理のまま変えない）。
         try:
             reparsed = lxml_html.fromstring(raw)
+            # ブロック要素の直後に改行を挿入してから結合する。挿入しないと
+            # "<p>Foo</p><p>Bar</p>"のような隣接ブロック要素間に何の区切りも
+            # 無いまま連結され、単語同士がくっついてしまう（例: "FooBar"。
+            # 2026-09-29のCodexレビューで指摘・修正）。
+            for block in reparsed.iter(*_BLOCK_LEVEL_TAGS):
+                block.tail = "\n" + (block.tail or "")
             reparsed_text = "".join(reparsed.itertext()).strip()
             if reparsed_text:
                 raw = reparsed_text
