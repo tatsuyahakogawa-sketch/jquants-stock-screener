@@ -49,6 +49,48 @@ _TRIGGER_SCHEDULE参照)を判定基準にした。このマーカーはGitHub A
 正しく判定してメール送信自体をスキップする（詳細はwatch_and_notify.py
 main()のstate["last_run_schedule"]周辺のコメント参照）。
 
+上記の設計にも、さらに次の5点がCodexレビューで指摘された（2026-09-30、
+2巡目）:
+  5. workflow_run一本に絞っても、10:00・13:00枠の完了イベントに起因する
+     起動がGitHub Actionsのジョブ開始待ち等でたまたま16:10枠のpush後に
+     状態を読んでしまうと「最終実行枠が完了している」と誤って判定し、
+     16:10枠自身の完了イベントに起因する起動と合わせて同じ内容を
+     重複送信しうる。
+  6. 個々の情報源が失敗していても4情報源全ての取得を「試みた」時点で
+     マーカーを無条件に設定していたため、例えばJQuantsClientの構築に
+     失敗しつつTDnet/IPOは正常に0件だった日に、実際には半分の情報源しか
+     確認できていないのに「該当銘柄はありませんでした」と断定的に伝えて
+     しまう。
+  7. stock_split・stock_consolidation（TDnet由来）の1日遅れ許容が前営業日
+     「全体」を対象にしていたため、前営業日の朝に本来検出できていたはず
+     の開示がTDnetミラーAPIの障害等で取りこぼされ今日catch-upで初めて
+     検出された場合も、16:10枠より後に出た正常な開示と区別できず
+     まとめメールに含めてしまう（本来防ぎたかった古いcatch-upの再発）。
+  8. workflow_dispatch（手動実行）時、FORCE_SEND判定より前に休日チェックを
+     行っていたため、休日に動作確認・手動リカバリのつもりで実行しても
+     何も送らず終了してしまう。
+  9. watch_and_notify.pyの16:10枠実行がJST深夜を跨ぐほど遅延すると、この
+     スクリプト自身のtoday_jst()とマーカーのlast_run_dateが一致しなくなり、
+     1.と同種のデータ欠落が日付境界でだけ再発する。
+
+対応: 5.はwatch_and_notify.py側にGitHub Actionsの実行ID
+(state["last_run_id"]。環境変数GITHUB_RUN_IDはActionsが自動的に渡す)も
+記録させ、このスクリプトを起動したworkflow_runイベントの元実行ID
+(TRIGGERING_RUN_ID環境変数＝github.event.workflow_run.id)と完全一致する
+場合のみ送信する(_resolve_todays_final_notifier_run参照)。6.は
+watch_and_notify.py側にstate["last_run_had_error"]も記録させ、0件かつ
+had_errorがTrueの日は「該当銘柄はありませんでした」ではなく「一部の
+情報源でチェックが完了できなかった可能性があります」という文言に変える
+(_build_email_body参照)。7.はTDnet由来のruleに限り、キーが持つ実際の
+開示時刻(_event_datetime_from_key)を見て、前営業日の最終実行枠(16:10 JST)
+以降だけを許容するよう絞った(_is_within_allowed_lag参照。財務情報のみの
+profit_growth_majorは開示"時刻"という概念自体が無いため対象外で、従来
+通り前営業日全体を許容する)。8.はFORCE_SENDの判定を休日チェックより前に
+移動した。9.はtarget_dayを「このスクリプト自身のtoday_jst()」ではなく
+「マーカーに刻まれたlast_run_date（watch_and_notify.pyが実際に処理した
+対象日）」そのものにし、日付の一致判定も前後1日までのずれを許容するよう
+緩めた(_resolve_todays_final_notifier_run参照)。
+
 scripts/watch_and_notify.pyがDiscordへ送信するたびに
 state["notified"][key] = {"sent_at": ..., "message": ...} として記録する
 送信時刻(sent_at, JST)と送信本文(message)を読み、当日に送信され、かつ
@@ -112,14 +154,46 @@ _RULE_ORDER = [
 _TARGET_TRIGGERS = {"10 7 * * 1-5", "manual"}
 
 
-def _is_todays_final_notifier_run(state: dict, today: dt.date) -> bool:
-    """watch_and_notify.pyの最終実行枠(16:10 JST)相当の実行が、当日分として
-    既に完了しているかをnotify_state.json自身のマーカーから判定する
+def _resolve_todays_final_notifier_run(
+    state: dict, today: dt.date, triggering_run_id: str | None
+) -> dt.date | None:
+    """watch_and_notify.pyの最終実行枠(16:10 JST)相当の実行が完了していれば
+    その対象日(target_day)を、完了していなければNoneを返す
     （モジュールdocstring参照。時刻の推測に頼らない）。
+
+    - 日付は厳密な完全一致ではなく前後1日までのずれを許容する。実行が
+      JST深夜を跨いでずれ込んだ場合（例: watch_and_notify.pyの16:10枠が
+      深夜近くまで遅延し、日付をまたいでから完了する等）、このスクリプト
+      自身のtoday_jst()とマーカーのlast_run_dateが厳密には一致しなくなる
+      ことがあり、完全一致だけを条件にすると16:30固定cronの時と同種の
+      データ欠落がJST日付境界でだけ再発してしまう（2026-09-30のCodex
+      レビューで指摘・修正）。target_dayはtoday（このスクリプト自身の
+      実行日）ではなく、マーカーに刻まれたlast_run_date（watch_and_notify.py
+      が実際に処理した対象日）をそのまま返す。
+    - triggering_run_idを渡した場合（workflow_run経由の起動。
+      TRIGGERING_RUN_ID環境変数＝github.event.workflow_run.id）、
+      state["last_run_id"]と完全一致することも要求する。これが無いと、
+      10:00・13:00枠の完了イベントに起因する起動が、GitHub Actionsの
+      ジョブ開始待ち等でたまたま16:10枠のpush後に状態を読んでしまった
+      場合に「最終実行枠が完了している」と誤って判定し、16:10枠自身の
+      完了イベントに起因する起動と合わせて同じ内容を重複送信してしまう
+      （2026-09-30のCodexレビューで指摘・修正）。Noneの場合はこの相関を
+      行わない（workflow_dispatch等、workflow_run以外からの起動）。
     """
-    if state.get("last_run_date") != today.isoformat():
-        return False
-    return state.get("last_run_schedule") in _TARGET_TRIGGERS
+    last_run_date_str = state.get("last_run_date")
+    if not last_run_date_str:
+        return None
+    try:
+        last_run_date = dt.date.fromisoformat(last_run_date_str)
+    except ValueError:
+        return None
+    if abs((today - last_run_date).days) > 1:
+        return None
+    if state.get("last_run_schedule") not in _TARGET_TRIGGERS:
+        return None
+    if triggering_run_id is not None and str(state.get("last_run_id")) != str(triggering_run_id):
+        return None
+    return last_run_date
 
 
 def _load_state() -> dict:
@@ -174,6 +248,21 @@ def _event_date_from_key(key: str) -> dt.date | None:
         return None
 
 
+def _event_datetime_from_key(key: str) -> dt.datetime | None:
+    """_event_date_from_keyの時刻付き版。時刻情報が無いキー（J-Quants由来の
+    rule等、元々日付単位の情報しか無い）は00:00:00として扱う。TDnet由来の
+    ruleの1日遅れ許容判定(_is_within_allowed_lag参照)で、実際の開示時刻を
+    見るために使う。
+    """
+    date_part = key.rsplit("|", 1)[-1]
+    try:
+        if "T" in date_part:
+            return dt.datetime.fromisoformat(date_part)
+        return dt.datetime.combine(dt.date.fromisoformat(date_part), dt.time())
+    except ValueError:
+        return None
+
+
 # ipo_listed（上場前日のお知らせ）だけは、キーに埋め込まれる日付が
 # 「対象の事象が起きた日」ではなく「翌営業日の上場予定日」（送信日の1日後）
 # になる設計のため（scripts/watch_and_notify.py _ipo_candidates参照）、
@@ -204,7 +293,40 @@ _NO_CATCH_UP_RULES = {"ipo_listed"}
 # テスト済みの状況）。profit_growth_majorだけを許容してこれらを対象外の
 #ままにすると、同じ理由で正常な1日遅れの分がまとめメールから漏れて
 # しまうため、同じ緩和を適用する（2026-09-29のCodexレビューで指摘・修正）。
-_NEXT_DAY_LAG_RULES = {"profit_growth_major", "stock_split", "stock_consolidation"}
+#
+# ただしTDnet由来のruleは、前営業日「全体」を許容すると本来防ぎたかった
+# 古いcatch-upまで再び許してしまう。例えば前営業日の朝10:00の開示が
+# TDnetミラーAPIの障害で取りこぼされ、今日になって初めてcatch-upで
+# 検出された場合、それは16:10枠より後に出た正常な開示ではなく一時的な
+# 障害由来の取りこぼしそのものであり、まとめメールに含めるべきではない
+# （2026-09-30のCodexレビューで指摘・修正）。TDnet由来のruleはキーに
+# 実際の開示時刻を持つ(_event_datetime_from_key参照)ため、前営業日の
+# 最終実行枠(16:10 JST)以降に限って許容する。profit_growth_majorは
+# 財務情報が元々日付単位の情報しか無く、開示"時刻"という概念自体が
+# 無いため、この時刻による絞り込みは適用できず従来通り前営業日全体を
+# 許容する。
+_TDNET_NEXT_DAY_LAG_RULES = {"stock_split", "stock_consolidation"}
+_DATE_ONLY_NEXT_DAY_LAG_RULES = {"profit_growth_major"}
+_NEXT_DAY_LAG_RULES = _TDNET_NEXT_DAY_LAG_RULES | _DATE_ONLY_NEXT_DAY_LAG_RULES
+_FINAL_NOTIFIER_SLOT_TIME = dt.time(16, 10)
+
+
+def _is_within_allowed_lag(key: str, rule: str, target_day: dt.date) -> bool:
+    """このkeyの対象日付・時刻が、target_day分のまとめメールに含めてよい
+    範囲内かを判定する（_NEXT_DAY_LAG_RULES群の詳細はその定義部分の
+    コメント参照）。
+    """
+    event_date = _event_date_from_key(key)
+    if event_date == target_day:
+        return True
+    if rule not in _NEXT_DAY_LAG_RULES:
+        return False
+    if event_date != _previous_business_day(target_day):
+        return False
+    if rule in _TDNET_NEXT_DAY_LAG_RULES:
+        event_dt = _event_datetime_from_key(key)
+        return event_dt is not None and event_dt.time() >= _FINAL_NOTIFIER_SLOT_TIME
+    return True  # _DATE_ONLY_NEXT_DAY_LAG_RULES
 
 
 def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
@@ -248,22 +370,28 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
         if sent_at_jst.date() != target_day:
             continue
         rule = key.split("|", 1)[0]
-        if rule not in _NO_CATCH_UP_RULES:
-            event_date = _event_date_from_key(key)
-            allowed_dates = {target_day}
-            if rule in _NEXT_DAY_LAG_RULES:
-                allowed_dates.add(_previous_business_day(target_day))
-            if event_date not in allowed_dates:
-                continue
+        if rule not in _NO_CATCH_UP_RULES and not _is_within_allowed_lag(key, rule, target_day):
+            continue
         entries.append((sent_at_jst, rule, message))
     entries.sort(key=lambda e: (_rule_sort_key(e[1]), e[0]))
     return [message for _, _, message in entries]
 
 
-def _build_email_body(target_day: dt.date, messages: list[str]) -> str:
+def _build_email_body(target_day: dt.date, messages: list[str], had_error: bool = False) -> str:
     lines = [f"{target_day:%Y-%m-%d}（本日）にDiscordへ通知した内容のまとめです。", ""]
     if not messages:
-        lines.append("該当銘柄はありませんでした。")
+        if had_error:
+            # watch_and_notify.py側でいずれかの情報源の取得に失敗した日。
+            # 「確認した上で0件だった」と「一部を確認できていない」は
+            # 全く違う情報なので、後者を「該当銘柄はありませんでした」と
+            # 断定的に伝えてはならない（CLAUDE.md「データの正確性を
+            # 最優先」参照。2026-09-30のCodexレビューで指摘・修正）。
+            lines.append(
+                "一部の情報源でチェックが完了できなかった可能性があります。"
+                "Discordに送信されたエラー通知をご確認ください。"
+            )
+        else:
+            lines.append("該当銘柄はありませんでした。")
     else:
         for message in messages:
             lines.append(message)
@@ -291,22 +419,36 @@ def _send_email(
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     today = today_jst()
-    if is_market_holiday(today):
+
+    # workflow_dispatch（手動実行）の場合はホリデーガード・マーカーガードの
+    # 両方を無効化し、いつでも強制送信できるようにする（.github/workflows/
+    # daily_email_digest.yml参照。動作確認や手動リカバリ用）。休日チェックを
+    # 先に行ってしまうと、休日にFORCE_SENDで動作確認しようとしても何も
+    # せず終了してしまう（2026-09-30のCodexレビューで指摘・修正）。
+    force_send = os.environ.get("FORCE_SEND", "").lower() == "true"
+
+    if not force_send and is_market_holiday(today):
         logger.info("%s は休日のためスキップします。", today)
         return 0
 
     state = _load_state()
 
-    # workflow_dispatch（手動実行）の場合はマーカーによるガードを無効化し、
-    # いつでも強制送信できるようにする（.github/workflows/
-    # daily_email_digest.yml参照。動作確認や手動リカバリ用）。
-    force_send = os.environ.get("FORCE_SEND", "").lower() == "true"
-    if not force_send and not _is_todays_final_notifier_run(state, today):
-        logger.info(
-            "watch_and_notifyの最終実行枠(16:10 JST)が当日分としてまだ完了して"
-            "いないためスキップします。"
-        )
-        return 0
+    if force_send:
+        target_day = today
+    else:
+        # TRIGGERING_RUN_ID: workflow_run経由の起動時、自身を起動した
+        # watch-and-notifyの実行ID(github.event.workflow_run.id)。
+        # state["last_run_id"]と突き合わせることで、実行順序の入れ替わりに
+        # よる重複送信を防ぐ（_resolve_todays_final_notifier_run参照）。
+        triggering_run_id = os.environ.get("TRIGGERING_RUN_ID") or None
+        resolved_target_day = _resolve_todays_final_notifier_run(state, today, triggering_run_id)
+        if resolved_target_day is None:
+            logger.info(
+                "watch_and_notifyの最終実行枠(16:10 JST)が当日分としてまだ完了して"
+                "いない、または既にこの実行分を送信済みのためスキップします。"
+            )
+            return 0
+        target_day = resolved_target_day
 
     smtp_user = os.environ.get("GMAIL_ADDRESS")
     smtp_password = os.environ.get("GMAIL_APP_PASSWORD")
@@ -319,15 +461,11 @@ def main() -> int:
         logger.error("NOTIFY_EMAIL_TO から有効な宛先を抽出できませんでした: %r", to_addrs_raw)
         return 1
 
-    # 2026-09-30にユーザー指摘・変更: 以前はtargetを前営業日にしていたが、
-    # 「前日分の情報を（スケジュール遅延でさらに）翌日遅くに受け取っても
-    # 意味が無い」との指摘を受け、当日分を送るように変更した
-    # （モジュールdocstring参照）。
-    target_day = today
     messages = _collect_digest_messages(state, target_day)
+    had_error = bool(state.get("last_run_had_error"))
 
     subject = f"📈 株式スクリーニング日次まとめ（{target_day:%Y-%m-%d}分）"
-    body = _build_email_body(target_day, messages)
+    body = _build_email_body(target_day, messages, had_error)
 
     try:
         _send_email(smtp_user, smtp_password, to_addrs, subject, body)

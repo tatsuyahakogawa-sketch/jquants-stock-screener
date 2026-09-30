@@ -496,6 +496,17 @@ def main() -> int:
     # マーカーによる実態ベースの判定に置き換えた）。
     state["last_run_schedule"] = os.environ.get("TRIGGER_SCHEDULE", "manual")
     state["last_run_date"] = today.isoformat()
+    # 起動元のGitHub Actions実行ID。scripts/send_daily_email.pyが、自身を
+    # 起動したworkflow_runイベントの元実行ID(github.event.workflow_run.id)と
+    # これを突き合わせることで「このマーカーを実際に書き込んだ実行と、
+    # 今まさにこのマーカーを読んで送信しようとしている起動が同一の実行か」
+    # を確認できるようにする。GITHUB_RUN_IDはGitHub Actionsが各ジョブに
+    # 自動で渡す環境変数（envブロックへの明示的な列挙は不要）。これが
+    # 無いと、10:00・13:00枠完了イベントに起因する（実行順序の入れ替わりで
+    # 実際には16:10枠のpush後に読みに行ってしまう）まとめメール起動が、
+    # 16:10枠自身の完了イベントに起因する起動と区別できず、同じ内容が
+    # 重複送信されうる（2026-09-30のCodexレビューで指摘・修正）。
+    state["last_run_id"] = os.environ.get("GITHUB_RUN_ID", "")
 
     if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
@@ -505,6 +516,15 @@ def main() -> int:
             if watermark_update:
                 key, value = watermark_update
                 state[key] = value
+        # had_errorはこの分岐に入った時点で必ずFalse（分岐条件
+        # `not error_messages`より）。scripts/send_daily_email.pyが
+        # 「本当に全て確認できた上での0件」か「一部確認できなかった」かを
+        # 区別できるようにするためのマーカー（2026-09-30のCodexレビューで
+        # 指摘・修正。以前はlast_run_schedule/last_run_dateが設定されて
+        # さえいれば無条件に「該当銘柄なし」の空メールを送っており、
+        # 一部の情報源が取得自体に失敗していた場合でも「確認済みの0件」と
+        # 誤って伝えてしまっていた）。
+        state["last_run_had_error"] = had_error
         _prune_state(state, today)
         _save_state(state)
         return 1 if had_error else 0
@@ -554,6 +574,12 @@ def main() -> int:
 
     if error_messages:
         discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
+
+    # 送信ループ中の失敗でhad_errorが変わりうるため、最終確定値をここで
+    # 改めて保存する（_no_hits分岐と同じ理由。2026-09-30のCodexレビューで
+    # 指摘・修正）。
+    state["last_run_had_error"] = had_error
+    _save_state(state)
 
     return 1 if had_error else 0
 

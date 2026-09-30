@@ -606,6 +606,36 @@ class TestLastRunMarker(_WatchAndNotifyTestCase):
         self.assertEqual(state["last_run_schedule"], "10 7 * * 1-5")
         self.assertEqual(state["last_run_date"], _TODAY.isoformat())
 
+    def test_last_run_had_error_is_false_on_a_clean_no_hits_run(self):
+        result, mock_send = self._run()
+
+        self.assertEqual(result, 0)
+        state = self._load_state()
+        self.assertFalse(state["last_run_had_error"])
+
+    def test_last_run_had_error_is_true_when_a_source_fails_with_no_candidates(self):
+        # scripts/send_daily_email.pyが「確認した上で0件だった」と
+        # 「一部を確認できていない」を区別できるようにするためのマーカー
+        # （2026-09-30のCodexレビューで指摘・修正）。TDnetの取得だけが
+        # 失敗し、他の情報源は正常に0件だった状況を再現する。
+        result, mock_send = self._run(disclosures_error=RuntimeError("tdnet mirror down"))
+
+        self.assertEqual(result, 1)
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
+    def test_last_run_had_error_is_true_when_a_source_fails_with_candidates_sent(self):
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        result, mock_send = self._run(
+            stop_high=stop_high_hit, disclosures_error=RuntimeError("tdnet mirror down")
+        )
+
+        self.assertEqual(result, 1)
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
 
 class TestPruneState(unittest.TestCase):
     def test_plain_date_keys_are_pruned_by_cutoff(self):

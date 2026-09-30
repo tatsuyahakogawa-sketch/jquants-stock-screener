@@ -24,8 +24,14 @@ name: daily-email-digest
 # notify_state.jsonに書き込む実行実績のマーカー(state["last_run_schedule"]
 # 等。github.event.scheduleをそのまま使うため実行時刻がずれても「どの
 # cronで発火したか」を誤らない)で判定するようscripts/send_daily_email.py
-# 側を作り直した（2026-09-30）。トリガー経路を1つに絞ったことで、重複
-# 送信の心配も無くなった。
+# 側を作り直した（2026-09-30）。
+#
+# それでもworkflow_run一本に絞っただけでは、10:00・13:00枠の完了イベント
+# に起因する起動がジョブ開始待ち等でたまたま16:10枠のpush後に状態を
+# 読んでしまうと重複送信されうるとCodexレビューで指摘され、
+# TRIGGERING_RUN_ID（このワークフローを起動したwatch-and-notify実行の
+# ID）をstate["last_run_id"]と突き合わせる相関チェックを追加した。
+# 詳細はscripts/send_daily_email.pyのモジュールdocstring参照。
 on:
   workflow_run:
     workflows: ["watch-and-notify"]
@@ -80,4 +86,12 @@ jobs:
           # 無効化し、いつでも強制送信できるようにする（動作確認・手動
           # リカバリ用）。
           FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' }}
+          # このワークフロー自身を起動したwatch-and-notifyの実行ID。
+          # notify_state.json側のstate["last_run_id"]（watch_and_notify.py
+          # 参照）と突き合わせ、10:00・13:00枠の完了イベントに起因する
+          # 起動がジョブ開始待ち等でたまたま16:10枠のpush後に状態を読んで
+          # しまうことによる重複送信を防ぐ（2026-09-30のCodexレビューで
+          # 指摘・修正。scripts/send_daily_email.pyのモジュールdocstring
+          # 参照）。workflow_run以外のイベントでは空になる。
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
         run: python scripts/send_daily_email.py

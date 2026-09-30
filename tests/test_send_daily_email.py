@@ -104,34 +104,77 @@ class TestPreviousBusinessDay(unittest.TestCase):
         self.assertEqual(sde._previous_business_day(dt.date(2026, 8, 31)), dt.date(2026, 8, 28))
 
 
-class TestIsTodaysFinalNotifierRun(unittest.TestCase):
-    def test_final_slot_schedule_today_is_true(self):
+class TestResolveTodaysFinalNotifierRun(unittest.TestCase):
+    def test_final_slot_schedule_today_returns_that_date(self):
         state = {"last_run_schedule": "10 7 * * 1-5", "last_run_date": "2026-09-01"}
-        self.assertTrue(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        self.assertEqual(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None),
+            dt.date(2026, 9, 1),
+        )
 
-    def test_manual_run_today_is_true(self):
+    def test_manual_run_today_returns_that_date(self):
         # workflow_dispatchでのwatch_and_notify.py手動実行も、意図的な
         # 当日分の実行として最終実行枠と同様に扱う。
         state = {"last_run_schedule": "manual", "last_run_date": "2026-09-01"}
-        self.assertTrue(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        self.assertEqual(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None),
+            dt.date(2026, 9, 1),
+        )
 
-    def test_early_slot_schedule_is_false(self):
+    def test_early_slot_schedule_is_none(self):
         # 10:00・13:00枠相当のcronはまだ当日分が揃っていないため対象外。
         state = {"last_run_schedule": "0 1 * * 1-5", "last_run_date": "2026-09-01"}
-        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        self.assertIsNone(sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None))
         state = {"last_run_schedule": "0 4 * * 1-5", "last_run_date": "2026-09-01"}
-        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        self.assertIsNone(sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None))
 
-    def test_final_slot_schedule_on_a_different_day_is_false(self):
-        # マーカーの日付が当日と一致しない場合（例: 前日の実行のまま
-        # 更新されていない）は対象外とする。
+    def test_one_day_gap_is_tolerated_and_returns_the_marker_date(self):
+        # watch_and_notify.py側の16:10枠実行がJST深夜を跨いでずれ込んだ
+        # 場合等、このスクリプト自身のtoday_jst()とマーカーのlast_run_date
+        # が厳密には一致しないことがある。前後1日までは許容し、target_dayは
+        # マーカーのlast_run_dateをそのまま使う（2026-09-30のCodexレビューで
+        # 指摘・修正）。
         state = {"last_run_schedule": "10 7 * * 1-5", "last_run_date": "2026-08-31"}
-        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        self.assertEqual(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None),
+            dt.date(2026, 8, 31),
+        )
 
-    def test_missing_marker_is_false(self):
+    def test_more_than_one_day_gap_is_none(self):
+        # 1日を超えるずれは「失敗・中断してマーカーが更新されないまま
+        # 放置されている」可能性が高いため対象外とする。
+        state = {"last_run_schedule": "10 7 * * 1-5", "last_run_date": "2026-08-28"}
+        self.assertIsNone(sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None))
+
+    def test_missing_marker_is_none(self):
         # watch_and_notify.py側がこの機能の追加より前の状態、または
         # 何らかの理由でマーカーの更新に到達しないまま終了した場合。
-        self.assertFalse(sde._is_todays_final_notifier_run({}, dt.date(2026, 9, 1)))
+        self.assertIsNone(sde._resolve_todays_final_notifier_run({}, dt.date(2026, 9, 1), None))
+
+    def test_matching_run_id_returns_the_date(self):
+        state = {
+            "last_run_schedule": "10 7 * * 1-5",
+            "last_run_date": "2026-09-01",
+            "last_run_id": "12345",
+        }
+        self.assertEqual(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), "12345"),
+            dt.date(2026, 9, 1),
+        )
+
+    def test_mismatching_run_id_is_none(self):
+        # 10:00・13:00枠の完了イベントに起因する起動が、ジョブ開始待ち等で
+        # たまたま16:10枠のpush後に状態を読んでしまった場合、この起動を
+        # 起こしたrun_id自体は16:10枠のものではないため、重複送信を防ぐため
+        # 送信しない（2026-09-30のCodexレビューで指摘・修正）。
+        state = {
+            "last_run_schedule": "10 7 * * 1-5",
+            "last_run_date": "2026-09-01",
+            "last_run_id": "99999",
+        }
+        self.assertIsNone(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), "12345")
+        )
 
 
 class TestEventDateFromKey(unittest.TestCase):
@@ -148,6 +191,62 @@ class TestEventDateFromKey(unittest.TestCase):
 
     def test_malformed_suffix_returns_none(self):
         self.assertIsNone(sde._event_date_from_key("stop_high|1234|not-a-date"))
+
+
+class TestEventDatetimeFromKey(unittest.TestCase):
+    def test_date_only_suffix_is_midnight(self):
+        self.assertEqual(
+            sde._event_datetime_from_key("profit_growth_major|1234|2026-08-28"),
+            dt.datetime(2026, 8, 28, 0, 0, 0),
+        )
+
+    def test_datetime_suffix_is_preserved(self):
+        self.assertEqual(
+            sde._event_datetime_from_key("stock_split|1234|2026-08-28T16:30:00"),
+            dt.datetime(2026, 8, 28, 16, 30, 0),
+        )
+
+    def test_malformed_suffix_returns_none(self):
+        self.assertIsNone(sde._event_datetime_from_key("stop_high|1234|not-a-date"))
+
+
+class TestIsWithinAllowedLag(unittest.TestCase):
+    def test_same_day_is_always_allowed(self):
+        target = dt.date(2026, 8, 31)
+        self.assertTrue(sde._is_within_allowed_lag("stop_high|1|2026-08-31", "stop_high", target))
+
+    def test_no_catch_up_rule_previous_day_is_rejected(self):
+        target = dt.date(2026, 8, 31)
+        self.assertFalse(sde._is_within_allowed_lag("stop_high|1|2026-08-28", "stop_high", target))
+
+    def test_profit_growth_major_whole_previous_day_is_allowed(self):
+        # 財務情報は日付単位の情報しか無く開示"時刻"という概念自体が無い
+        # ため、前営業日全体を許容する。
+        target = dt.date(2026, 8, 31)  # 月曜
+        key = "profit_growth_major|1|2026-08-28"  # 前営業日(金曜)
+        self.assertTrue(sde._is_within_allowed_lag(key, "profit_growth_major", target))
+
+    def test_tdnet_disclosure_after_final_slot_is_allowed(self):
+        # 前営業日の最終実行枠(16:10 JST)より後に出た開示は、正常な1日遅れ。
+        target = dt.date(2026, 8, 31)  # 月曜
+        key = "stock_split|1|2026-08-28T16:30:00"  # 前営業日16:30
+        self.assertTrue(sde._is_within_allowed_lag(key, "stock_split", target))
+
+    def test_tdnet_disclosure_before_final_slot_is_rejected(self):
+        # 前営業日の朝の開示がTDnetミラーAPIの障害等で取りこぼされ、今日
+        # catch-upで初めて検出された場合。16:10枠より前の開示なので、
+        # 本来は前営業日中に検出できていたはずの一時的な取りこぼしであり、
+        # 正常な1日遅れとは区別して除外する（2026-09-30のCodexレビューで
+        # 指摘・修正。以前は前営業日全体を許容しており、このケースも
+        # 誤って含めてしまっていた）。
+        target = dt.date(2026, 8, 31)  # 月曜
+        key = "stock_split|1|2026-08-28T09:00:00"  # 前営業日09:00
+        self.assertFalse(sde._is_within_allowed_lag(key, "stock_split", target))
+
+    def test_tdnet_disclosure_two_days_before_is_rejected(self):
+        target = dt.date(2026, 8, 31)  # 月曜
+        key = "stock_split|1|2026-08-27T17:00:00"  # 2営業日前
+        self.assertFalse(sde._is_within_allowed_lag(key, "stock_split", target))
 
 
 class TestCollectDigestMessages(unittest.TestCase):
@@ -294,12 +393,39 @@ class TestBuildEmailBody(unittest.TestCase):
         body = sde._build_email_body(dt.date(2026, 8, 28), ["🔴 ストップ高\n1234 テスト株式"])
         self.assertIn("🔴 ストップ高\n1234 テスト株式", body)
 
+    def test_empty_messages_with_error_avoids_confident_no_hits_claim(self):
+        # 「確認した上で0件だった」と「一部を確認できていない」は全く
+        # 違う情報。watch_and_notify.py側でいずれかの情報源の取得に
+        # 失敗していた日は、0件でも「該当銘柄はありませんでした」と
+        # 断定的に伝えてはならない（2026-09-30のCodexレビューで指摘・修正）。
+        body = sde._build_email_body(dt.date(2026, 8, 28), [], had_error=True)
+        self.assertNotIn("該当銘柄はありませんでした。", body)
+        self.assertIn("完了できなかった可能性があります", body)
+
+    def test_messages_present_with_error_still_shows_the_messages(self):
+        # 一部の情報源が失敗していても、他の情報源で実際に検出・送信済み
+        # の内容はそのまま正しく載せる。
+        body = sde._build_email_body(
+            dt.date(2026, 8, 28), ["🔴 ストップ高\n1234 テスト株式"], had_error=True
+        )
+        self.assertIn("🔴 ストップ高\n1234 テスト株式", body)
+
 
 class TestMain(_SendDailyEmailTestCase):
     def test_holiday_skips_without_sending(self):
         result, smtp_instance = self._run(holiday=True)
         self.assertEqual(result, 0)
         smtp_instance.send_message.assert_not_called()
+
+    def test_force_send_bypasses_the_holiday_guard(self):
+        # FORCE_SEND=trueの判定を休日チェックより前に行う。以前は休日
+        # チェックが先だったため、休日に動作確認・手動リカバリのつもりで
+        # workflow_dispatchしても何も送らず終了してしまっていた
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        env = dict(_DEFAULT_ENV, FORCE_SEND="true")
+        result, smtp_instance = self._run(env=env, holiday=True)
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_called_once()
 
     def test_early_workflow_run_trigger_skips_without_sending(self):
         # watch-and-notifyの10:00・13:00枠の完了イベントで起動された場合、
@@ -317,14 +443,32 @@ class TestMain(_SendDailyEmailTestCase):
 
     def test_failed_or_incomplete_notifier_run_skips_without_sending(self):
         # watch-and-notify側が失敗・中断し、最終実行枠のマーカーが当日分
-        # として更新されないまま終了した場合、実際には確認できていない
-        # のに「該当銘柄はありませんでした」という誤った空メールを送って
-        # しまわないよう、何もせず終了する（2026-09-30のCodexレビューで
-        # 指摘・修正）。
-        self._write_state({}, last_run_schedule="10 7 * * 1-5", last_run_date="2026-08-31")
+        # として更新されないまま長期間放置されている場合（1日を超える
+        # ずれ）、実際には確認できていないのに「該当銘柄はありませんでした」
+        # という誤った空メールを送ってしまわないよう、何もせず終了する
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        self._write_state({}, last_run_schedule="10 7 * * 1-5", last_run_date="2026-08-28")
         result, smtp_instance = self._run()
         self.assertEqual(result, 0)
         smtp_instance.send_message.assert_not_called()
+
+    def test_mismatching_triggering_run_id_skips_without_sending(self):
+        # 10:00・13:00枠の完了イベントに起因する起動が、ジョブ開始待ち等で
+        # たまたま16:10枠のpush後に状態を読んでしまった場合、この起動を
+        # 起こしたrun_id自体は16:10枠のものではないため送信しない
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        self._write_state({}, last_run_id="12345")
+        env = dict(_DEFAULT_ENV, TRIGGERING_RUN_ID="99999")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_not_called()
+
+    def test_matching_triggering_run_id_sends(self):
+        self._write_state({}, last_run_id="12345")
+        env = dict(_DEFAULT_ENV, TRIGGERING_RUN_ID="12345")
+        result, smtp_instance = self._run(env=env)
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_called_once()
 
     def test_force_send_bypasses_the_marker_guard(self):
         # workflow_dispatch（手動実行）はFORCE_SEND=trueでマーカーによる
@@ -384,6 +528,17 @@ class TestMain(_SendDailyEmailTestCase):
         smtp_instance.send_message.assert_called_once()
         sent_msg = smtp_instance.send_message.call_args[0][0]
         self.assertIn("該当銘柄はありませんでした。", sent_msg.get_content())
+
+    def test_no_hits_with_marker_had_error_avoids_confident_no_hits_claim(self):
+        # watch_and_notify.py側でstate["last_run_had_error"]=Trueが記録
+        # されている日は、0件でも「該当銘柄はありませんでした」と断定的に
+        # 伝えない（2026-09-30のCodexレビューで指摘・修正）。
+        self._write_state({}, last_run_had_error=True)
+        result, smtp_instance = self._run()
+        self.assertEqual(result, 0)
+        sent_msg = smtp_instance.send_message.call_args[0][0]
+        self.assertNotIn("該当銘柄はありませんでした。", sent_msg.get_content())
+        self.assertIn("完了できなかった可能性があります", sent_msg.get_content())
 
     def test_smtp_failure_returns_error(self):
         self._write_state({})
