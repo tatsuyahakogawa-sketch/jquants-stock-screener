@@ -85,6 +85,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -92,7 +93,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import discord_notify, endpoints, jpx_new_listings, rules, tdnet_client
+from src import discord_notify, edinet_client, endpoints, jpx_new_listings, rules, tdnet_client
 from src.jquants_client import JQuantsClient
 from src.jst import JST, today_jst
 from src.market_calendar import is_market_holiday
@@ -361,6 +362,68 @@ def _tdnet_candidates(
     return candidates, ("tdnet_watermark", today.isoformat()), None  # _jquants_candidatesと同じ理由
 
 
+_BUSINESS_OVERVIEW_MAX_LEN = 200
+# 有価証券届出書の項目見出し。実機のEDINETデータで確認した表記
+# （例: "３ 【事業の内容】"）に限定して取り除く。任意の【...】構成を
+# 対象にすると、開示本文自体が【】で始まる場合（例: "当社は【Foo】
+# ブランドを運営する。"）に本文まで削ってしまう
+# （2026-09-29のCodexレビューで指摘・修正）。前置き部分も項目番号・
+# 空白・括弧等の記号だけに限定する（任意の文字列を許すと、"当社の
+# 【事業の内容】は..."のように本文の一部が見出しの前置きと誤認されて
+# 削られてしまうため。同2026-09-29のCodexレビューで指摘・修正）。
+_SECTION_HEADER_PATTERN = re.compile(r"^[\d０-９\s().（）．、]{0,10}【事業の内容】")
+# 開示のHTML由来の改行・空白（表組みの空セル・段落や表セルの境界に
+# edinet_client._insert_block_separatorsが挿入する半角スペース等）は
+# 全て1つの半角スペースに圧縮する（連続する空白・改行をまとめるだけで、
+# 完全に除去はしない）。
+#
+# 以前は「前後どちらも日本語の文字でなければ1つの半角スペースに圧縮し、
+# それ以外は完全に除去する」という、日本語の文章は元々語間に空白を
+# 持たないことを利用した方式だったが、これは繰り返しCodexレビューで
+# 指摘を受けた: (1) 前後がASCII文字かどうかで判定すると"Café au lait"の
+# ような非ASCIIラテン文字を含む語の空白が消える、(2) 前後が半角文字かで
+# 判定すると"Foo & Bar"のような記号隣接の空白が消える、(3) 全角ラテン文字
+# ("ＡＩ　ＣＲＯＳＳ"のような社名)はUnicode名に"FULLWIDTH"を含むため
+# 日本語の文字と誤判定され空白が消える、(4) 最大の問題として、この
+# 「日本語文字同士に挟まれた空白は除去してよい」という判定は、
+# _insert_block_separatorsが挿入する構造的な区切り（隣接する日本語の
+# 表セル等）と、単なるレイアウト空白（表組みの空セル等）を原理的に
+# 区別できず、前者まで除去して"国内海外"のように結合してしまっていた。
+# 際限なく特殊ケースが増え続けたため、2026-09-30のCodexレビューで
+# 複数回にわたり指摘・修正した末に、「完全除去」自体をやめて常に
+# 1つの半角スペースへ圧縮する方式に単純化した。日本語の文章の語間に
+# 多少の余分な半角スペースが残ることはあるが（例:
+# "当社は 菓子小売事業を 行っております。"）、これは見た目の些細な問題に
+# すぎず、単語同士が連結されて意味を誤読する（"国内海外"等）よりも
+# 明確に安全である（CLAUDE.md「データの正確性を最優先」参照）。
+_WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
+
+
+def _collapse_whitespace(text: str) -> str:
+    return _WHITESPACE_RUN_PATTERN.sub(" ", text).strip()
+
+
+def _summarize_business_overview(text: str, max_len: int = _BUSINESS_OVERVIEW_MAX_LEN) -> str:
+    """EDINETの「事業の内容」原文から、Discord通知に載せる簡単な説明を作る。
+
+    LLMによる要約・言い換えは行わず、開示された原文をそのまま短く切り出すだけ
+    にする（CLAUDE.md「データの正確性を最優先」参照。数値・事実を含む開示文を
+    独自に要約すると誤った印象を与えかねないため）。開示のHTML由来の改行・
+    空白は1つの半角スペースに圧縮する（_collapse_whitespace参照）。
+    max_len文字を超える場合は最後の「。」で自然に区切れればそこまでを使い、
+    区切れなければ「…」を付けて機械的に切り詰める。
+    """
+    collapsed = _collapse_whitespace(text)
+    collapsed = _SECTION_HEADER_PATTERN.sub("", collapsed, count=1)
+    if len(collapsed) <= max_len:
+        return collapsed
+    cut = collapsed[:max_len]
+    last_period = cut.rfind("。")
+    if last_period >= max_len // 2:
+        return cut[: last_period + 1]
+    return cut + "…"
+
+
 def _ipo_candidates(
     today: dt.date, state: dict, seen_keys: set[str]
 ) -> tuple[list[Candidate], WatermarkUpdate | None, str | None]:
@@ -387,6 +450,20 @@ def _ipo_candidates(
             f"🆕 新規上場承認\n{row['Code']} {row['CompanyName']}（{row['MarketSegment']}）\n"
             f"上場承認日: {row['ApprovalDate']:%Y-%m-%d} / 上場予定日: {row['ListingDate']:%Y-%m-%d}"
         )
+        # どのような会社かを簡単に説明する（2026-09-28にユーザー要望）。
+        # 上場前の会社はEDINETの有価証券報告書を持たないため、代わりに
+        # 有価証券届出書（新規公開時）から「事業の内容」を取得する
+        # （src/edinet_client.fetch_ipo_business_overview参照）。取得できない
+        # 場合（該当書類が無い・EDINET_API_KEY未設定・一時的な取得失敗等）は
+        # 通知自体は本文なしでそのまま送る（この情報は付加的なものであり、
+        # 取得できないことを理由に本来の通知自体を止めてはならないため）。
+        try:
+            overview = edinet_client.fetch_ipo_business_overview(row["Code"], row["ApprovalDate"])
+        except Exception:
+            logger.warning("事業概要の取得に失敗しました（%s）", row["Code"], exc_info=True)
+            overview = None
+        if overview:
+            message += f"\n事業内容: {_summarize_business_overview(overview)}"
         candidates.append(Candidate("ipo_approval", row["Code"], row["ApprovalDate"], message, key))
 
     # 上場当日ではなく前日にリマインダーとして知らせる。上場当日に知らせても

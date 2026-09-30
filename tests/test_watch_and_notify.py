@@ -23,6 +23,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts import watch_and_notify as wan
+from src import edinet_client
 
 _MOD = "scripts.watch_and_notify"
 
@@ -59,6 +60,8 @@ class _WatchAndNotifyTestCase(unittest.TestCase):
         fetch_listings_error=None,
         disclosures_error=None,
         send_error=None,
+        business_overview=None,
+        business_overview_error=None,
     ):
         """main()を、指定した戻り値/例外でモックした状態で1回実行する。
 
@@ -100,6 +103,10 @@ class _WatchAndNotifyTestCase(unittest.TestCase):
                     "jpx_new_listings.fetch_new_listing_table",
                     return_value=listings if listings is not None else _empty_listings_df(),
                 )
+            if business_overview_error is not None:
+                _patch("edinet_client.fetch_ipo_business_overview", side_effect=business_overview_error)
+            else:
+                _patch("edinet_client.fetch_ipo_business_overview", return_value=business_overview)
             mock_send = _patch("discord_notify.send_discord_message")
             if send_error is not None:
                 mock_send.side_effect = send_error
@@ -550,6 +557,159 @@ class TestIpoNotifications(_WatchAndNotifyTestCase):
         self.assertEqual(result, 1)
         mock_send.assert_called_once()
         self.assertIn("JPX新規上場会社情報の取得に失敗", mock_send.call_args[0][1])
+
+    def test_approval_message_includes_business_overview_when_available(self):
+        # 上場承認の通知には、どのような会社かの簡単な説明を添える
+        # （2026-09-28にユーザー要望）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(
+            listings=listings, business_overview="当社は、菓子小売事業を行っております。",
+        )
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertIn("事業内容: 当社は、菓子小売事業を行っております。", sent_text)
+        self.mocks["edinet_client.fetch_ipo_business_overview"].assert_called_once_with("634A", _TODAY)
+
+    def test_approval_message_omits_business_overview_when_unavailable(self):
+        # EDINET側で該当書類が無い場合はNoneが返る想定（fetch_ipo_business_overview
+        # 自体が「無い」と「取得失敗」を区別せずNoneを返すため）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(listings=listings, business_overview=None)
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertNotIn("事業内容", sent_text)
+
+    def test_business_overview_failure_does_not_block_approval_notification(self):
+        # EDINET側の一時的な失敗で例外が出ても、上場承認の通知自体は
+        # 止めてはならない（この情報は付加的なものであるため）。
+        listings = pd.DataFrame([
+            {
+                "Code": "634A", "CompanyName": "（株）レイヤード", "MarketSegment": "スタンダード",
+                "ListingDate": _TODAY + dt.timedelta(days=10), "ApprovalDate": _TODAY,
+            },
+        ])
+        result, mock_send = self._run(
+            listings=listings, business_overview_error=RuntimeError("EDINET down"),
+        )
+
+        self.assertEqual(result, 0)
+        sent_text = self._sent_text(mock_send)
+        self.assertIn("新規上場承認", sent_text)
+        self.assertIn("634A", sent_text)
+        self.assertNotIn("事業内容", sent_text)
+
+
+class TestSummarizeBusinessOverview(unittest.TestCase):
+    def test_short_text_has_whitespace_runs_collapsed_to_a_single_space(self):
+        # 開示のHTML由来の改行・空白は完全に除去するのではなく、常に1つの
+        # 半角スペースへ圧縮する（2026-09-30のCodexレビューで複数回にわたり
+        # 指摘を受けた末に、「日本語の文字同士に挟まれた空白は完全に除去する」
+        # という以前の方式をやめて単純化した。日本語の文章に多少の余分な
+        # 半角スペースが残ることはあるが、単語同士が連結されて意味を
+        # 誤読するよりも明確に安全）。
+        text = "当社は、\n菓子小売事業を 　行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、 菓子小売事業を 行っております。",
+        )
+
+    def test_leading_section_header_is_stripped(self):
+        text = "３　【事業の内容】当社は、菓子小売事業を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、菓子小売事業を行っております。",
+        )
+
+    def test_bracketed_content_in_the_body_is_not_mistaken_for_the_header(self):
+        # 開示本文自体が【】で始まる場合（見出しではなく実際のブランド名等）に
+        # 本文まで削ってしまわないよう、「事業の内容」という見出しそのものに
+        # 一致する場合だけを除去対象にする（2026-09-29のCodexレビューで
+        # 指摘・修正。以前は任意の【...】構成を対象にしていた）。
+        text = "当社は【Foo】ブランドを運営する。"
+        self.assertEqual(wan._summarize_business_overview(text), text)
+
+    def test_text_content_before_the_heading_is_not_mistaken_for_a_numbering_prefix(self):
+        # 見出しの前置き部分も項目番号・空白・記号だけに限定する。任意の
+        # 文字列を許すと"当社の【事業の内容】は..."のように本文の一部
+        # （"当社の"）が見出しの前置きと誤認されて削られてしまう
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社の【事業の内容】は多岐にわたる。"
+        self.assertEqual(wan._summarize_business_overview(text), text)
+
+    def test_long_text_is_cut_at_the_last_sentence_boundary(self):
+        text = "あ" * 50 + "。" + "い" * 300
+        result = wan._summarize_business_overview(text, max_len=100)
+        self.assertEqual(result, "あ" * 50 + "。")
+
+    def test_long_text_without_sentence_boundary_is_hard_truncated(self):
+        text = "あ" * 300
+        result = wan._summarize_business_overview(text, max_len=100)
+        self.assertEqual(result, "あ" * 100 + "…")
+
+    def test_english_phrase_word_boundaries_are_preserved(self):
+        # 英数字の語の区切りとしての空白を消して単語を連結してしまうと
+        # 開示内容を損なう（例: "Software as a Service"→"SoftwareasaService"）。
+        # 常に1つの半角スペースへ圧縮する現在の方式では、この種の空白は
+        # 単純に保たれる（2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社は、\nSoftware as a Service　を提供しております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、 Software as a Service を提供しております。",
+        )
+
+    def test_whitespace_adjacent_to_english_punctuation_is_preserved(self):
+        # "Foo & Bar"や"Foo, Inc."のような句読点・記号が隣接する英語表現の
+        # 空白も同様に保たれる（2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社は、\nFoo & Bar、Foo, Inc.　との提携を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、 Foo & Bar、Foo, Inc. との提携を行っております。",
+        )
+
+    def test_whitespace_around_non_ascii_latin_characters_is_preserved(self):
+        # "Café au lait"のような非ASCIIのラテン文字（アクセント付き文字
+        # "é"等）を含む語の空白も同様に保たれる
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        text = "当社は、\nCafé au lait　を提供しております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、 Café au lait を提供しております。",
+        )
+
+    def test_whitespace_between_fullwidth_latin_words_is_preserved(self):
+        # "ＡＩ　ＣＲＯＳＳ"のような全角ラテン文字の社名の単語間の空白も
+        # 同様に保たれる（2026-09-30のCodexレビューで指摘・修正）。
+        text = "当社は、\nＡＩ　ＣＲＯＳＳ株式会社との提携を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、 ＡＩ ＣＲＯＳＳ株式会社との提携を行っております。",
+        )
+
+    def test_block_separator_between_japanese_text_is_preserved(self):
+        # edinet_client.BLOCK_SEPARATORは、隣接する表セル等の構造的な区切りを
+        # 示すために_element_to_textが挿入する半角スペース。前後がどちらも
+        # 日本語の文字であっても、常に1つの半角スペースへ圧縮する現在の
+        # 方式では単純に保たれ、"国内海外"のように結合されない
+        # （2026-09-30のCodexレビューで指摘・修正）。
+        text = f"国内{edinet_client.BLOCK_SEPARATOR}海外の店舗数は以下の通りです。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "国内 海外の店舗数は以下の通りです。",
+        )
 
 
 class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):

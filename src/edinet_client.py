@@ -1,5 +1,8 @@
 """EDINET(金融庁)から有価証券報告書の「事業の内容」「大株主の状況」「潜在株式の
-状況」を取得するクライアント。
+状況」を取得するクライアント。上場承認銘柄については、有価証券報告書の代わりに
+有価証券届出書（新規公開時）から「事業の内容」を取得する
+（fetch_ipo_business_overview参照。watch_and_notify.pyの上場承認通知用に
+2026-09-28追加）。
 
 これらはJ-Quantsには無い自由記述項目だが、EDINETの開示書類には実データとして
 存在する。ただし個別の構造化要素としては取れず、1つのテキストブロック要素の中に
@@ -22,6 +25,7 @@ import zipfile
 import pandas as pd
 import requests
 from lxml import etree
+from lxml import html as lxml_html
 
 from src import cache
 from src.jst import today_jst
@@ -31,6 +35,14 @@ CODE_LIST_URL = "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/
 
 # 有価証券報告書・訂正有価証券報告書（大量保有報告書等の他の書類種別は対象外）
 _YUHO_DOC_TYPE_CODES = {"120", "130"}
+
+# 有価証券届出書・訂正有価証券届出書のうち、新規上場（IPO）時に提出される分
+# （docTypeCodeだけでは投資信託受益証券等の届出書とも区別できないため、
+# docDescriptionに「新規公開時」を含むものだけに絞る。2026-09-28に実機の
+# EDINET API(documents.json)で確認: docTypeCode="030"のdocDescriptionが
+# 「有価証券届出書（新規公開時）」となっている）。
+_IPO_PROSPECTUS_DOC_TYPE_CODES = {"030", "040"}
+_IPO_PROSPECTUS_DESCRIPTION_MARKER = "新規公開時"
 
 _BUSINESS_OVERVIEW_TAGS = ["DescriptionOfBusinessTextBlock"]
 _SHAREHOLDERS_TAGS = ["MajorShareholdersTextBlock"]
@@ -71,13 +83,20 @@ def _load_code_list() -> pd.DataFrame:
 
 
 def get_edinet_code(stock_code: str) -> str | None:
-    """証券コード(4桁または5桁)からEDINETコード(例: E01753)を引く。"""
+    """証券コード(4桁または5桁)からEDINETコード(例: E01753)を引く。
+
+    EDINETの証券コード列は5桁（4桁+末尾0）で登録されている。以前は
+    4桁が数字のみの場合しか末尾0を補わなかったが、2024年以降のTSEの
+    新形式コード（数字3桁+英字1桁、例: "634A"）は数字のみではないため
+    候補に入らず、新規上場銘柄のEDINETコードが引けなかった
+    （2026-09-28、上場承認通知への事業概要追加時に発見・修正）。
+    """
     df = _load_code_list()
     if df.empty or "証券コード" not in df.columns:
         return None
     code = str(stock_code)
     candidates = {code}
-    if code.isdigit() and len(code) == 4:
+    if len(code) == 4:
         candidates.add(code + "0")
     match = df.loc[df["証券コード"].astype(str).str.strip().isin(candidates)]
     if match.empty:
@@ -142,6 +161,76 @@ def find_latest_yuho(edinet_code: str, fiscal_year_end: dt.date | None = None) -
     return found[-1]
 
 
+def find_ipo_prospectus_candidates(edinet_code: str, approval_date: dt.date) -> list[dict]:
+    """指定EDINETコードの新規上場時の有価証券届出書（訂正含む）のメタデータを、
+    提出日時の新しい順（訂正があれば訂正が先）に全件返す。
+
+    上場前の会社にはfind_latest_yuhoが前提とする決算期末情報が無いため、
+    代わりに上場承認日を基準にした前後の窓（提出は承認発表の前後どちらも
+    ありうるため両方向に取る）で走査する。
+
+    1件だけでなく全件返すのは、訂正有価証券届出書（040）が訂正箇所だけの
+    差分を含み、「事業の内容」欄自体は変更されていない場合その項目が
+    訂正後の書類には含まれないことがあるため。呼び出し側(fetch_ipo_business_
+    overview)で新しい順に試し、無ければより古い（原本を含む）書類に
+    フォールバックできるようにする（2026-09-29のCodexレビューで指摘・修正）。
+    """
+    key = _api_key()
+    today = today_jst()
+    window_start = approval_date - dt.timedelta(days=60)
+    window_end = min(approval_date + dt.timedelta(days=30), today)
+
+    found = []
+    d = window_end
+    while d >= window_start:
+        for doc in _get_documents_for_date(d, key):
+            if (
+                doc.get("edinetCode") == edinet_code
+                and doc.get("docTypeCode") in _IPO_PROSPECTUS_DOC_TYPE_CODES
+                and _IPO_PROSPECTUS_DESCRIPTION_MARKER in (doc.get("docDescription") or "")
+            ):
+                found.append(doc)
+        d -= dt.timedelta(days=1)
+
+    found.sort(key=lambda x: x.get("submitDateTime", ""), reverse=True)
+    return found
+
+
+def fetch_ipo_business_overview(stock_code: str, approval_date: dt.date) -> str | None:
+    """新規上場承認された銘柄の「事業の内容」を有価証券届出書（新規公開時）から取得する。
+
+    watch_and_notify.pyの上場承認通知に「どのような会社か」の簡単な説明を
+    添えるために2026-09-28に追加（ユーザー要望）。該当書類が無い、
+    EDINET_API_KEY未設定、その他取得エラーの場合はNoneを返し、呼び出し側は
+    その項目を省略するだけにする（fetch_yuho_texts docstring同様、
+    「無い」と「取得失敗」を区別せずNoneとして扱う）。
+
+    候補が複数ある場合（訂正有価証券届出書が出ている場合）は新しい順に試し、
+    最新の書類に「事業の内容」欄が含まれていなければ（訂正がその項目以外
+    だった場合等）より古い書類にフォールバックする
+    （find_ipo_prospectus_candidates docstring参照。2026-09-29の
+    Codexレビューで指摘・修正）。
+    """
+    try:
+        edinet_code = get_edinet_code(stock_code)
+        if edinet_code is None:
+            return None
+        candidates = find_ipo_prospectus_candidates(edinet_code, approval_date)
+        if not candidates:
+            return None
+        key = _api_key()
+        for doc in candidates:
+            zip_bytes = _download_xbrl_zip(doc["docID"], key)
+            overview = _find_text_block(zip_bytes, _BUSINESS_OVERVIEW_TAGS)
+            if overview:
+                return overview
+        return None
+    except EdinetAuthError:
+        return None
+    except Exception:
+        return None
+
+
 def _download_xbrl_zip(doc_id: str, key: str) -> bytes:
     cache_dir = os.path.join("data", "cache", "edinet_xbrl")
     os.makedirs(cache_dir, exist_ok=True)
@@ -204,9 +293,91 @@ def _find_text_block(zip_bytes: bytes, tag_names: list[str]) -> str | None:
     return None
 
 
+_LOOKS_LIKE_HTML_MARKUP_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
+# 隣接するブロック要素の間で改行を挿入するために使うタグ名（小文字、
+# 名前空間prefix無し）。tdとthはtr内で隣接するセル同士を区切るために必要
+# （2026-09-30のCodexレビューで指摘・修正。以前はtrの直後にしか改行を
+# 挿入しておらず、同じ行内の"<td>Foo</td><td>Bar</td>"は区切られなかった）。
+_BLOCK_LEVEL_TAGS = frozenset(
+    {"p", "div", "tr", "td", "th", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
+)
+
+# ブロック要素の境界を示すため、直後に半角スペースを挿入する。
+# 以前はUnicode専用領域(Private Use Area)の専用マーカー文字を使い、
+# 呼び出し側(scripts/watch_and_notify.py)がそれを「除去してはならない
+# 構造的な区切り」として特別扱いしてから表示用のスペースへ変換して
+# いたが、_element_to_textは大株主・事業概要のテキストブロック抽出全般で
+# 使われる共通処理であり、fetch_yuho_texts()経由でexcel_export.pyが
+# 企業詳細Excelのセルへ値をそのまま書き込む用途にも使われる。マーカー
+# 文字への変換をwatch_and_notify.py側でしか行っていなかったため、
+# それ以外の呼び出し元ではマーカー文字（豆腐文字として表示されうる）が
+# そのまま出力に混入してしまっていた（2026-09-30のCodexレビューで指摘・
+# 修正）。_element_to_textの時点で誰が見ても意味の通る半角スペースに
+# 変換しておくことでこの問題自体を無くす。scripts/watch_and_notify.py側の
+# _collapse_whitespaceも、日本語の文字同士に挟まれた空白を無条件に
+# 除去せず常に1つの半角スペースへ圧縮するよう単純化した（構造的な区切りと
+# レイアウト空白を区別する必要が無くなったため）。
+BLOCK_SEPARATOR = " "
+
+
+def _insert_block_separators(root) -> None:
+    """ブロック要素(<p>等)の直後にBLOCK_SEPARATORを挿入する
+    （rootの子孫要素のtailを書き換える副作用がある）。
+
+    隣接するブロック要素間に元のHTML側で改行・空白等の区切りが無い場合、
+    テキストだけを単純に連結すると単語同士がくっついてしまう
+    （例: "<p>Foo</p><p>Bar</p>" → "FooBar"）。通常のネスト要素・
+    inline XBRLのケース（_element_to_text冒頭のraw計算）・再解析した
+    escapedItemTypeのケース（同関数内のreparsed）の両方に必要
+    （2026-09-29・30のCodexレビューで指摘・修正。当初はescapedItemType
+    再解析側にしか適用しておらず、より一般的な通常経路の方は未対応だった）。
+
+    タグ名は名前空間prefixを無視したローカル名で比較する。inline XBRLの
+    <html>本文は標準のXHTML名前空間を使うことが多く、lxmlはその場合
+    タグ名を"{http://www.w3.org/1999/xhtml}p"のような修飾名（Clark記法）
+    として保持するため、"p"との単純な文字列一致では該当せず区切りが
+    入らなかった（2026-09-30のCodexレビューで指摘・修正）。
+
+    escapedItemType再解析側（lxml_html.fromstring）で"<xhtml:p>"のような
+    コロン付きの名前空間prefixがエスケープ後の文字列にそのまま含まれて
+    いる場合、lxml_html（XMLではなくHTMLパーサ）はこれをClark記法に
+    解決せず"xhtml:p"という1つのタグ名文字列としてそのまま保持するため、
+    Clark記法(`}`)だけを見る上記の対処では区切りが入らなかった
+    （2026-09-30のCodexレビューで指摘・修正）。Clark記法・コロンprefix
+    のどちらであっても、最後の`}`または`:`より後ろだけを見ることで
+    ローカル名を取り出す。
+    """
+    for elem in root.iter():
+        tag = elem.tag
+        if not isinstance(tag, str):
+            continue  # コメント・処理命令等（tagが関数になっている）は対象外
+        local_name = tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1].lower()
+        if local_name in _BLOCK_LEVEL_TAGS:
+            elem.tail = BLOCK_SEPARATOR + (elem.tail or "")
+
+
 def _element_to_text(elem) -> str | None:
     """要素の中身（ネストしたHTMLタグを含む）をプレーンテキストに変換する。"""
+    _insert_block_separators(elem)
     raw = "".join(elem.itertext()).strip()
+    if raw and _LOOKS_LIKE_HTML_MARKUP_PATTERN.search(raw):
+        # XBRLのテキストブロック要素(escapedItemType)は、仕様上XHTMLを
+        # 一段エスケープした文字列として格納されることがある。その場合
+        # itertext()はエスケープ前のXML解析時点で実体参照が展開されるため、
+        # タグに見える文字列がそのままテキストとして返ってきてしまう
+        # （例: "<p>Foo</p>"というタグ付き文字列がそのまま混入する）。
+        # その場合は改めてHTMLとして解析し直しテキストだけを取り出す
+        # （2026-09-29のCodexレビューで指摘・修正。実機確認済みの通常の
+        # ネスト要素・inline XBRLのケースでは"<"を含む文字列は出現しない
+        # ため、このパターンに一致しない場合は元の処理のまま変えない）。
+        try:
+            reparsed = lxml_html.fromstring(raw)
+            _insert_block_separators(reparsed)
+            reparsed_text = "".join(reparsed.itertext()).strip()
+            if reparsed_text:
+                raw = reparsed_text
+        except Exception:
+            pass
     if raw:
         # HTML実体参照や連続する空白・改行を整理
         raw = re.sub(r"[ \t]+", " ", raw)
