@@ -25,6 +25,7 @@ import zipfile
 import pandas as pd
 import requests
 from lxml import etree
+from lxml import html as lxml_html
 
 from src import cache
 from src.jst import today_jst
@@ -292,9 +293,29 @@ def _find_text_block(zip_bytes: bytes, tag_names: list[str]) -> str | None:
     return None
 
 
+_LOOKS_LIKE_HTML_MARKUP_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
+
+
 def _element_to_text(elem) -> str | None:
     """要素の中身（ネストしたHTMLタグを含む）をプレーンテキストに変換する。"""
     raw = "".join(elem.itertext()).strip()
+    if raw and _LOOKS_LIKE_HTML_MARKUP_PATTERN.search(raw):
+        # XBRLのテキストブロック要素(escapedItemType)は、仕様上XHTMLを
+        # 一段エスケープした文字列として格納されることがある。その場合
+        # itertext()はエスケープ前のXML解析時点で実体参照が展開されるため、
+        # タグに見える文字列がそのままテキストとして返ってきてしまう
+        # （例: "<p>Foo</p>"というタグ付き文字列がそのまま混入する）。
+        # その場合は改めてHTMLとして解析し直しテキストだけを取り出す
+        # （2026-09-29のCodexレビューで指摘・修正。実機確認済みの通常の
+        # ネスト要素・inline XBRLのケースでは"<"を含む文字列は出現しない
+        # ため、このパターンに一致しない場合は元の処理のまま変えない）。
+        try:
+            reparsed = lxml_html.fromstring(raw)
+            reparsed_text = "".join(reparsed.itertext()).strip()
+            if reparsed_text:
+                raw = reparsed_text
+        except Exception:
+            pass
     if raw:
         # HTML実体参照や連続する空白・改行を整理
         raw = re.sub(r"[ \t]+", " ", raw)

@@ -12,12 +12,37 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+from lxml import etree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import edinet_client
 
 _MOD = "src.edinet_client"
+
+
+class TestElementToText(unittest.TestCase):
+    def test_normal_nested_elements_are_extracted_as_is(self):
+        # 通常のケース（inline XBRL等、実際にネストした要素として入っている
+        # 場合）は従来通りタグを気にせずテキストだけを結合する。
+        elem = etree.fromstring("<block>当社は<b>菓子</b>小売事業を行う。</block>")
+        self.assertEqual(edinet_client._element_to_text(elem), "当社は菓子小売事業を行う。")
+
+    def test_escaped_html_stored_as_literal_text_is_reparsed(self):
+        # XBRLのescapedItemType仕様により、要素のテキスト自体が一段
+        # エスケープされたXHTML文字列として格納されている場合、
+        # 通常のXML解析(itertext())ではタグがそのまま文字列として
+        # 残ってしまう（2026-09-29のCodexレビューで指摘・修正）。
+        xml = "<block>&lt;p&gt;Foo&lt;/p&gt;&lt;p&gt;Bar&lt;/p&gt;</block>"
+        elem = etree.fromstring(xml)
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("<p>", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
+    def test_empty_element_returns_none(self):
+        elem = etree.fromstring("<block>   </block>")
+        self.assertIsNone(edinet_client._element_to_text(elem))
 
 
 class TestGetEdinetCodeAlphanumericStockCode(unittest.TestCase):

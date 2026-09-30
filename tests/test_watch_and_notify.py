@@ -627,6 +627,14 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
             "当社は、菓子小売事業を行っております。",
         )
 
+    def test_bracketed_content_in_the_body_is_not_mistaken_for_the_header(self):
+        # 開示本文自体が【】で始まる場合（見出しではなく実際のブランド名等）に
+        # 本文まで削ってしまわないよう、「事業の内容」という見出しそのものに
+        # 一致する場合だけを除去対象にする（2026-09-29のCodexレビューで
+        # 指摘・修正。以前は任意の【...】構成を対象にしていた）。
+        text = "当社は【Foo】ブランドを運営する。"
+        self.assertEqual(wan._summarize_business_overview(text), text)
+
     def test_long_text_is_cut_at_the_last_sentence_boundary(self):
         text = "あ" * 50 + "。" + "い" * 300
         result = wan._summarize_business_overview(text, max_len=100)
@@ -646,6 +654,18 @@ class TestSummarizeBusinessOverview(unittest.TestCase):
         self.assertEqual(
             wan._summarize_business_overview(text),
             "当社は、Software as a Serviceを提供しております。",
+        )
+
+    def test_whitespace_adjacent_to_english_punctuation_is_preserved(self):
+        # 空白の前後が英数字同士の場合だけを対象にすると、"Foo & Bar"や
+        # "Foo, Inc."のような句読点・記号が隣接する英語表現の空白まで
+        # 消えてしまう（"Foo&Bar"・"Foo,Inc."になる）。半角文字同士で
+        # あれば記号でも空白を残すよう修正した
+        # （2026-09-29のCodexレビューで指摘・修正）。
+        text = "当社は、\nFoo & Bar、Foo, Inc.　との提携を行っております。"
+        self.assertEqual(
+            wan._summarize_business_overview(text),
+            "当社は、Foo & Bar、Foo, Inc.との提携を行っております。",
         )
 
 

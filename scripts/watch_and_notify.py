@@ -363,15 +363,22 @@ def _tdnet_candidates(
 
 
 _BUSINESS_OVERVIEW_MAX_LEN = 200
-# 有価証券届出書の項目見出し（例: "３ 【事業の内容】"）は内容ではないため、
-# 通知に含める前に取り除く。
-_SECTION_HEADER_PATTERN = re.compile(r"^[^【]{0,10}【[^】]*】")
+# 有価証券届出書の項目見出し。実機のEDINETデータで確認した表記
+# （例: "３ 【事業の内容】"）に限定して取り除く。任意の【...】構成を
+# 対象にすると、開示本文自体が【】で始まる場合（例: "当社は【Foo】
+# ブランドを運営する。"）に本文まで削ってしまう
+# （2026-09-29のCodexレビューで指摘・修正）。
+_SECTION_HEADER_PATTERN = re.compile(r"^[^【]{0,10}【事業の内容】")
 # 開示のHTML由来の改行・空白（表組みの空セル等）を除去する際、"Software as a
-# Service"のような英数字の間の空白（意味を持つ区切り）まで消してしまうと
-# 単語が連結されて開示内容を損なう（例: "SoftwareasaService"）。日本語の
-# 文章自体は元々語間に空白を持たないため、前後どちらかが半角英数字でない
-# 空白だけを除去し、半角英数字同士に挟まれた空白は1つの半角スペースに
-# 圧縮して残す（2026-09-29のCodexレビューで指摘・修正）。
+# Service"や"Foo, Inc."のような英語表現中の空白（意味を持つ区切り）まで
+# 消してしまうと単語が連結されて開示内容を損なう
+# （例: "SoftwareasaService"・"Foo,Inc."）。日本語の文章自体は元々語間に
+# 空白を持たないため、前後がどちらも半角文字（英数字に限らず、カンマ・
+# アンパサンド等の半角記号も含む）である空白だけを1つの半角スペースに
+# 圧縮して残し、それ以外（全角文字が隣接する空白）は除去する
+# （2026-09-29のCodexレビューで指摘・修正。当初は英数字同士の場合だけを
+# 対象にしていたため"Foo & Bar"や"Foo, Inc."のような句読点隣接の空白は
+# 依然として消えてしまっていた）。
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 
 
@@ -380,7 +387,7 @@ def _collapse_whitespace(text: str) -> str:
         start, end = m.span()
         before = text[start - 1] if start > 0 else ""
         after = text[end] if end < len(text) else ""
-        if before.isascii() and before.isalnum() and after.isascii() and after.isalnum():
+        if before and after and before.isascii() and after.isascii():
             return " "
         return ""
 
