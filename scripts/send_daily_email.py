@@ -1,15 +1,20 @@
-"""前営業日にDiscordへ送信した内容をまとめて、毎朝9:00 JST(平日)にメールで
+"""当日にDiscordへ送信した内容をまとめて、平日16:30 JSTに1日1回メールで
 再掲するバッチ。GitHub Actions(.github/workflows/daily_email_digest.yml)から
-実行される想定（2026-09-01にユーザー指定）。
+実行される想定（2026-09-01にユーザー指定。以前は毎朝9:00 JSTに前営業日分を
+まとめる仕様だったが、(1) GitHub Actionsのschedule実行はしばしば遅延し、
+2026-09-30に9:00→11:30 JSTまで遅延した実例が発生、(2) 定刻通りに動いても
+そもそも「前日分」しか載らず鮮度が低い、という2つの問題をユーザーに指摘され、
+2026-09-30に「当日16:30に当日分を1回で」に変更した。16:30 JSTはstop_high等の
+当日中通知を担うwatch_and_notify.pyの最終実行枠(16:10 JST。CLAUDE.md参照)の
+後に、その回の送信・状態保存が完了しているはずの猶予を見込んだ時刻）。
 
 scripts/watch_and_notify.pyがDiscordへ送信するたびに
 state["notified"][key] = {"sent_at": ..., "message": ...} として記録する
-送信時刻(sent_at, JST)と送信本文(message)を読み、前営業日
-（土日祝日を除く直前の営業日）に送信され、かつ対象銘柄・事象そのものの
-日付も前営業日であるものだけを抽出してメールにまとめる（_collect_digest_messages
-参照。watch_and_notify.py側のウォーターマークによるcatch-upで本来より古い
-日付の内容が紛れ込むことがあるため、単純にsent_atの日付だけでは絞らない。
-2026-09-29にユーザー指摘・修正）。
+送信時刻(sent_at, JST)と送信本文(message)を読み、当日に送信され、かつ
+対象銘柄・事象そのものの日付も当日であるものだけを抽出してメールにまとめる
+（_collect_digest_messages参照。watch_and_notify.py側のウォーターマークに
+よるcatch-upで本来より古い日付の内容が紛れ込むことがあるため、単純に
+sent_atの日付だけでは絞らない。2026-09-29にユーザー指摘・修正）。
 watch_and_notify.py自体の送信スケジュール（平日10:00・13:00・16:10 JST）は変更しない。
 
 このスクリプトは読み取り専用で、data/notify_state.jsonを書き換えない
@@ -71,6 +76,13 @@ def _parse_recipients(raw: str) -> list[str]:
 
 
 def _previous_business_day(today: dt.date) -> dt.date:
+    """dayの直前の営業日を返す。
+
+    2026-09-30以降、まとめメールの対象日(target_day)自体はtoday(当日)を
+    直接使うため、この関数はもう対象日の算出には使わない。_NEXT_DAY_LAG_RULES
+    に該当するruleが「target_dayの前営業日」に検出された分も許容するための、
+    _collect_digest_messages内部でのみ引き続き使う。
+    """
     day = today - dt.timedelta(days=1)
     while is_market_holiday(day):
         day -= dt.timedelta(days=1)
@@ -123,7 +135,16 @@ _NO_CATCH_UP_RULES = {"ipo_listed"}
 # どのまとめメールにも一度も載らなくなってしまう（2026-09-29のCodex
 # レビューで指摘・修正）。このruleに限り、キーの日付がtarget_day自体か
 # その前営業日のどちらでも許容する。
-_NEXT_DAY_LAG_RULES = {"profit_growth_major"}
+#
+# stock_split・stock_consolidation（TDnet由来）も同じ構造的リスクを持つ。
+# watch_and_notify.pyの最終実行は16:10 JSTのため、それより後（例:
+# 16:30）に出た開示は当日中には検出できず、翌営業日の10:00の実行で初めて
+# 検出・送信される（tests/test_watch_and_notify.pyのTestPruneState等で
+# 16:30の開示時刻が実際にモデル化されている＝起こりうる想定として既に
+# テスト済みの状況）。profit_growth_majorだけを許容してこれらを対象外の
+#ままにすると、同じ理由で正常な1日遅れの分がまとめメールから漏れて
+# しまうため、同じ緩和を適用する（2026-09-29のCodexレビューで指摘・修正）。
+_NEXT_DAY_LAG_RULES = {"profit_growth_major", "stock_split", "stock_consolidation"}
 
 
 def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
@@ -180,7 +201,7 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
 
 
 def _build_email_body(target_day: dt.date, messages: list[str]) -> str:
-    lines = [f"{target_day:%Y-%m-%d}（前営業日）にDiscordへ通知した内容のまとめです。", ""]
+    lines = [f"{target_day:%Y-%m-%d}（本日）にDiscordへ通知した内容のまとめです。", ""]
     if not messages:
         lines.append("該当銘柄はありませんでした。")
     else:
@@ -226,7 +247,11 @@ def main() -> int:
         return 1
 
     state = _load_state()
-    target_day = _previous_business_day(today)
+    # 2026-09-30にユーザー指摘・変更: 以前はtargetを前営業日にしていたが、
+    # 「前日分の情報を（スケジュール遅延でさらに）翌日遅くに受け取っても
+    # 意味が無い」との指摘を受け、当日分を当日16:30 JSTに送るように変更した
+    # （モジュールdocstring参照）。
+    target_day = today
     messages = _collect_digest_messages(state, target_day)
 
     subject = f"📈 株式スクリーニング日次まとめ（{target_day:%Y-%m-%d}分）"

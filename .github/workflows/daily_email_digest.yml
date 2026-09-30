@@ -1,12 +1,19 @@
 name: daily-email-digest
 
-# 平日9:00 JSTに実行する（UTC 00:00。JSTはUTC+9で日付をまたがないため、
+# 平日16:30 JSTに実行する（UTC 07:30。JSTはUTC+9で日付をまたがないため、
 # UTCの曜日指定(1-5=月-金)がそのままJSTの曜日と一致する）。
 # 日本の祝日はcronでは表現できないため、scripts/send_daily_email.py内で
 # src.market_calendar.is_market_holiday()により実行時にスキップする。
+#
+# 以前は平日9:00 JSTに前営業日分をまとめる仕様だったが、2026-09-30に
+# ユーザー指摘で変更した: (1) GitHub Actionsのschedule実行はしばしば
+# 遅延し、2026-09-30に実際9:00→11:30 JSTまで遅延した実例が発生していた、
+# (2) 定刻通りに動いても「前日分」しか載らず鮮度が低かった。当日分を
+# 当日中にまとめるにはwatch_and_notify.pyの最終実行枠(16:10 JST)より後に
+# 実行する必要があるため16:30とした（scripts/send_daily_email.py参照）。
 on:
   schedule:
-    - cron: "0 0 * * 1-5"
+    - cron: "30 7 * * 1-5"
   workflow_dispatch: {}
 
 # data/notify_state.jsonを読むだけで書き換えない（notify-stateブランチへの

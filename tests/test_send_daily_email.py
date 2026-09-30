@@ -268,11 +268,12 @@ class TestMain(_SendDailyEmailTestCase):
         self.assertEqual(result, 1)
         smtp_instance.send_message.assert_not_called()
 
-    def test_sends_digest_for_previous_business_day(self):
+    def test_sends_digest_for_today(self):
+        # 2026-09-30にユーザー指摘・変更: 前営業日分ではなく当日分を送る。
         self._write_state(
             {
-                "stop_high|1234|2026-08-31": {
-                    "sent_at": dt.datetime(2026, 8, 31, 10, 5, tzinfo=JST).isoformat(),
+                f"stop_high|1234|{_TODAY.isoformat()}": {
+                    "sent_at": dt.datetime(2026, 9, 1, 16, 10, tzinfo=JST).isoformat(),
                     "message": "🔴 ストップ高\n1234 テスト株式",
                 }
             }
@@ -285,7 +286,7 @@ class TestMain(_SendDailyEmailTestCase):
         sent_msg = smtp_instance.send_message.call_args[0][0]
         self.assertEqual(sent_msg["To"], "to@example.com")
         self.assertEqual(sent_msg["From"], "sender@example.com")
-        self.assertIn("2026-08-31", sent_msg["Subject"])
+        self.assertIn(_TODAY.isoformat(), sent_msg["Subject"])
         self.assertIn("1234 テスト株式", sent_msg.get_content())
 
     def test_multiple_recipients_are_split_and_all_addressed(self):

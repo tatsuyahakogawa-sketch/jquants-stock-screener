@@ -286,10 +286,13 @@ LINE通知は非対応。LINE Notify（個人向けの簡単な通知サービ�
 
 ## メール通知（日次まとめ）
 
-上記Discord通知（平日10:00・13:00・16:10 JST）とは別に、毎朝9:00 JST（平日）に
-「前営業日にDiscordへ通知した内容」をまとめて1通のメールで再掲するバッチ
+上記Discord通知（平日10:00・13:00・16:10 JST）とは別に、平日16:30 JSTに
+「当日にDiscordへ通知した内容」をまとめて1通のメールで再掲するバッチ
 （`scripts/send_daily_email.py`、GitHub Actions
-`.github/workflows/daily_email_digest.yml`から実行。2026-09-01にユーザー指定）。
+`.github/workflows/daily_email_digest.yml`から実行。2026-09-01にユーザー指定。
+以前は毎朝9:00 JSTに前営業日分をまとめる仕様だったが、スケジュール遅延と
+「前日分」の鮮度の低さを2026-09-30にユーザーから指摘され、当日16:30に
+当日分へ変更した）。
 
 `scripts/watch_and_notify.py`がDiscordへ送信するたびに`data/notify_state.json`の
 `notified`エントリへ送信時刻(JST)と送信本文を記録しており、このバッチはそれを
