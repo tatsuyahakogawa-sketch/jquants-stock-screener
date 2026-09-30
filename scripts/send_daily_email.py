@@ -149,9 +149,21 @@ _RULE_ORDER = [
 # watch_and_notify.yml参照）。schedule実行時、watch_and_notify.py側は
 # github.event.scheduleをそのままstate["last_run_schedule"]に書き込む
 # （TRIGGER_SCHEDULE環境変数）ため、この文字列と完全一致するかどうかで
-# 「当日の最終実行枠が完了したか」を判定できる。"manual"は
-# workflow_dispatch（手動実行）で、意図的な当日分の実行として同様に扱う。
-_TARGET_TRIGGERS = {"10 7 * * 1-5", "manual"}
+# 「当日の最終実行枠が完了したか」を判定できる。
+#
+# 以前は"manual"（watch_and_notify.pyのworkflow_dispatchによる手動実行）
+# もここに含めていたが、平日の最終実行枠(16:10 JST)より前に
+# watch_and_notify.pyを手動実行すると（動作確認・当日中の即時確認等で
+# 実際に何度も行っている）、その完了イベントで自動的にまとめメールが
+# 送信されてしまい、その後の本来の16:10枠の完了でも改めて送信されるため
+# 同じ日に重複送信されうるとCodexレビューで指摘された。このスクリプト側
+# には送信済みかどうかの永続的な記録が無く（読み取り専用の設計）、
+# 「今日まだ送っていないか」を別途確認する手段が無いため、自動送信の
+# 対象は最終実行枠のcronだけに絞り、手動実行を契機にした自動送信は
+# 行わない（2026-09-30のCodexレビューで指摘・修正）。手動実行後に
+# 明示的にまとめメールを送りたい場合は、このワークフロー自体を
+# workflow_dispatch（FORCE_SEND=true）で手動実行する。
+_TARGET_TRIGGERS = {"10 7 * * 1-5"}
 
 
 def _resolve_todays_final_notifier_run(
@@ -377,8 +389,18 @@ def _collect_digest_messages(state: dict, target_day: dt.date) -> list[str]:
     return [message for _, _, message in entries]
 
 
-def _build_email_body(target_day: dt.date, messages: list[str], had_error: bool = False) -> str:
-    lines = [f"{target_day:%Y-%m-%d}（本日）にDiscordへ通知した内容のまとめです。", ""]
+def _build_email_body(
+    target_day: dt.date, messages: list[str], had_error: bool = False, *, is_today: bool = True
+) -> str:
+    # target_dayは常に「今日」とは限らない。JST深夜を跨ぐ遅延やFORCE_SEND
+    # による手動リカバリでは、target_dayが実行日より前の日になりうる
+    # （_resolve_todays_final_notifier_run docstring参照）。それでも
+    # 「（本日）」と表示すると、件名・本文の対象日は過去の日付なのに
+    # 本文だけ「今日のことだ」と読めてしまい紛らわしいため、target_dayが
+    # 実際に今日である場合だけこの表記を付ける（2026-09-30のCodexレビューで
+    # 指摘・修正）。
+    label = "（本日）" if is_today else ""
+    lines = [f"{target_day:%Y-%m-%d}{label}にDiscordへ通知した内容のまとめです。", ""]
     # watch_and_notify.py側でいずれかの情報源の取得に失敗した日は、0件の
     # ときだけでなく、他の情報源が検出・送信できた分がある場合でも
     # その旨を明記する。「一部の情報源が失敗しつつ別の情報源は成功した」
@@ -488,7 +510,7 @@ def main() -> int:
     had_error = bool(state.get("last_run_had_error"))
 
     subject = f"📈 株式スクリーニング日次まとめ（{target_day:%Y-%m-%d}分）"
-    body = _build_email_body(target_day, messages, had_error)
+    body = _build_email_body(target_day, messages, had_error, is_today=(target_day == today))
 
     try:
         _send_email(smtp_user, smtp_password, to_addrs, subject, body)

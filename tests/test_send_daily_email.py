@@ -112,13 +112,19 @@ class TestResolveTodaysFinalNotifierRun(unittest.TestCase):
             dt.date(2026, 9, 1),
         )
 
-    def test_manual_run_today_returns_that_date(self):
-        # workflow_dispatchでのwatch_and_notify.py手動実行も、意図的な
-        # 当日分の実行として最終実行枠と同様に扱う。
+    def test_manual_run_today_does_not_auto_trigger(self):
+        # watch_and_notify.pyのworkflow_dispatchによる手動実行（動作確認・
+        # 当日中の即時確認等で頻繁に行う）は、自動送信（workflow_run経由の
+        # 起動）の対象にはしない。含めてしまうと、最終実行枠(16:10 JST)より
+        # 前に手動実行した場合にその時点で一度送信され、後で本来の16:10枠が
+        # 完了した際にも改めて送信されてしまい、同じ日に重複送信されうる
+        # （このスクリプトは読み取り専用で送信済みかどうかの永続的な記録を
+        # 持たないため、この重複を別途検知できない。2026-09-30のCodex
+        # レビューで指摘・修正）。手動実行後に明示的に送りたい場合は
+        # FORCE_SEND=trueで日次メール自体を手動実行する。
         state = {"last_run_schedule": "manual", "last_run_date": "2026-09-01"}
-        self.assertEqual(
-            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None),
-            dt.date(2026, 9, 1),
+        self.assertIsNone(
+            sde._resolve_todays_final_notifier_run(state, dt.date(2026, 9, 1), None)
         )
 
     def test_early_slot_schedule_is_none(self):
@@ -389,6 +395,20 @@ class TestBuildEmailBody(unittest.TestCase):
         body = sde._build_email_body(dt.date(2026, 8, 28), [])
         self.assertIn("該当銘柄はありませんでした。", body)
 
+    def test_today_label_is_shown_by_default(self):
+        body = sde._build_email_body(dt.date(2026, 8, 28), [])
+        self.assertIn("（本日）", body)
+
+    def test_today_label_is_omitted_for_a_recovered_or_delayed_date(self):
+        # target_dayは常に「今日」とは限らない。JST深夜を跨ぐ遅延や
+        # FORCE_SENDによる手動リカバリでは、target_dayが実行日より前の
+        # 日になりうる。それでも「（本日）」と表示すると、件名・本文の
+        # 対象日は過去の日付なのに本文だけ「今日のことだ」と読めてしまい
+        # 紛らわしい（2026-09-30のCodexレビューで指摘・修正）。
+        body = sde._build_email_body(dt.date(2026, 8, 28), [], is_today=False)
+        self.assertNotIn("（本日）", body)
+        self.assertIn("2026-08-28", body)
+
     def test_messages_are_included_in_body(self):
         body = sde._build_email_body(dt.date(2026, 8, 28), ["🔴 ストップ高\n1234 テスト株式"])
         self.assertIn("🔴 ストップ高\n1234 テスト株式", body)
@@ -497,6 +517,20 @@ class TestMain(_SendDailyEmailTestCase):
         sent_msg = smtp_instance.send_message.call_args[0][0]
         self.assertIn(yesterday.isoformat(), sent_msg["Subject"])
         self.assertIn("1234 テスト株式", sent_msg.get_content())
+        # 対象日は実行日(today)ではなく前日のため「（本日）」とは表示しない。
+        self.assertNotIn("（本日）", sent_msg.get_content())
+
+    def test_manual_notifier_run_does_not_auto_trigger_the_digest(self):
+        # watch_and_notify.pyのworkflow_dispatchによる手動実行（動作確認・
+        # 当日中の即時確認等で頻繁に行う）の完了イベントでは自動送信しない。
+        # 含めてしまうと、最終実行枠(16:10 JST)より前に手動実行した場合に
+        # その時点で一度送信され、後で本来の16:10枠が完了した際にも改めて
+        # 送信されてしまい、同じ日に重複送信されうる（2026-09-30のCodex
+        # レビューで指摘・修正）。
+        self._write_state({}, last_run_schedule="manual")
+        result, smtp_instance = self._run()
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_not_called()
 
     def test_early_workflow_run_trigger_skips_without_sending(self):
         # watch-and-notifyの10:00・13:00枠の完了イベントで起動された場合、
