@@ -126,6 +126,13 @@ jobs:
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # daily_email_digest.yml側が「当日の最終実行枠(16:10 JST)が完了
+          # したか」をnotify_state.json自身から判定するためのマーカー
+          # （scripts/watch_and_notify.py参照）。scheduleで発火した場合は
+          # 実際に発火したcron式そのもの（複数のcronがある場合にどれが
+          # 発火したかを区別できる、GitHub公式のgithub.event.schedule）、
+          # それ以外（workflow_dispatch等）は"manual"にする。
+          TRIGGER_SCHEDULE: ${{ github.event.schedule || 'manual' }}
         run: python scripts/watch_and_notify.py
 
       # notify-stateブランチには常にnotify_state.json 1個だけを含むコミットを

@@ -568,6 +568,102 @@ class TestNoHitsStillPersistsWatermark(_WatchAndNotifyTestCase):
         self.assertEqual(state["ipo_watermark"], _TODAY.isoformat())
 
 
+class TestLastRunMarker(_WatchAndNotifyTestCase):
+    """scripts/send_daily_email.pyが「当日の最終実行枠が完了したか」を
+    判定するためのマーカー(state["last_run_schedule"]/["last_run_date"])。
+    2026-09-30のCodexレビューで、日次まとめメール側が固定時刻の推測に
+    頼っていた設計に4つの欠陥を指摘され、代わりにこのマーカーで判定する
+    方式に作り直した際に追加。"""
+
+    def test_marker_defaults_to_manual_without_trigger_schedule_env(self):
+        # GitHub ActionsのTRIGGER_SCHEDULE環境変数が無い場合（ローカル
+        # 実行やworkflow_dispatch等）は"manual"として記録する。
+        result, mock_send = self._run()
+
+        self.assertEqual(result, 0)
+        state = self._load_state()
+        self.assertEqual(state["last_run_schedule"], "manual")
+        self.assertEqual(state["last_run_date"], _TODAY.isoformat())
+
+    def test_marker_reflects_trigger_schedule_env(self):
+        env = dict(_DEFAULT_ENV, TRIGGER_SCHEDULE="10 7 * * 1-5")
+        result, mock_send = self._run(env=env)
+
+        self.assertEqual(result, 0)
+        state = self._load_state()
+        self.assertEqual(state["last_run_schedule"], "10 7 * * 1-5")
+        self.assertEqual(state["last_run_date"], _TODAY.isoformat())
+
+    def test_marker_is_saved_even_when_candidates_are_sent(self):
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        env = dict(_DEFAULT_ENV, TRIGGER_SCHEDULE="10 7 * * 1-5")
+        result, mock_send = self._run(env=env, stop_high=stop_high_hit)
+
+        self.assertEqual(result, 0)
+        state = self._load_state()
+        self.assertEqual(state["last_run_schedule"], "10 7 * * 1-5")
+        self.assertEqual(state["last_run_date"], _TODAY.isoformat())
+
+    def test_last_run_had_error_is_false_on_a_clean_no_hits_run(self):
+        result, mock_send = self._run()
+
+        self.assertEqual(result, 0)
+        state = self._load_state()
+        self.assertFalse(state["last_run_had_error"])
+
+    def test_last_run_had_error_is_true_when_a_source_fails_with_no_candidates(self):
+        # scripts/send_daily_email.pyが「確認した上で0件だった」と
+        # 「一部を確認できていない」を区別できるようにするためのマーカー
+        # （2026-09-30のCodexレビューで指摘・修正）。TDnetの取得だけが
+        # 失敗し、他の情報源は正常に0件だった状況を再現する。
+        result, mock_send = self._run(disclosures_error=RuntimeError("tdnet mirror down"))
+
+        self.assertEqual(result, 1)
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
+    def test_last_run_had_error_is_true_when_a_source_fails_with_candidates_sent(self):
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        result, mock_send = self._run(
+            stop_high=stop_high_hit, disclosures_error=RuntimeError("tdnet mirror down")
+        )
+
+        self.assertEqual(result, 1)
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
+    def test_had_error_marker_is_saved_even_if_the_error_summary_send_fails(self):
+        # 送信ループ完了後、エラーまとめのDiscord送信自体がネットワーク
+        # エラー等で例外を送出しても、last_run_had_errorの保存はそれより
+        # 前に行っているため正しく反映される。以前は保存がこの送信より
+        # 後だったため、送信が例外を送出すると保存に到達できず、既に
+        # 成功した情報源のウォーターマーク保存で「当日の最終実行枠が
+        # 完了した」ことを示すマーカーだけが残り、last_run_had_errorは
+        # 更新されないまま（scripts/send_daily_email.pyが実際にはエラーが
+        # あった日を「該当銘柄なし」の確認済み0件と誤って伝えてしまう）に
+        # なっていた（2026-09-30のCodexレビューで指摘・修正）。
+        def _fail_only_on_error_summary(webhook_url, message):
+            if message.startswith("⚠️"):
+                raise RuntimeError("discord down")
+
+        stop_high_hit = pd.DataFrame([
+            {"Code": "1234", "Date": pd.Timestamp(_TODAY), "rule": "stop_high", "detail": "ストップ高"},
+        ])
+        with self.assertRaises(RuntimeError):
+            self._run(
+                stop_high=stop_high_hit,
+                disclosures_error=RuntimeError("tdnet mirror down"),
+                send_error=_fail_only_on_error_summary,
+            )
+
+        state = self._load_state()
+        self.assertTrue(state["last_run_had_error"])
+
+
 class TestPruneState(unittest.TestCase):
     def test_plain_date_keys_are_pruned_by_cutoff(self):
         # 重複排除キーの日時部分は、TDnet由来のruleでは時刻付き

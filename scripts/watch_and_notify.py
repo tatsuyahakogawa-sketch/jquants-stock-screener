@@ -479,6 +479,35 @@ def main() -> int:
     ]
     all_candidates = stop_high_candidates + profit_growth_candidates + tdnet_candidates + ipo_candidates
 
+    # scripts/send_daily_email.pyが「当日の最終実行枠(16:10 JST)が完了した
+    # か」をnotify_state.json自身から判定できるようにするためのマーカー。
+    # GitHub ActionsのTRIGGER_SCHEDULE環境変数（.github/workflows/
+    # watch_and_notify.yml参照。schedule実行時は${{ github.event.schedule }}
+    # ＝実際に発火したcron式そのもの、workflow_dispatch(手動実行)等では
+    # "manual"）をそのまま記録する。4情報源全ての取得を試みた（個々の
+    # 成否は問わない、各情報源のtry/exceptで既に処理・Discordへ報告済み）
+    # 直後、かつ以降のDiscord送信で失敗しても必ず保存されるよう、最初の
+    # _save_state()より前のこの時点で設定する（2026-09-30のCodexレビューで、
+    # 16:30固定cron・時刻ガードだけに頼る方式には(1)16:10枠完了前に発火
+    # すると当日分を取りこぼす(2)16:30枠と16:10枠完了イベントの両方から
+    # 重複送信されうる(3)遅延した13:00枠を16:10枠と誤認しうる(4)
+    # watch_and_notify自体が完全に失敗した日も「該当銘柄なし」の当日分と
+    # して誤送信しうる、の4点を指摘され、日時ベースの推測をやめてこの
+    # マーカーによる実態ベースの判定に置き換えた）。
+    state["last_run_schedule"] = os.environ.get("TRIGGER_SCHEDULE", "manual")
+    state["last_run_date"] = today.isoformat()
+    # 起動元のGitHub Actions実行ID。scripts/send_daily_email.pyが、自身を
+    # 起動したworkflow_runイベントの元実行ID(github.event.workflow_run.id)と
+    # これを突き合わせることで「このマーカーを実際に書き込んだ実行と、
+    # 今まさにこのマーカーを読んで送信しようとしている起動が同一の実行か」
+    # を確認できるようにする。GITHUB_RUN_IDはGitHub Actionsが各ジョブに
+    # 自動で渡す環境変数（envブロックへの明示的な列挙は不要）。これが
+    # 無いと、10:00・13:00枠完了イベントに起因する（実行順序の入れ替わりで
+    # 実際には16:10枠のpush後に読みに行ってしまう）まとめメール起動が、
+    # 16:10枠自身の完了イベントに起因する起動と区別できず、同じ内容が
+    # 重複送信されうる（2026-09-30のCodexレビューで指摘・修正）。
+    state["last_run_id"] = os.environ.get("GITHUB_RUN_ID", "")
+
     if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
         # 候補が0件の情報源は、この走査範囲を全て「送信済み」扱いにできる
@@ -487,6 +516,15 @@ def main() -> int:
             if watermark_update:
                 key, value = watermark_update
                 state[key] = value
+        # had_errorはこの分岐に入った時点で必ずFalse（分岐条件
+        # `not error_messages`より）。scripts/send_daily_email.pyが
+        # 「本当に全て確認できた上での0件」か「一部確認できなかった」かを
+        # 区別できるようにするためのマーカー（2026-09-30のCodexレビューで
+        # 指摘・修正。以前はlast_run_schedule/last_run_dateが設定されて
+        # さえいれば無条件に「該当銘柄なし」の空メールを送っており、
+        # 一部の情報源が取得自体に失敗していた場合でも「確認済みの0件」と
+        # 誤って伝えてしまっていた）。
+        state["last_run_had_error"] = had_error
         _prune_state(state, today)
         _save_state(state)
         return 1 if had_error else 0
@@ -533,6 +571,20 @@ def main() -> int:
             logger.exception("Discordへの送信に失敗しました")
             had_error = True
             error_messages.append(f"⚠️ Discordへの送信に失敗しました: {e}")
+
+    # 送信ループ中の失敗でhad_errorが変わりうるため、最終確定値をここで
+    # 改めて保存する（_no_hits分岐と同じ理由。2026-09-30のCodexレビューで
+    # 指摘・修正）。この保存は、直後のエラーまとめ送信（Discordへの
+    # ネットワーク呼び出し）より前に行う。後にすると、そのエラーまとめ
+    # 送信自体が例外を送出した場合にこの保存へ到達できず、既に成功した
+    # 情報源のウォーターマーク保存によってlast_run_schedule/last_run_id等は
+    # 「当日の最終実行枠が完了した」ことを示しているのに、last_run_had_error
+    # だけは前回以前の値のまま（またはキー自体が無い状態）で取り残されて
+    # しまい、scripts/send_daily_email.pyが実際にはエラーがあった日を
+    # 「該当銘柄なし」の確認済み0件と誤って伝えてしまう
+    # （2026-09-30のCodexレビューで指摘・修正）。
+    state["last_run_had_error"] = had_error
+    _save_state(state)
 
     if error_messages:
         discord_notify.send_discord_message(webhook_url, "\n\n".join(error_messages))
