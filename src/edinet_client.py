@@ -298,8 +298,25 @@ _LOOKS_LIKE_HTML_MARKUP_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
 _BLOCK_LEVEL_TAGS = ("p", "div", "tr", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6")
 
 
+def _insert_block_separators(root) -> None:
+    """ブロック要素(<p>等)の直後に改行を挿入する（rootの子孫要素のtailを
+    書き換える副作用がある）。
+
+    隣接するブロック要素間に元のHTML側で改行・空白等の区切りが無い場合、
+    テキストだけを単純に連結すると単語同士がくっついてしまう
+    （例: "<p>Foo</p><p>Bar</p>" → "FooBar"）。通常のネスト要素・
+    inline XBRLのケース（_element_to_text冒頭のraw計算）・再解析した
+    escapedItemTypeのケース（同関数内のreparsed）の両方に必要
+    （2026-09-29・30のCodexレビューで指摘・修正。当初はescapedItemType
+    再解析側にしか適用しておらず、より一般的な通常経路の方は未対応だった）。
+    """
+    for block in root.iter(*_BLOCK_LEVEL_TAGS):
+        block.tail = "\n" + (block.tail or "")
+
+
 def _element_to_text(elem) -> str | None:
     """要素の中身（ネストしたHTMLタグを含む）をプレーンテキストに変換する。"""
+    _insert_block_separators(elem)
     raw = "".join(elem.itertext()).strip()
     if raw and _LOOKS_LIKE_HTML_MARKUP_PATTERN.search(raw):
         # XBRLのテキストブロック要素(escapedItemType)は、仕様上XHTMLを
@@ -313,12 +330,7 @@ def _element_to_text(elem) -> str | None:
         # ため、このパターンに一致しない場合は元の処理のまま変えない）。
         try:
             reparsed = lxml_html.fromstring(raw)
-            # ブロック要素の直後に改行を挿入してから結合する。挿入しないと
-            # "<p>Foo</p><p>Bar</p>"のような隣接ブロック要素間に何の区切りも
-            # 無いまま連結され、単語同士がくっついてしまう（例: "FooBar"。
-            # 2026-09-29のCodexレビューで指摘・修正）。
-            for block in reparsed.iter(*_BLOCK_LEVEL_TAGS):
-                block.tail = "\n" + (block.tail or "")
+            _insert_block_separators(reparsed)
             reparsed_text = "".join(reparsed.itertext()).strip()
             if reparsed_text:
                 raw = reparsed_text

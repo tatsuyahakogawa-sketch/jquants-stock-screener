@@ -28,6 +28,18 @@ class TestElementToText(unittest.TestCase):
         elem = etree.fromstring("<block>当社は<b>菓子</b>小売事業を行う。</block>")
         self.assertEqual(edinet_client._element_to_text(elem), "当社は菓子小売事業を行う。")
 
+    def test_normal_nested_block_elements_are_separated(self):
+        # escapedItemTypeの再解析(reparsed)側だけでなく、通常のネスト要素・
+        # inline XBRLの主経路(raw計算)でも、隣接するブロック要素間に元の
+        # HTML側の区切りが無い場合に単語が連結されないようにする
+        # （例: "<p>Foo</p><p>Bar</p>"→"FooBar"。2026-09-30のCodexレビューで
+        # 指摘・修正。当初はescapedItemType再解析側にしか適用していなかった）。
+        elem = etree.fromstring("<block><p>Foo</p><p>Bar</p></block>")
+        result = edinet_client._element_to_text(elem)
+        self.assertNotIn("FooBar", result)
+        self.assertIn("Foo", result)
+        self.assertIn("Bar", result)
+
     def test_escaped_html_stored_as_literal_text_is_reparsed(self):
         # XBRLのescapedItemType仕様により、要素のテキスト自体が一段
         # エスケープされたXHTML文字列として格納されている場合、
