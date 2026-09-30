@@ -1,30 +1,32 @@
 name: daily-email-digest
 
-# 平日16:30 JSTのcron(UTC 07:30)に加え、watch-and-notifyワークフロー
-# (.github/workflows/watch_and_notify.yml)の完了イベントでも起動する。
-# 日本の祝日はcronでは表現できないため、scripts/send_daily_email.py内で
-# src.market_calendar.is_market_holiday()により実行時にスキップする。
+# watch-and-notifyワークフロー(.github/workflows/watch_and_notify.yml)の
+# 完了イベント(workflow_run)でのみ起動する。固定時刻のcronは持たない。
 #
 # 以前は平日9:00 JSTに前営業日分をまとめる仕様だったが、2026-09-30に
-# ユーザー指摘で変更した: (1) GitHub Actionsのschedule実行はしばしば
-# 遅延し、2026-09-30に実際9:00→11:30 JSTまで遅延した実例が発生していた、
-# (2) 定刻通りに動いても「前日分」しか載らず鮮度が低かった。当日分を
-# 当日中にまとめるにはwatch_and_notify.pyの最終実行枠(16:10 JST)より後に
-# 実行する必要があるため16:30とした（scripts/send_daily_email.py参照）。
+# ユーザー指摘で「当日分を当日中に」変更し、その後は「平日16:30 JST固定
+# cron」（watch_and_notify.pyの最終実行枠16:10 JSTの後に猶予を見込んだ
+# 時刻）で実装した。しかしCodexレビューで、固定時刻に頼る設計そのものに
+# 以下の欠陥を指摘された（詳細はscripts/send_daily_email.pyのモジュール
+# docstring参照）:
+#   - watch_and_notify.py側のschedule実行自体が16:30より後にずれ込むと
+#     当日分の一部が永久にメールから漏れる
+#   - その対策でworkflow_runトリガーを追加すると、今度は16:30固定cronと
+#     の両方から重複送信されうる（このワークフローは読み取り専用で
+#     送信済みマーカーを自分で書けないため、時刻ガードだけでは防げない）
+#   - 「15:00 JST以降か」のような時刻だけの判定では、遅延した13:00枠を
+#     最終実行枠(16:10)と誤認しうる
+#   - watch-and-notify側が失敗した日も「該当銘柄なし」の当日分として
+#     誤って空メールを送ってしまう
 #
-# しかしcronの固定時刻だけに頼ると、watch_and_notify.py側のschedule実行
-# 自体がGitHub Actionsのschedule遅延で16:30より後にずれ込んだ場合（この
-# リポジトリで10:00・13:00枠・旧9:00枠のいずれも数時間規模の遅延実績が
-# あり、16:10枠だけが遅延しない保証は無い）、まとめメールがその日の
-# 状態更新前の古い状態を読んでしまい、当日分の一部が翌日以降は対象日が
-# 変わるため二度とメールに載らなくなる（2026-09-30のCodexレビューで
-# 指摘）。watch-and-notifyの完了イベントでも起動することで、実際に
-# 状態が更新された直後にも追いつけるようにした（scripts/send_daily_email.py
-# の_is_after_final_notifier_slotが10:00・13:00枠の完了では何もせず
-# 終了するガードを持つ）。
+# これらは全て「いつ実行されたか」の推測に頼っていたことが原因のため、
+# 固定cronをやめてworkflow_run一本に絞り、watch_and_notify.py自身が
+# notify_state.jsonに書き込む実行実績のマーカー(state["last_run_schedule"]
+# 等。github.event.scheduleをそのまま使うため実行時刻がずれても「どの
+# cronで発火したか」を誤らない)で判定するようscripts/send_daily_email.py
+# 側を作り直した（2026-09-30）。トリガー経路を1つに絞ったことで、重複
+# 送信の心配も無くなった。
 on:
-  schedule:
-    - cron: "30 7 * * 1-5"
   workflow_run:
     workflows: ["watch-and-notify"]
     types: [completed]
@@ -74,7 +76,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
-          # workflow_dispatch（手動実行）の場合は時刻ガード(15:00 JST)を
+          # workflow_dispatch（手動実行）の場合はマーカーによるガードを
           # 無効化し、いつでも強制送信できるようにする（動作確認・手動
           # リカバリ用）。
           FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' }}

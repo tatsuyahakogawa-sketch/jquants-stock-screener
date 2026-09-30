@@ -479,6 +479,24 @@ def main() -> int:
     ]
     all_candidates = stop_high_candidates + profit_growth_candidates + tdnet_candidates + ipo_candidates
 
+    # scripts/send_daily_email.pyが「当日の最終実行枠(16:10 JST)が完了した
+    # か」をnotify_state.json自身から判定できるようにするためのマーカー。
+    # GitHub ActionsのTRIGGER_SCHEDULE環境変数（.github/workflows/
+    # watch_and_notify.yml参照。schedule実行時は${{ github.event.schedule }}
+    # ＝実際に発火したcron式そのもの、workflow_dispatch(手動実行)等では
+    # "manual"）をそのまま記録する。4情報源全ての取得を試みた（個々の
+    # 成否は問わない、各情報源のtry/exceptで既に処理・Discordへ報告済み）
+    # 直後、かつ以降のDiscord送信で失敗しても必ず保存されるよう、最初の
+    # _save_state()より前のこの時点で設定する（2026-09-30のCodexレビューで、
+    # 16:30固定cron・時刻ガードだけに頼る方式には(1)16:10枠完了前に発火
+    # すると当日分を取りこぼす(2)16:30枠と16:10枠完了イベントの両方から
+    # 重複送信されうる(3)遅延した13:00枠を16:10枠と誤認しうる(4)
+    # watch_and_notify自体が完全に失敗した日も「該当銘柄なし」の当日分と
+    # して誤送信しうる、の4点を指摘され、日時ベースの推測をやめてこの
+    # マーカーによる実態ベースの判定に置き換えた）。
+    state["last_run_schedule"] = os.environ.get("TRIGGER_SCHEDULE", "manual")
+    state["last_run_date"] = today.isoformat()
+
     if not all_candidates and not error_messages:
         logger.info("%s: 該当銘柄なし", today)
         # 候補が0件の情報源は、この走査範囲を全て「送信済み」扱いにできる

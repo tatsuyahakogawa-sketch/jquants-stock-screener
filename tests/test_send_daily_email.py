@@ -41,17 +41,27 @@ class _SendDailyEmailTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _write_state(self, notified: dict) -> None:
-        self.state_path.write_text(
-            json.dumps({"notified": notified}, ensure_ascii=False), encoding="utf-8"
-        )
+    def _write_state(self, notified: dict, **extra) -> None:
+        # last_run_schedule/last_run_dateは、watch_and_notify.pyの当日
+        # 最終実行枠(16:10 JST)が完了済みであることを示すデフォルト値。
+        # このガード自体を狙ったテスト（TestIsTodaysFinalNotifierRun・
+        # test_early_workflow_run_trigger_skips_without_sending等）は
+        # extraで明示的に上書きする。
+        payload = {
+            "notified": notified,
+            "last_run_schedule": "10 7 * * 1-5",
+            "last_run_date": _TODAY.isoformat(),
+        }
+        payload.update(extra)
+        self.state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    def _run(self, *, env=None, holiday=False, now=None):
+    def _run(self, *, env=None, holiday=False):
         env = _DEFAULT_ENV if env is None else env
-        # デフォルトは最終実行枠(16:10 JST)を過ぎた時刻にしておき、
-        # _is_after_final_notifier_slotのガードで既存テストが変わらず
-        # 通るようにする（このガード自体のテストはnowを明示的に渡す）。
-        now = now if now is not None else dt.datetime(2026, 9, 1, 16, 30, tzinfo=JST)
+        # _write_stateを呼んでいない（状態ファイルがまだ無い）場合は、
+        # ガードを満たすデフォルト状態を書いておく（既存の大半のテストは
+        # 通知内容そのものではなくmain()の他の挙動を見ているため）。
+        if not self.state_path.exists():
+            self._write_state({})
         self.mocks = {}
         with ExitStack() as stack:
             def _patch(target, **kwargs):
@@ -61,7 +71,6 @@ class _SendDailyEmailTestCase(unittest.TestCase):
 
             stack.enter_context(patch.dict(f"{_MOD}.os.environ", env, clear=True))
             _patch("today_jst", return_value=_TODAY)
-            _patch("_now_jst", return_value=now)
             _patch("is_market_holiday", side_effect=lambda d: holiday if d == _TODAY else False)
             smtp_cls = _patch("smtplib.SMTP")
             smtp_instance = smtp_cls.return_value
@@ -95,20 +104,34 @@ class TestPreviousBusinessDay(unittest.TestCase):
         self.assertEqual(sde._previous_business_day(dt.date(2026, 8, 31)), dt.date(2026, 8, 28))
 
 
-class TestIsAfterFinalNotifierSlot(unittest.TestCase):
-    def test_before_threshold_is_false(self):
-        # watch_and_notify.pyの10:00・13:00枠相当の時刻ではまだ当日分が
-        # 揃っていないため対象外とする。
-        self.assertFalse(sde._is_after_final_notifier_slot(dt.datetime(2026, 9, 1, 13, 5, tzinfo=JST)))
+class TestIsTodaysFinalNotifierRun(unittest.TestCase):
+    def test_final_slot_schedule_today_is_true(self):
+        state = {"last_run_schedule": "10 7 * * 1-5", "last_run_date": "2026-09-01"}
+        self.assertTrue(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
 
-    def test_at_or_after_threshold_is_true(self):
-        self.assertTrue(sde._is_after_final_notifier_slot(dt.datetime(2026, 9, 1, 15, 0, tzinfo=JST)))
-        self.assertTrue(sde._is_after_final_notifier_slot(dt.datetime(2026, 9, 1, 16, 30, tzinfo=JST)))
-        # watch_and_notify.py自体がGitHub Actionsのschedule遅延で
-        # 16:10より大幅に後ろにずれ込んでも、この関数自体は時刻さえ
-        # 過ぎていれば真を返す（呼び出し側のworkflow_runトリガーが
-        # その遅延した完了イベントで起動することを想定している）。
-        self.assertTrue(sde._is_after_final_notifier_slot(dt.datetime(2026, 9, 1, 20, 0, tzinfo=JST)))
+    def test_manual_run_today_is_true(self):
+        # workflow_dispatchでのwatch_and_notify.py手動実行も、意図的な
+        # 当日分の実行として最終実行枠と同様に扱う。
+        state = {"last_run_schedule": "manual", "last_run_date": "2026-09-01"}
+        self.assertTrue(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+
+    def test_early_slot_schedule_is_false(self):
+        # 10:00・13:00枠相当のcronはまだ当日分が揃っていないため対象外。
+        state = {"last_run_schedule": "0 1 * * 1-5", "last_run_date": "2026-09-01"}
+        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+        state = {"last_run_schedule": "0 4 * * 1-5", "last_run_date": "2026-09-01"}
+        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+
+    def test_final_slot_schedule_on_a_different_day_is_false(self):
+        # マーカーの日付が当日と一致しない場合（例: 前日の実行のまま
+        # 更新されていない）は対象外とする。
+        state = {"last_run_schedule": "10 7 * * 1-5", "last_run_date": "2026-08-31"}
+        self.assertFalse(sde._is_todays_final_notifier_run(state, dt.date(2026, 9, 1)))
+
+    def test_missing_marker_is_false(self):
+        # watch_and_notify.py側がこの機能の追加より前の状態、または
+        # 何らかの理由でマーカーの更新に到達しないまま終了した場合。
+        self.assertFalse(sde._is_todays_final_notifier_run({}, dt.date(2026, 9, 1)))
 
 
 class TestEventDateFromKey(unittest.TestCase):
@@ -280,21 +303,35 @@ class TestMain(_SendDailyEmailTestCase):
 
     def test_early_workflow_run_trigger_skips_without_sending(self):
         # watch-and-notifyの10:00・13:00枠の完了イベントで起動された場合、
-        # まだ当日分が揃っていないため何もせず終了する
+        # まだ当日分の最終実行枠が完了していないため何もせず終了する
         # （2026-09-30のCodexレビューで指摘・修正。以前は16:30固定cronの
         # みに頼っており、watch_and_notify.py側のschedule遅延でその
         # 16:30より後にずれ込んだ場合に当日分の一部が永久にメールから
-        # 漏れうる問題があった。workflow_run経由の起動にも対応する代わりに
-        # 10:00・13:00枠では送らないようこのガードが必要）。
-        result, smtp_instance = self._run(now=dt.datetime(2026, 9, 1, 13, 5, tzinfo=JST))
+        # 漏れうる問題があった。単純な時刻ガードでは、遅延した13:00枠を
+        # 最終実行枠と誤認しうる点もCodexに指摘され、時刻ではなく
+        # notify_state.json自身のマーカーで判定するよう作り直した）。
+        self._write_state({}, last_run_schedule="0 4 * * 1-5", last_run_date=_TODAY.isoformat())
+        result, smtp_instance = self._run()
         self.assertEqual(result, 0)
         smtp_instance.send_message.assert_not_called()
 
-    def test_force_send_bypasses_the_time_guard(self):
-        # workflow_dispatch（手動実行）はFORCE_SEND=trueで時刻ガードを
-        # 無効化し、いつでも送信できる（動作確認・手動リカバリ用）。
+    def test_failed_or_incomplete_notifier_run_skips_without_sending(self):
+        # watch-and-notify側が失敗・中断し、最終実行枠のマーカーが当日分
+        # として更新されないまま終了した場合、実際には確認できていない
+        # のに「該当銘柄はありませんでした」という誤った空メールを送って
+        # しまわないよう、何もせず終了する（2026-09-30のCodexレビューで
+        # 指摘・修正）。
+        self._write_state({}, last_run_schedule="10 7 * * 1-5", last_run_date="2026-08-31")
+        result, smtp_instance = self._run()
+        self.assertEqual(result, 0)
+        smtp_instance.send_message.assert_not_called()
+
+    def test_force_send_bypasses_the_marker_guard(self):
+        # workflow_dispatch（手動実行）はFORCE_SEND=trueでマーカーによる
+        # ガードを無効化し、いつでも送信できる（動作確認・手動リカバリ用）。
+        self._write_state({}, last_run_schedule="0 1 * * 1-5", last_run_date=_TODAY.isoformat())
         env = dict(_DEFAULT_ENV, FORCE_SEND="true")
-        result, smtp_instance = self._run(env=env, now=dt.datetime(2026, 9, 1, 10, 5, tzinfo=JST))
+        result, smtp_instance = self._run(env=env)
         self.assertEqual(result, 0)
         smtp_instance.send_message.assert_called_once()
 
@@ -349,13 +386,13 @@ class TestMain(_SendDailyEmailTestCase):
         self.assertIn("該当銘柄はありませんでした。", sent_msg.get_content())
 
     def test_smtp_failure_returns_error(self):
+        self._write_state({})
         with ExitStack() as stack:
             def _patch(target, **kwargs):
                 return stack.enter_context(patch(f"{_MOD}.{target}", **kwargs))
 
             stack.enter_context(patch.dict(f"{_MOD}.os.environ", _DEFAULT_ENV, clear=True))
             _patch("today_jst", return_value=_TODAY)
-            _patch("_now_jst", return_value=dt.datetime(2026, 9, 1, 16, 30, tzinfo=JST))
             _patch("is_market_holiday", return_value=False)
             smtp_cls = _patch("smtplib.SMTP", side_effect=OSError("connection refused"))
             result = sde.main()
