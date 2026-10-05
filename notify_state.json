@@ -1,5 +1,5 @@
 {
-  "ipo_watermark": "2026-10-02",
+  "ipo_watermark": "2026-10-05",
   "notified": {
     "ipo_approval|634A|2026-08-24": true,
     "ipo_approval|640A|2026-09-01": {
@@ -1146,7 +1146,7 @@
       "sent_at": "2026-10-01T16:04:59.036617+09:00"
     }
   },
-  "profit_growth_watermark": "2026-10-02",
-  "stop_high_watermark": "2026-10-02",
-  "tdnet_watermark": "2026-10-02"
+  "profit_growth_watermark": "2026-10-05",
+  "stop_high_watermark": "2026-10-05",
+  "tdnet_watermark": "2026-10-05"
 }
