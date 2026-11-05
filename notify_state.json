@@ -1,5 +1,5 @@
 {
-  "ipo_watermark": "2026-11-05",
+  "ipo_watermark": "2026-11-06",
   "notified": {
     "ipo_approval|646A|2026-09-07": {
       "message": "🆕 新規上場承認\n646A クラサスケミカル（株）（スタンダード）\n上場承認日: 2026-09-07 / 上場予定日: 2026-09-29",
@@ -2866,7 +2866,7 @@
       "sent_at": "2026-10-22T18:16:40.850526+09:00"
     }
   },
-  "profit_growth_watermark": "2026-11-05",
-  "stop_high_watermark": "2026-11-05",
-  "tdnet_watermark": "2026-11-05"
+  "profit_growth_watermark": "2026-11-06",
+  "stop_high_watermark": "2026-11-06",
+  "tdnet_watermark": "2026-11-06"
 }
