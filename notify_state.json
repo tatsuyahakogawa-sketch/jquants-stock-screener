@@ -1,5 +1,5 @@
 {
-  "ipo_watermark": "2026-11-11",
+  "ipo_watermark": "2026-11-12",
   "notified": {
     "ipo_approval|652A|2026-09-28": {
       "message": "🆕 新規上場承認\n652A トグルホールディングス（株）（グロース）\n上場承認日: 2026-09-28 / 上場予定日: 2026-10-30",
@@ -3614,7 +3614,7 @@
       "sent_at": "2026-11-10T17:10:02.187914+09:00"
     }
   },
-  "profit_growth_watermark": "2026-11-11",
-  "stop_high_watermark": "2026-11-11",
-  "tdnet_watermark": "2026-11-11"
+  "profit_growth_watermark": "2026-11-12",
+  "stop_high_watermark": "2026-11-12",
+  "tdnet_watermark": "2026-11-12"
 }
