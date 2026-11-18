@@ -1,5 +1,5 @@
 {
-  "ipo_watermark": "2026-11-18",
+  "ipo_watermark": "2026-11-19",
   "notified": {
     "ipo_approval|652A|2026-09-28": {
       "message": "🆕 新規上場承認\n652A トグルホールディングス（株）（グロース）\n上場承認日: 2026-09-28 / 上場予定日: 2026-10-30",
@@ -112,6 +112,10 @@
     "ipo_listed|656A|2026-11-04": {
       "message": "🔔 上場前日のお知らせ\n656A Allganize Holdings（株）（グロース）\n上場日: 2026-11-04",
       "sent_at": "2026-11-02T16:31:28.505237+09:00"
+    },
+    "ipo_listed|657A|2026-11-20": {
+      "message": "🔔 上場前日のお知らせ\n657A HiJoJo Partners（株）（グロース）\n上場日: 2026-11-20",
+      "sent_at": "2026-11-19T01:23:37.039365+09:00"
     },
     "ipo_listed|658A|2026-11-06": {
       "message": "🔔 上場前日のお知らせ\n658A （株）estie（グロース）\n上場日: 2026-11-06",
@@ -4610,7 +4614,7 @@
       "sent_at": "2026-11-10T17:10:02.187914+09:00"
     }
   },
-  "profit_growth_watermark": "2026-11-18",
-  "stop_high_watermark": "2026-11-18",
-  "tdnet_watermark": "2026-11-18"
+  "profit_growth_watermark": "2026-11-19",
+  "stop_high_watermark": "2026-11-19",
+  "tdnet_watermark": "2026-11-19"
 }
